@@ -44,6 +44,8 @@ func main() {
 
 	// Initialize workers
 	plcScanner := plc.NewScanner(db, cfg.PLC)
+	defer plcScanner.Close() // Close scanner to cleanup cache
+
 	pdsScanner := pds.NewScanner(db, cfg.PDS)
 
 	scheduler := worker.NewScheduler()

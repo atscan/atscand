@@ -1,0 +1,4 @@
+plc_cache
+*.db
+*.db-*
+atscanner

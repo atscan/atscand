@@ -2,6 +2,7 @@ package plc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -14,19 +15,39 @@ type Scanner struct {
 	client *Client
 	db     storage.Database
 	config config.PLCConfig
+	cache  *Cache
 }
 
 func NewScanner(db storage.Database, cfg config.PLCConfig) *Scanner {
+	cache, err := NewCache(cfg.CacheDir, cfg.UseCache)
+	if err != nil {
+		log.Printf("Warning: failed to initialize cache: %v", err)
+		cache = &Cache{enabled: false}
+	}
+
 	return &Scanner{
 		client: NewClient(cfg.DirectoryURL),
 		db:     db,
 		config: cfg,
+		cache:  cache,
+	}
+}
+
+func (s *Scanner) Close() {
+	if s.cache != nil {
+		s.cache.Close()
 	}
 }
 
 func (s *Scanner) Scan(ctx context.Context) error {
 	startTime := time.Now()
 	log.Println("Starting PLC directory scan...")
+
+	// Print cache stats
+	if s.config.UseCache {
+		count, size, _ := s.cache.Stats()
+		log.Printf("Cache: %d files, %.2f MB", count, float64(size)/1024/1024)
+	}
 
 	// Get last cursor position
 	cursor, err := s.db.GetScanCursor(ctx, "plc_directory")
@@ -51,6 +72,8 @@ func (s *Scanner) Scan(ctx context.Context) error {
 	latestTimestamp := afterTimestamp
 	consecutiveErrors := 0
 	maxConsecutiveErrors := 3
+	cacheHits := 0
+	cacheMisses := 0
 
 	// Paginate through all operations
 	for {
@@ -61,8 +84,8 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		default:
 		}
 
-		// Fetch batch of operations with retry logic
-		operations, err := s.fetchWithRetry(ctx, afterTimestamp, 3)
+		// Fetch batch of operations (with cache)
+		operations, fromCache, err := s.fetchBatchWithCache(ctx, afterTimestamp, 3)
 		if err != nil {
 			metrics.ErrorCount++
 			consecutiveErrors++
@@ -81,6 +104,13 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			continue
 		}
 
+		// Track cache performance
+		if fromCache {
+			cacheHits++
+		} else {
+			cacheMisses++
+		}
+
 		// Reset error counter on success
 		consecutiveErrors = 0
 
@@ -89,7 +119,18 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			break
 		}
 
-		log.Printf("Processing batch of %d operations (after: %s)", len(operations), afterTimestamp)
+		cacheStatus := ""
+		if fromCache {
+			cacheStatus = " [cached]"
+		}
+		log.Printf("Processing batch of %d operations (after: %s)%s", len(operations), afterTimestamp, cacheStatus)
+
+		// DEBUG: Print first operation structure (only once)
+		if len(operations) > 0 && totalProcessed == 0 {
+			log.Println("=== DEBUG: First operation structure ===")
+			opJSON, _ := json.MarshalIndent(operations[0], "", "  ")
+			log.Printf("%s\n", string(opJSON))
+		}
 
 		// Process this batch
 		batchNewPDS, err := s.processBatch(ctx, operations)
@@ -104,10 +145,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		// Update timestamp to the latest operation's createdAt
 		if len(operations) > 0 {
 			lastOp := operations[len(operations)-1]
-			// Use the ISO 8601 formatted timestamp from createdAt
 			latestTimestamp = lastOp.CreatedAt.Format(time.RFC3339Nano)
-
-			// Update afterTimestamp for next iteration
 			afterTimestamp = latestTimestamp
 
 			// Save cursor position periodically (every batch)
@@ -127,8 +165,10 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			break
 		}
 
-		// Rate limiting between batches
-		//time.Sleep(500 * time.Millisecond)
+		// Rate limiting between batches (only if not using cache)
+		if !fromCache {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 
 	// Final cursor update
@@ -156,8 +196,39 @@ func (s *Scanner) Scan(ctx context.Context) error {
 
 	log.Printf("PLC scan completed: %d operations processed, %d new PDS servers found in %v",
 		totalProcessed, newPDSCount, time.Since(startTime))
+	log.Printf("Cache performance: %d hits, %d misses (%.1f%% hit rate)",
+		cacheHits, cacheMisses, float64(cacheHits)*100/float64(cacheHits+cacheMisses))
 
 	return nil
+}
+
+// fetchBatchWithCache fetches operations with caching support
+func (s *Scanner) fetchBatchWithCache(ctx context.Context, afterTimestamp string, maxRetries int) ([]PLCOperation, bool, error) {
+	// Check cache first
+	if s.cache.Has(afterTimestamp) {
+		log.Printf("→ Using cached batch for after=%s", afterTimestamp)
+		operations, err := s.cache.Get(afterTimestamp)
+		if err != nil {
+			log.Printf("Warning: cache read failed, falling back to API: %v", err)
+		} else {
+			return operations, true, nil
+		}
+	}
+
+	// Fetch from API with retry
+	operations, err := s.fetchWithRetry(ctx, afterTimestamp, maxRetries)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Store in cache
+	if err := s.cache.Set(afterTimestamp, operations); err != nil {
+		log.Printf("Warning: failed to cache batch: %v", err)
+	} else {
+		log.Printf("✓ Cached batch to %s", s.cache.GetCachePath(afterTimestamp))
+	}
+
+	return operations, false, nil
 }
 
 func (s *Scanner) fetchWithRetry(ctx context.Context, afterTimestamp string, maxRetries int) ([]PLCOperation, error) {
@@ -191,24 +262,20 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 	seenInBatch := make(map[string]bool)
 
 	for _, op := range operations {
-		// Skip nullified operations
 		if op.IsNullified() {
 			continue
 		}
 
-		// Extract PDS endpoint from operation directly
 		pdsEndpoint := s.extractPDSFromOperation(op)
 		if pdsEndpoint == "" {
 			continue
 		}
 
-		// Skip if we've already seen this PDS in current batch
 		if seenInBatch[pdsEndpoint] {
 			continue
 		}
 		seenInBatch[pdsEndpoint] = true
 
-		// Check if PDS already exists in database
 		exists, err := s.db.PDSExists(ctx, pdsEndpoint)
 		if err != nil {
 			log.Printf("Error checking PDS existence: %v", err)
@@ -216,10 +283,9 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 		}
 
 		if exists {
-			continue // Already know about this PDS
+			continue
 		}
 
-		// New PDS! Store it
 		if err := s.db.UpsertPDS(ctx, &storage.PDS{
 			Endpoint:     pdsEndpoint,
 			DiscoveredAt: time.Now(),
@@ -230,21 +296,17 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 			continue
 		}
 
-		log.Printf("✓ Discovered new PDS: %s (from DID %s)", pdsEndpoint, op.DID)
+		log.Printf("✓ Discovered new PDS: %s", pdsEndpoint)
 		newPDSCount++
 	}
 
 	return newPDSCount, nil
 }
 
-// Extract PDS endpoint directly from operation
 func (s *Scanner) extractPDSFromOperation(op PLCOperation) string {
-	// PLC operations have "services" as a map, not an array
 	if services, ok := op.Operation["services"].(map[string]interface{}); ok {
-		// Look for atproto_pds service
 		if atprotoPDS, ok := services["atproto_pds"].(map[string]interface{}); ok {
 			if endpoint, ok := atprotoPDS["endpoint"].(string); ok {
-				// Validate it's actually a PDS endpoint
 				if svcType, ok := atprotoPDS["type"].(string); ok {
 					if svcType == "AtprotoPersonalDataServer" {
 						return endpoint
@@ -253,6 +315,5 @@ func (s *Scanner) extractPDSFromOperation(op PLCOperation) string {
 			}
 		}
 	}
-
 	return ""
 }

@@ -6,6 +6,8 @@ plc:
   directory_url: "https://plc.directory"
   scan_interval: "6h"
   batch_size: 1000
+  cache_dir: "./plc_cache"    # Cache directory
+  use_cache: true             # Enable caching
 
 pds:
   scan_interval: "15m"

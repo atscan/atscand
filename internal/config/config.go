@@ -23,6 +23,8 @@ type PLCConfig struct {
 	DirectoryURL string        `yaml:"directory_url"`
 	ScanInterval time.Duration `yaml:"scan_interval"`
 	BatchSize    int           `yaml:"batch_size"`
+	CacheDir     string        `yaml:"cache_dir"` // NEW: Cache directory
+	UseCache     bool          `yaml:"use_cache"` // NEW: Enable/disable cache
 }
 
 type PDSConfig struct {
@@ -57,6 +59,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.PLC.BatchSize == 0 {
 		cfg.PLC.BatchSize = 1000
+	}
+	if cfg.PLC.CacheDir == "" {
+		cfg.PLC.CacheDir = "./plc_cache"
 	}
 	if cfg.PDS.ScanInterval == 0 {
 		cfg.PDS.ScanInterval = 15 * time.Minute
