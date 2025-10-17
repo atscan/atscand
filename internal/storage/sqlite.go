@@ -1,0 +1,343 @@
+package storage
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+type SQLiteDB struct {
+	db *sql.DB
+}
+
+func NewSQLiteDB(path string) (*SQLiteDB, error) {
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Enable WAL mode for better concurrency
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return nil, err
+	}
+
+	return &SQLiteDB{db: db}, nil
+}
+
+func (s *SQLiteDB) Close() error {
+	return s.db.Close()
+}
+
+func (s *SQLiteDB) Migrate() error {
+	schema := `
+    CREATE TABLE IF NOT EXISTS pds_servers (
+        endpoint TEXT PRIMARY KEY,
+        discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_checked TIMESTAMP,
+        status TEXT DEFAULT 'unknown',
+        response_time_ms INTEGER,
+        error_message TEXT,
+        server_info TEXT,
+        user_count INTEGER DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pds_status ON pds_servers(status);
+    CREATE INDEX IF NOT EXISTS idx_pds_last_checked ON pds_servers(last_checked);
+
+    CREATE TABLE IF NOT EXISTS plc_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        total_dids INTEGER,
+        total_pds INTEGER,
+        unique_pds INTEGER,
+        scan_duration_ms INTEGER,
+        error_count INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS pds_scans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint TEXT NOT NULL,
+        status TEXT,
+        response_time_ms INTEGER,
+        error_message TEXT,
+        server_info TEXT,
+        scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (endpoint) REFERENCES pds_servers(endpoint)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pds_scans_endpoint ON pds_scans(endpoint);
+    CREATE INDEX IF NOT EXISTS idx_pds_scans_scanned_at ON pds_scans(scanned_at);
+
+    CREATE TABLE IF NOT EXISTS scan_cursors (
+        source TEXT PRIMARY KEY,
+        last_timestamp TEXT NOT NULL,
+        last_scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        records_processed INTEGER DEFAULT 0
+    );
+    `
+
+	_, err := s.db.Exec(schema)
+	return err
+}
+
+// PDSExists checks if a PDS endpoint already exists in the database
+func (s *SQLiteDB) PDSExists(ctx context.Context, endpoint string) (bool, error) {
+	query := "SELECT EXISTS(SELECT 1 FROM pds_servers WHERE endpoint = ?)"
+
+	var exists bool
+	err := s.db.QueryRowContext(ctx, query, endpoint).Scan(&exists)
+	return exists, err
+}
+
+// UpsertPDS inserts or updates a PDS server
+func (s *SQLiteDB) UpsertPDS(ctx context.Context, pds *PDS) error {
+	query := `
+        INSERT INTO pds_servers (endpoint, discovered_at, last_checked, status)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(endpoint) DO UPDATE SET
+            last_checked = excluded.last_checked
+    `
+	_, err := s.db.ExecContext(ctx, query, pds.Endpoint, pds.DiscoveredAt, pds.LastChecked, pds.Status)
+	return err
+}
+
+// GetPDS retrieves a single PDS server by endpoint
+func (s *SQLiteDB) GetPDS(ctx context.Context, endpoint string) (*PDS, error) {
+	query := `
+        SELECT endpoint, discovered_at, last_checked, status, response_time_ms, 
+               error_message, server_info, user_count 
+        FROM pds_servers 
+        WHERE endpoint = ?
+    `
+
+	var pds PDS
+	var lastChecked sql.NullTime
+	var responseTime sql.NullInt64
+	var errorMsg sql.NullString
+	var serverInfo sql.NullString
+
+	err := s.db.QueryRowContext(ctx, query, endpoint).Scan(
+		&pds.Endpoint, &pds.DiscoveredAt, &lastChecked, &pds.Status,
+		&responseTime, &errorMsg, &serverInfo, &pds.UserCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if lastChecked.Valid {
+		pds.LastChecked = lastChecked.Time
+	}
+	if responseTime.Valid {
+		pds.ResponseTime = responseTime.Int64
+	}
+	if errorMsg.Valid {
+		pds.ErrorMessage = errorMsg.String
+	}
+	if serverInfo.Valid && serverInfo.String != "" {
+		json.Unmarshal([]byte(serverInfo.String), &pds.ServerInfo)
+	}
+
+	return &pds, nil
+}
+
+// GetPDSServers retrieves multiple PDS servers with optional filtering
+func (s *SQLiteDB) GetPDSServers(ctx context.Context, filter *PDSFilter) ([]*PDS, error) {
+	query := `
+        SELECT endpoint, discovered_at, last_checked, status, response_time_ms, 
+               error_message, user_count 
+        FROM pds_servers
+    `
+	args := []interface{}{}
+
+	if filter != nil && filter.Status != "" {
+		query += " WHERE status = ?"
+		args = append(args, filter.Status)
+	}
+
+	query += " ORDER BY user_count DESC"
+
+	if filter != nil && filter.Limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d OFFSET %d", filter.Limit, filter.Offset)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var servers []*PDS
+	for rows.Next() {
+		var pds PDS
+		var lastChecked sql.NullTime
+		var responseTime sql.NullInt64
+		var errorMsg sql.NullString
+
+		err := rows.Scan(
+			&pds.Endpoint, &pds.DiscoveredAt, &lastChecked, &pds.Status,
+			&responseTime, &errorMsg, &pds.UserCount,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if lastChecked.Valid {
+			pds.LastChecked = lastChecked.Time
+		}
+		if responseTime.Valid {
+			pds.ResponseTime = responseTime.Int64
+		}
+		if errorMsg.Valid {
+			pds.ErrorMessage = errorMsg.String
+		}
+
+		servers = append(servers, &pds)
+	}
+
+	return servers, rows.Err()
+}
+
+// UpdatePDSStatus updates the status and metrics of a PDS server
+func (s *SQLiteDB) UpdatePDSStatus(ctx context.Context, endpoint string, update *PDSUpdate) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Update main record
+	var serverInfoJSON []byte
+	if update.ServerInfo != nil {
+		serverInfoJSON, _ = json.Marshal(update.ServerInfo)
+	}
+
+	query := `
+        UPDATE pds_servers 
+        SET status = ?, last_checked = ?, response_time_ms = ?, error_message = ?, server_info = ?, updated_at = ?
+        WHERE endpoint = ?
+    `
+	_, err = tx.ExecContext(ctx, query, update.Status, update.LastChecked, update.ResponseTime,
+		update.ErrorMessage, string(serverInfoJSON), time.Now(), endpoint)
+	if err != nil {
+		return err
+	}
+
+	// Insert scan history
+	scanQuery := `
+        INSERT INTO pds_scans (endpoint, status, response_time_ms, error_message, server_info)
+        VALUES (?, ?, ?, ?, ?)
+    `
+	_, err = tx.ExecContext(ctx, scanQuery, endpoint, update.Status, update.ResponseTime,
+		update.ErrorMessage, string(serverInfoJSON))
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// GetScanCursor retrieves the last scan cursor for a source
+func (s *SQLiteDB) GetScanCursor(ctx context.Context, source string) (*ScanCursor, error) {
+	query := "SELECT source, last_timestamp, last_scan_time, records_processed FROM scan_cursors WHERE source = ?"
+
+	var cursor ScanCursor
+	err := s.db.QueryRowContext(ctx, query, source).Scan(
+		&cursor.Source, &cursor.LastTimestamp, &cursor.LastScanTime, &cursor.RecordsProcessed,
+	)
+	if err == sql.ErrNoRows {
+		// No cursor yet, return empty one
+		return &ScanCursor{
+			Source:        source,
+			LastTimestamp: "",
+			LastScanTime:  time.Time{},
+		}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &cursor, nil
+}
+
+// UpdateScanCursor updates or inserts a scan cursor
+func (s *SQLiteDB) UpdateScanCursor(ctx context.Context, cursor *ScanCursor) error {
+	query := `
+        INSERT INTO scan_cursors (source, last_timestamp, last_scan_time, records_processed)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(source) DO UPDATE SET
+            last_timestamp = excluded.last_timestamp,
+            last_scan_time = excluded.last_scan_time,
+            records_processed = excluded.records_processed
+    `
+	_, err := s.db.ExecContext(ctx, query, cursor.Source, cursor.LastTimestamp, cursor.LastScanTime, cursor.RecordsProcessed)
+	return err
+}
+
+// StorePLCMetrics stores PLC scan metrics
+func (s *SQLiteDB) StorePLCMetrics(ctx context.Context, metrics *PLCMetrics) error {
+	query := `
+        INSERT INTO plc_metrics (total_dids, total_pds, unique_pds, scan_duration_ms, error_count)
+        VALUES (?, ?, ?, ?, ?)
+    `
+	_, err := s.db.ExecContext(ctx, query, metrics.TotalDIDs, metrics.TotalPDS,
+		metrics.UniquePDS, metrics.ScanDuration, metrics.ErrorCount)
+	return err
+}
+
+// GetPLCMetrics retrieves recent PLC metrics
+func (s *SQLiteDB) GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetrics, error) {
+	query := `
+        SELECT total_dids, total_pds, unique_pds, scan_duration_ms, error_count, created_at
+        FROM plc_metrics
+        ORDER BY created_at DESC
+        LIMIT ?
+    `
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metrics []*PLCMetrics
+	for rows.Next() {
+		var m PLCMetrics
+		if err := rows.Scan(&m.TotalDIDs, &m.TotalPDS, &m.UniquePDS, &m.ScanDuration, &m.ErrorCount, &m.LastScanTime); err != nil {
+			return nil, err
+		}
+		metrics = append(metrics, &m)
+	}
+
+	return metrics, rows.Err()
+}
+
+// GetPDSStats returns aggregate statistics about PDS servers
+func (s *SQLiteDB) GetPDSStats(ctx context.Context) (*PDSStats, error) {
+	query := `
+        SELECT 
+            COUNT(*) as total_pds,
+            SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online_pds,
+            SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END) as offline_pds,
+            AVG(CASE WHEN response_time_ms > 0 THEN response_time_ms ELSE NULL END) as avg_response_time,
+            SUM(user_count) as total_dids
+        FROM pds_servers
+    `
+
+	var stats PDSStats
+	var avgResponseTime sql.NullFloat64
+
+	err := s.db.QueryRowContext(ctx, query).Scan(
+		&stats.TotalPDS, &stats.OnlinePDS, &stats.OfflinePDS, &avgResponseTime, &stats.TotalDIDs,
+	)
+
+	if avgResponseTime.Valid {
+		stats.AvgResponseTime = avgResponseTime.Float64
+	}
+
+	return &stats, err
+}
