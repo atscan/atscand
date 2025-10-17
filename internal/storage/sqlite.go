@@ -79,10 +79,128 @@ func (s *SQLiteDB) Migrate() error {
         last_scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         records_processed INTEGER DEFAULT 0
     );
+
+    -- NEW: PLC bundles table
+    CREATE TABLE IF NOT EXISTS plc_bundles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        start_time TIMESTAMP NOT NULL,
+        end_time TIMESTAMP NOT NULL,
+        operation_count INTEGER NOT NULL,
+        file_path TEXT NOT NULL,
+        file_size INTEGER NOT NULL,
+        compressed BOOLEAN DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_plc_bundles_time ON plc_bundles(start_time, end_time);
+    CREATE INDEX IF NOT EXISTS idx_plc_bundles_created ON plc_bundles(created_at);
     `
 
 	_, err := s.db.Exec(schema)
 	return err
+}
+
+// CreateBundle stores a new PLC bundle record
+func (s *SQLiteDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
+	query := `
+        INSERT INTO plc_bundles (start_time, end_time, operation_count, file_path, file_size, compressed)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `
+	result, err := s.db.ExecContext(ctx, query,
+		bundle.StartTime, bundle.EndTime, bundle.OperationCount,
+		bundle.FilePath, bundle.FileSize, bundle.Compressed,
+	)
+	if err != nil {
+		return err
+	}
+
+	id, _ := result.LastInsertId()
+	bundle.ID = id
+	return nil
+}
+
+// GetBundle retrieves a bundle that covers a specific time range
+// If afterTime is zero, returns the first bundle
+func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBundle, error) {
+	var query string
+	var args []interface{}
+
+	if afterTime.IsZero() {
+		// Get first bundle
+		query = `
+            SELECT id, start_time, end_time, operation_count, file_path, file_size, compressed, created_at
+            FROM plc_bundles
+            ORDER BY start_time ASC
+            LIMIT 1
+        `
+		args = []interface{}{}
+	} else {
+		// Get next bundle after this time
+		query = `
+            SELECT id, start_time, end_time, operation_count, file_path, file_size, compressed, created_at
+            FROM plc_bundles
+            WHERE start_time >= ?
+            ORDER BY start_time ASC
+            LIMIT 1
+        `
+		args = []interface{}{afterTime}
+	}
+
+	var bundle PLCBundle
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(
+		&bundle.ID, &bundle.StartTime, &bundle.EndTime, &bundle.OperationCount,
+		&bundle.FilePath, &bundle.FileSize, &bundle.Compressed, &bundle.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil // No bundle found
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &bundle, nil
+}
+
+// GetBundles retrieves recent bundles
+func (s *SQLiteDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error) {
+	query := `
+        SELECT id, start_time, end_time, operation_count, file_path, file_size, compressed, created_at
+        FROM plc_bundles
+        ORDER BY start_time DESC
+        LIMIT ?
+    `
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bundles []*PLCBundle
+	for rows.Next() {
+		var bundle PLCBundle
+		if err := rows.Scan(
+			&bundle.ID, &bundle.StartTime, &bundle.EndTime, &bundle.OperationCount,
+			&bundle.FilePath, &bundle.FileSize, &bundle.Compressed, &bundle.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		bundles = append(bundles, &bundle)
+	}
+
+	return bundles, rows.Err()
+}
+
+// GetBundleStats returns bundle statistics
+func (s *SQLiteDB) GetBundleStats(ctx context.Context) (int64, int64, error) {
+	query := `
+        SELECT COUNT(*), COALESCE(SUM(file_size), 0)
+        FROM plc_bundles
+    `
+
+	var count, totalSize int64
+	err := s.db.QueryRowContext(ctx, query).Scan(&count, &totalSize)
+	return count, totalSize, err
 }
 
 // PDSExists checks if a PDS endpoint already exists in the database

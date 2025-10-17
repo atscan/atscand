@@ -44,12 +44,12 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/pds/{endpoint}", s.handleGetPDS).Methods("GET")
 	api.HandleFunc("/pds/stats", s.handleGetPDSStats).Methods("GET")
 
-	// DID endpoints
-	api.HandleFunc("/dids", s.handleGetDIDList).Methods("GET")
-	api.HandleFunc("/dids/{did}", s.handleGetDID).Methods("GET")
-
 	// Metrics endpoints
 	api.HandleFunc("/metrics/plc", s.handleGetPLCMetrics).Methods("GET")
+
+	// Bundle endpoints - NEW
+	api.HandleFunc("/bundles", s.handleGetBundles).Methods("GET")
+	api.HandleFunc("/bundles/stats", s.handleGetBundleStats).Methods("GET")
 
 	// Health check
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")

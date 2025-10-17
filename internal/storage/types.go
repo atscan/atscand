@@ -66,3 +66,15 @@ type ScanCursor struct {
 	LastScanTime     time.Time
 	RecordsProcessed int64
 }
+
+// PLCBundle represents a cached bundle of PLC operations
+type PLCBundle struct {
+	ID             int64
+	StartTime      time.Time // First operation timestamp
+	EndTime        time.Time // Last operation timestamp
+	OperationCount int
+	FilePath       string
+	FileSize       int64
+	Compressed     bool
+	CreatedAt      time.Time
+}

@@ -92,6 +92,41 @@ func (s *Server) handleGetPLCMetrics(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, metrics)
 }
 
+func (s *Server) handleGetBundles(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil {
+			limit = parsed
+		}
+	}
+
+	bundles, err := s.db.GetBundles(ctx, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, bundles)
+}
+
+func (s *Server) handleGetBundleStats(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	count, size, err := s.db.GetBundleStats(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{
+		"bundle_count":  count,
+		"total_size":    size,
+		"total_size_mb": float64(size) / 1024 / 1024,
+	})
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, map[string]string{"status": "ok"})
 }

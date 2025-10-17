@@ -2,7 +2,6 @@ package plc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -12,30 +11,30 @@ import (
 )
 
 type Scanner struct {
-	client *Client
-	db     storage.Database
-	config config.PLCConfig
-	cache  *Cache
+	client        *Client
+	db            storage.Database
+	config        config.PLCConfig
+	bundleManager *BundleManager
 }
 
 func NewScanner(db storage.Database, cfg config.PLCConfig) *Scanner {
-	cache, err := NewCache(cfg.CacheDir, cfg.UseCache)
+	bundleManager, err := NewBundleManager(cfg.CacheDir, cfg.UseCache, db)
 	if err != nil {
-		log.Printf("Warning: failed to initialize cache: %v", err)
-		cache = &Cache{enabled: false}
+		log.Printf("Warning: failed to initialize bundle manager: %v", err)
+		bundleManager = &BundleManager{enabled: false}
 	}
 
 	return &Scanner{
-		client: NewClient(cfg.DirectoryURL),
-		db:     db,
-		config: cfg,
-		cache:  cache,
+		client:        NewClient(cfg.DirectoryURL),
+		db:            db,
+		config:        cfg,
+		bundleManager: bundleManager,
 	}
 }
 
 func (s *Scanner) Close() {
-	if s.cache != nil {
-		s.cache.Close()
+	if s.bundleManager != nil {
+		s.bundleManager.Close()
 	}
 }
 
@@ -43,10 +42,21 @@ func (s *Scanner) Scan(ctx context.Context) error {
 	startTime := time.Now()
 	log.Println("Starting PLC directory scan...")
 
-	// Print cache stats
+	// Auto-discover bundles if using cache
 	if s.config.UseCache {
-		count, size, _ := s.cache.Stats()
-		log.Printf("Cache: %d files, %.2f MB", count, float64(size)/1024/1024)
+		if err := s.bundleManager.DiscoverAndIndexBundles(ctx); err != nil {
+			log.Printf("Warning: bundle discovery failed: %v", err)
+		}
+	}
+
+	// Print bundle stats
+	if s.config.UseCache {
+		count, size, _ := s.bundleManager.GetStats(ctx)
+		if count > 0 {
+			log.Printf("Bundles available: %d files, %.2f MB total", count, float64(size)/1024/1024)
+		} else {
+			log.Println("No bundles available (will fetch from API)")
+		}
 	}
 
 	// Get last cursor position
@@ -60,9 +70,8 @@ func (s *Scanner) Scan(ctx context.Context) error {
 	if afterTimestamp != "" {
 		log.Printf("Resuming from timestamp: %s", afterTimestamp)
 	} else {
-		log.Println("Starting fresh scan (no previous cursor)")
+		log.Println("Starting fresh scan")
 	}
-
 	metrics := &storage.PLCMetrics{
 		LastScanTime: startTime,
 	}
@@ -72,10 +81,10 @@ func (s *Scanner) Scan(ctx context.Context) error {
 	latestTimestamp := afterTimestamp
 	consecutiveErrors := 0
 	maxConsecutiveErrors := 3
-	cacheHits := 0
-	cacheMisses := 0
+	bundlesUsed := 0
+	apiFetches := 0
 
-	// Paginate through all operations
+	// Rest of the scanning logic stays the same...
 	for {
 		select {
 		case <-ctx.Done():
@@ -84,34 +93,54 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		default:
 		}
 
-		// Fetch batch of operations (with cache)
-		operations, fromCache, err := s.fetchBatchWithCache(ctx, afterTimestamp, 3)
-		if err != nil {
-			metrics.ErrorCount++
-			consecutiveErrors++
+		// Try to find a bundle first
+		var operations []PLCOperation
+		var fromBundle bool
 
-			log.Printf("Error fetching operations (attempt %d/%d): %v",
-				consecutiveErrors, maxConsecutiveErrors, err)
+		bundle, err := s.bundleManager.FindBundle(ctx, afterTimestamp)
+		if err == nil && bundle != nil {
+			log.Printf("→ Using bundle: %s to %s (%d ops, %.2f MB)",
+				bundle.StartTime.Format("2006-01-02 15:04"),
+				bundle.EndTime.Format("2006-01-02 15:04"),
+				bundle.OperationCount,
+				float64(bundle.FileSize)/1024/1024)
 
-			if consecutiveErrors >= maxConsecutiveErrors {
-				return fmt.Errorf("failed after %d consecutive errors: %w", maxConsecutiveErrors, err)
+			ops, err := s.bundleManager.loadBundleFromFile(bundle.FilePath)
+			if err != nil {
+				log.Printf("Warning: failed to load bundle, falling back to API: %v", err)
+			} else {
+				operations = ops
+				fromBundle = true
+				bundlesUsed++
+
+				// Jump to end of this bundle for next iteration
+				afterTimestamp = bundle.EndTime.Format(time.RFC3339Nano)
 			}
-
-			// Exponential backoff
-			backoff := time.Duration(consecutiveErrors) * 5 * time.Second
-			log.Printf("Backing off for %v before retry...", backoff)
-			time.Sleep(backoff)
-			continue
 		}
 
-		// Track cache performance
-		if fromCache {
-			cacheHits++
-		} else {
-			cacheMisses++
+		// Fetch from API if no bundle
+		if !fromBundle {
+			ops, err := s.fetchWithRetry(ctx, afterTimestamp, 3)
+			if err != nil {
+				metrics.ErrorCount++
+				consecutiveErrors++
+
+				log.Printf("Error fetching operations (attempt %d/%d): %v",
+					consecutiveErrors, maxConsecutiveErrors, err)
+
+				if consecutiveErrors >= maxConsecutiveErrors {
+					return fmt.Errorf("failed after %d consecutive errors: %w", maxConsecutiveErrors, err)
+				}
+
+				backoff := time.Duration(consecutiveErrors) * 5 * time.Second
+				log.Printf("Backing off for %v before retry...", backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			operations = ops
+			apiFetches++
 		}
 
-		// Reset error counter on success
 		consecutiveErrors = 0
 
 		if len(operations) == 0 {
@@ -119,18 +148,11 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			break
 		}
 
-		cacheStatus := ""
-		if fromCache {
-			cacheStatus = " [cached]"
+		bundleStatus := ""
+		if fromBundle {
+			bundleStatus = " [bundled]"
 		}
-		log.Printf("Processing batch of %d operations (after: %s)%s", len(operations), afterTimestamp, cacheStatus)
-
-		// DEBUG: Print first operation structure (only once)
-		if len(operations) > 0 && totalProcessed == 0 {
-			log.Println("=== DEBUG: First operation structure ===")
-			opJSON, _ := json.MarshalIndent(operations[0], "", "  ")
-			log.Printf("%s\n", string(opJSON))
-		}
+		log.Printf("Processing batch of %d operations%s", len(operations), bundleStatus)
 
 		// Process this batch
 		batchNewPDS, err := s.processBatch(ctx, operations)
@@ -142,13 +164,25 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		newPDSCount += batchNewPDS
 		totalProcessed += int64(len(operations))
 
-		// Update timestamp to the latest operation's createdAt
-		if len(operations) > 0 {
+		// Save as bundle if complete batch and not from bundle
+		isCompleteBundle := len(operations) == s.config.BatchSize
+		if !fromBundle && isCompleteBundle {
+			if err := s.bundleManager.SaveBundle(ctx, operations, true); err != nil {
+				log.Printf("Warning: failed to save bundle: %v", err)
+			} else {
+				log.Printf("✓ Saved bundle (%d operations)", len(operations))
+			}
+		}
+
+		// Update timestamp to latest operation
+		if len(operations) > 0 && !fromBundle {
 			lastOp := operations[len(operations)-1]
 			latestTimestamp = lastOp.CreatedAt.Format(time.RFC3339Nano)
 			afterTimestamp = latestTimestamp
+		}
 
-			// Save cursor position periodically (every batch)
+		// Save cursor
+		if latestTimestamp != "" {
 			if err := s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
 				Source:           "plc_directory",
 				LastTimestamp:    latestTimestamp,
@@ -159,77 +193,43 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			}
 		}
 
-		// Check if we got fewer results than requested (end of stream)
-		if len(operations) < s.config.BatchSize {
-			log.Println("Reached end of PLC export")
+		// Check if end of stream
+		if !fromBundle && len(operations) < s.config.BatchSize {
+			log.Println("Reached end of PLC export (partial batch)")
 			break
 		}
 
-		// Rate limiting between batches (only if not using cache)
-		if !fromCache {
+		// Rate limiting (only for API fetches)
+		if !fromBundle {
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
 
-	// Final cursor update
+	// Final cursor update and metrics (same as before)
 	if latestTimestamp != cursor.LastTimestamp && latestTimestamp != "" {
-		if err := s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
+		s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
 			Source:           "plc_directory",
 			LastTimestamp:    latestTimestamp,
 			LastScanTime:     time.Now(),
 			RecordsProcessed: cursor.RecordsProcessed + totalProcessed,
-		}); err != nil {
-			log.Printf("Warning: failed to update final cursor: %v", err)
-		}
+		})
 	}
 
-	// Final metrics
 	metrics.TotalDIDs = totalProcessed
 	metrics.TotalPDS = newPDSCount
 	metrics.UniquePDS = newPDSCount
 	metrics.ScanDuration = time.Since(startTime).Milliseconds()
 
-	// Store metrics
-	if err := s.db.StorePLCMetrics(ctx, metrics); err != nil {
-		log.Printf("Error storing metrics: %v", err)
-	}
+	s.db.StorePLCMetrics(ctx, metrics)
 
-	log.Printf("PLC scan completed: %d operations processed, %d new PDS servers found in %v",
+	log.Printf("PLC scan completed: %d operations, %d new PDS servers in %v",
 		totalProcessed, newPDSCount, time.Since(startTime))
-	log.Printf("Cache performance: %d hits, %d misses (%.1f%% hit rate)",
-		cacheHits, cacheMisses, float64(cacheHits)*100/float64(cacheHits+cacheMisses))
+	log.Printf("Source: %d bundles, %d API fetches", bundlesUsed, apiFetches)
 
 	return nil
 }
 
-// fetchBatchWithCache fetches operations with caching support
-func (s *Scanner) fetchBatchWithCache(ctx context.Context, afterTimestamp string, maxRetries int) ([]PLCOperation, bool, error) {
-	// Check cache first
-	if s.cache.Has(afterTimestamp) {
-		log.Printf("→ Using cached batch for after=%s", afterTimestamp)
-		operations, err := s.cache.Get(afterTimestamp)
-		if err != nil {
-			log.Printf("Warning: cache read failed, falling back to API: %v", err)
-		} else {
-			return operations, true, nil
-		}
-	}
-
-	// Fetch from API with retry
-	operations, err := s.fetchWithRetry(ctx, afterTimestamp, maxRetries)
-	if err != nil {
-		return nil, false, err
-	}
-
-	// Store in cache
-	if err := s.cache.Set(afterTimestamp, operations); err != nil {
-		log.Printf("Warning: failed to cache batch: %v", err)
-	} else {
-		log.Printf("✓ Cached batch to %s", s.cache.GetCachePath(afterTimestamp))
-	}
-
-	return operations, false, nil
-}
+// ... rest of scanner methods stay the same
 
 func (s *Scanner) fetchWithRetry(ctx context.Context, afterTimestamp string, maxRetries int) ([]PLCOperation, error) {
 	var lastErr error
@@ -278,7 +278,6 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 
 		exists, err := s.db.PDSExists(ctx, pdsEndpoint)
 		if err != nil {
-			log.Printf("Error checking PDS existence: %v", err)
 			continue
 		}
 
@@ -292,7 +291,7 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 			LastChecked:  time.Time{},
 			Status:       "unknown",
 		}); err != nil {
-			log.Printf("Error storing new PDS %s: %v", pdsEndpoint, err)
+			log.Printf("Error storing PDS %s: %v", pdsEndpoint, err)
 			continue
 		}
 

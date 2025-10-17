@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -43,13 +44,12 @@ func (c *Client) Export(ctx context.Context, opts ExportOptions) ([]PLCOperation
 	if opts.Count > 0 {
 		q.Add("count", fmt.Sprintf("%d", opts.Count))
 	}
-	// Only add 'after' if it's a valid datetime string
 	if opts.After != "" {
 		q.Add("after", opts.After)
 	}
 	req.URL.RawQuery = q.Encode()
 
-	fmt.Printf("Requesting: %s\n", req.URL.String())
+	log.Printf("→ Requesting: %s", req.URL.String())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -66,7 +66,6 @@ func (c *Client) Export(ctx context.Context, opts ExportOptions) ([]PLCOperation
 
 	// PLC export returns newline-delimited JSON
 	scanner := bufio.NewScanner(resp.Body)
-	// Increase buffer size for large lines
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 
@@ -75,14 +74,13 @@ func (c *Client) Export(ctx context.Context, opts ExportOptions) ([]PLCOperation
 		lineCount++
 		line := scanner.Bytes()
 
-		// Skip empty lines
 		if len(line) == 0 {
 			continue
 		}
 
 		var op PLCOperation
 		if err := json.Unmarshal(line, &op); err != nil {
-			fmt.Printf("Warning: failed to parse operation on line %d: %v\n", lineCount, err)
+			log.Printf("Warning: failed to parse operation on line %d: %v", lineCount, err)
 			continue
 		}
 		operations = append(operations, op)
@@ -91,6 +89,8 @@ func (c *Client) Export(ctx context.Context, opts ExportOptions) ([]PLCOperation
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading response: %w", err)
 	}
+
+	log.Printf("← Received %d operations", len(operations))
 
 	return operations, nil
 }
