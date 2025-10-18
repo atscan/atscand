@@ -27,4 +27,5 @@ type PDSStatus struct {
 	LastChecked  time.Time
 	ErrorMessage string
 	Description  *ServerDescription
+	DIDs         []string
 }

@@ -66,6 +66,7 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	// Process results
 	successCount := 0
 	failureCount := 0
+	totalUsers := int64(0)
 
 	for status := range results {
 		if err := s.db.UpdatePDSStatus(ctx, status.Endpoint, &storage.PDSUpdate{
@@ -74,19 +75,21 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 			ResponseTime: status.ResponseTime.Milliseconds(),
 			ErrorMessage: status.ErrorMessage,
 			ServerInfo:   status.Description,
+			DIDs:         status.DIDs, // NEW: Store DIDs
 		}); err != nil {
 			log.Printf("Error updating PDS %s: %v", status.Endpoint, err)
 		}
 
 		if status.Available {
 			successCount++
+			totalUsers += int64(len(status.DIDs))
 		} else {
 			failureCount++
 		}
 	}
 
-	log.Printf("PDS scan completed: %d available, %d unavailable in %v",
-		successCount, failureCount, time.Since(startTime))
+	log.Printf("PDS scan completed: %d available, %d unavailable, %d total users in %v",
+		successCount, failureCount, totalUsers, time.Since(startTime))
 
 	return nil
 }
@@ -127,10 +130,19 @@ func (s *Scanner) scanPDS(ctx context.Context, endpoint string) *PDSStatus {
 	// Describe server
 	desc, err := s.client.DescribeServer(ctx, endpoint)
 	if err != nil {
-		log.Printf("Error describing server %s: %v", endpoint, err)
-		// Still mark as available if health check passed
+		log.Printf("Warning: failed to describe server %s: %v", endpoint, err)
 	} else {
 		status.Description = desc
+	}
+
+	// List repos (DIDs) - NEW
+	dids, err := s.client.ListRepos(ctx, endpoint)
+	if err != nil {
+		log.Printf("Warning: failed to list repos for %s: %v", endpoint, err)
+		status.DIDs = []string{} // Empty if failed
+	} else {
+		status.DIDs = dids
+		log.Printf("  → Found %d users on %s", len(dids), endpoint)
 	}
 
 	return status

@@ -23,9 +23,10 @@ type Database interface {
 	// Bundle operations
 	CreateBundle(ctx context.Context, bundle *PLCBundle) error
 	GetBundle(ctx context.Context, afterTime time.Time) (*PLCBundle, error)
+	GetBundleByID(ctx context.Context, bundleID int64) (*PLCBundle, error)
 	GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error)
+	GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error) // JSON query
 	GetBundleStats(ctx context.Context) (int64, int64, error)
-	GetAllBundles(ctx context.Context) ([]*PLCBundle, error) // For DID search
 
 	// Metrics
 	StorePLCMetrics(ctx context.Context, metrics *PLCMetrics) error

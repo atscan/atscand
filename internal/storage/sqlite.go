@@ -43,12 +43,14 @@ func (s *SQLiteDB) Migrate() error {
         response_time_ms INTEGER,
         error_message TEXT,
         server_info TEXT,
+        dids TEXT DEFAULT '[]',
         user_count INTEGER DEFAULT 0,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE INDEX IF NOT EXISTS idx_pds_status ON pds_servers(status);
     CREATE INDEX IF NOT EXISTS idx_pds_last_checked ON pds_servers(last_checked);
+    CREATE INDEX IF NOT EXISTS idx_pds_user_count ON pds_servers(user_count);
 
     CREATE TABLE IF NOT EXISTS plc_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,8 +95,8 @@ func (s *SQLiteDB) Migrate() error {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE INDEX IF NOT EXISTS idx_plc_bundles_time ON plc_bundles(start_time, end_time);
-    CREATE INDEX IF NOT EXISTS idx_plc_bundles_created ON plc_bundles(created_at);
+    -- CREATE INDEX IF NOT EXISTS idx_plc_bundles_time ON plc_bundles(start_time, end_time);
+    -- CREATE INDEX IF NOT EXISTS idx_plc_bundles_created ON plc_bundles(created_at);
     `
 
 	_, err := s.db.Exec(schema)
@@ -206,6 +208,53 @@ func (s *SQLiteDB) GetAllBundles(ctx context.Context) ([]*PLCBundle, error) {
 	return s.scanBundles(rows)
 }
 
+// GetBundlesForDID finds bundles containing a specific DID using JSON functions
+func (s *SQLiteDB) GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error) {
+	query := `
+        SELECT id, start_time, end_time, operation_count, dids, file_path, file_size, compressed, created_at
+        FROM plc_bundles
+        WHERE EXISTS (
+            SELECT 1 FROM json_each(dids) 
+            WHERE json_each.value = ?
+        )
+        ORDER BY start_time ASC
+    `
+
+	rows, err := s.db.QueryContext(ctx, query, did)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return s.scanBundles(rows)
+}
+
+// GetBundleByID retrieves a single bundle by ID
+func (s *SQLiteDB) GetBundleByID(ctx context.Context, bundleID int64) (*PLCBundle, error) {
+	query := `
+        SELECT id, start_time, end_time, operation_count, dids, file_path, file_size, compressed, created_at
+        FROM plc_bundles
+        WHERE id = ?
+    `
+
+	var bundle PLCBundle
+	var didsJSON string
+
+	err := s.db.QueryRowContext(ctx, query, bundleID).Scan(
+		&bundle.ID, &bundle.StartTime, &bundle.EndTime, &bundle.OperationCount,
+		&didsJSON, &bundle.FilePath, &bundle.FileSize, &bundle.Compressed, &bundle.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal([]byte(didsJSON), &bundle.DIDs); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal DIDs: %w", err)
+	}
+
+	return &bundle, nil
+}
+
 // Helper to scan bundle rows
 func (s *SQLiteDB) scanBundles(rows *sql.Rows) ([]*PLCBundle, error) {
 	var bundles []*PLCBundle
@@ -266,11 +315,63 @@ func (s *SQLiteDB) UpsertPDS(ctx context.Context, pds *PDS) error {
 	return err
 }
 
+// UpdatePDSStatus updates the status, metrics, and DIDs of a PDS server
+func (s *SQLiteDB) UpdatePDSStatus(ctx context.Context, endpoint string, update *PDSUpdate) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Marshal server info
+	var serverInfoJSON []byte
+	if update.ServerInfo != nil {
+		serverInfoJSON, _ = json.Marshal(update.ServerInfo)
+	}
+
+	// Marshal DIDs
+	var didsJSON []byte
+	if update.DIDs != nil {
+		didsJSON, _ = json.Marshal(update.DIDs)
+	} else {
+		didsJSON = []byte("[]")
+	}
+
+	// Calculate user count
+	userCount := len(update.DIDs)
+
+	query := `
+        UPDATE pds_servers 
+        SET status = ?, last_checked = ?, response_time_ms = ?, error_message = ?, 
+            server_info = ?, dids = ?, user_count = ?, updated_at = ?
+        WHERE endpoint = ?
+    `
+	_, err = tx.ExecContext(ctx, query,
+		update.Status, update.LastChecked, update.ResponseTime,
+		update.ErrorMessage, string(serverInfoJSON), string(didsJSON), userCount, time.Now(), endpoint)
+	if err != nil {
+		return err
+	}
+
+	// Insert scan history
+	scanQuery := `
+        INSERT INTO pds_scans (endpoint, status, response_time_ms, error_message, server_info)
+        VALUES (?, ?, ?, ?, ?)
+    `
+	_, err = tx.ExecContext(ctx, scanQuery, endpoint, update.Status, update.ResponseTime,
+		update.ErrorMessage, string(serverInfoJSON))
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
 // GetPDS retrieves a single PDS server by endpoint
 func (s *SQLiteDB) GetPDS(ctx context.Context, endpoint string) (*PDS, error) {
 	query := `
         SELECT endpoint, discovered_at, last_checked, status, response_time_ms, 
-               error_message, server_info, user_count 
+               error_message, server_info, dids, user_count 
         FROM pds_servers 
         WHERE endpoint = ?
     `
@@ -280,10 +381,11 @@ func (s *SQLiteDB) GetPDS(ctx context.Context, endpoint string) (*PDS, error) {
 	var responseTime sql.NullInt64
 	var errorMsg sql.NullString
 	var serverInfo sql.NullString
+	var didsJSON string
 
 	err := s.db.QueryRowContext(ctx, query, endpoint).Scan(
 		&pds.Endpoint, &pds.DiscoveredAt, &lastChecked, &pds.Status,
-		&responseTime, &errorMsg, &serverInfo, &pds.UserCount,
+		&responseTime, &errorMsg, &serverInfo, &didsJSON, &pds.UserCount,
 	)
 	if err != nil {
 		return nil, err
@@ -300,6 +402,11 @@ func (s *SQLiteDB) GetPDS(ctx context.Context, endpoint string) (*PDS, error) {
 	}
 	if serverInfo.Valid && serverInfo.String != "" {
 		json.Unmarshal([]byte(serverInfo.String), &pds.ServerInfo)
+	}
+
+	// Unmarshal DIDs
+	if didsJSON != "" {
+		json.Unmarshal([]byte(didsJSON), &pds.DIDs)
 	}
 
 	return &pds, nil
@@ -360,45 +467,6 @@ func (s *SQLiteDB) GetPDSServers(ctx context.Context, filter *PDSFilter) ([]*PDS
 	}
 
 	return servers, rows.Err()
-}
-
-// UpdatePDSStatus updates the status and metrics of a PDS server
-func (s *SQLiteDB) UpdatePDSStatus(ctx context.Context, endpoint string, update *PDSUpdate) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// Update main record
-	var serverInfoJSON []byte
-	if update.ServerInfo != nil {
-		serverInfoJSON, _ = json.Marshal(update.ServerInfo)
-	}
-
-	query := `
-        UPDATE pds_servers 
-        SET status = ?, last_checked = ?, response_time_ms = ?, error_message = ?, server_info = ?, updated_at = ?
-        WHERE endpoint = ?
-    `
-	_, err = tx.ExecContext(ctx, query, update.Status, update.LastChecked, update.ResponseTime,
-		update.ErrorMessage, string(serverInfoJSON), time.Now(), endpoint)
-	if err != nil {
-		return err
-	}
-
-	// Insert scan history
-	scanQuery := `
-        INSERT INTO pds_scans (endpoint, status, response_time_ms, error_message, server_info)
-        VALUES (?, ?, ?, ?, ?)
-    `
-	_, err = tx.ExecContext(ctx, scanQuery, endpoint, update.Status, update.ResponseTime,
-		update.ErrorMessage, string(serverInfoJSON))
-	if err != nil {
-		return err
-	}
-
-	return tx.Commit()
 }
 
 // GetScanCursor retrieves the last scan cursor for a source

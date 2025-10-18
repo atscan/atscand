@@ -56,7 +56,22 @@ func (s *Server) handleGetPDS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, pds)
+	// Optionally include DIDs list or just count
+	includeDIDs := r.URL.Query().Get("include_dids") == "true"
+
+	response := map[string]interface{}{
+		"endpoint":      pds.Endpoint,
+		"discovered_at": pds.DiscoveredAt,
+		"last_checked":  pds.LastChecked,
+		"status":        pds.Status,
+		"user_count":    pds.UserCount,
+	}
+
+	if includeDIDs {
+		response["dids"] = pds.DIDs
+	}
+
+	respondJSON(w, response)
 }
 
 func (s *Server) handleGetPDSStats(w http.ResponseWriter, r *http.Request) {
@@ -75,31 +90,20 @@ func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	did := vars["did"]
 
-	// Get all bundles and search for DID
-	bundles, err := s.db.GetAllBundles(ctx)
+	// Use SQL JSON query to find bundles
+	bundles, err := s.db.GetBundlesForDID(ctx, did)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Find bundles containing this DID
-	var relevantBundles []*storage.PLCBundle
-	for _, bundle := range bundles {
-		for _, bundleDID := range bundle.DIDs {
-			if bundleDID == did {
-				relevantBundles = append(relevantBundles, bundle)
-				break
-			}
-		}
-	}
-
-	if len(relevantBundles) == 0 {
+	if len(bundles) == 0 {
 		http.Error(w, "DID not found in bundles", http.StatusNotFound)
 		return
 	}
 
-	// Load the last bundle and find latest operation
-	lastBundle := relevantBundles[len(relevantBundles)-1]
+	// Load the last bundle (most recent)
+	lastBundle := bundles[len(bundles)-1]
 
 	operations, err := s.loadBundleOperations(lastBundle.FilePath)
 	if err != nil {
@@ -129,25 +133,14 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	did := vars["did"]
 
-	// Get all bundles
-	bundles, err := s.db.GetAllBundles(ctx)
+	// Use SQL JSON query
+	bundles, err := s.db.GetBundlesForDID(ctx, did)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Find bundles containing this DID
-	var relevantBundles []*storage.PLCBundle
-	for _, bundle := range bundles {
-		for _, bundleDID := range bundle.DIDs {
-			if bundleDID == did {
-				relevantBundles = append(relevantBundles, bundle)
-				break
-			}
-		}
-	}
-
-	if len(relevantBundles) == 0 {
+	if len(bundles) == 0 {
 		http.Error(w, "DID not found in bundles", http.StatusNotFound)
 		return
 	}
@@ -155,8 +148,8 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	var allOperations []plc.DIDHistoryEntry
 	var currentOp *plc.PLCOperation
 
-	// Load relevant bundles
-	for _, bundle := range relevantBundles {
+	// Load all relevant bundles
+	for _, bundle := range bundles {
 		operations, err := s.loadBundleOperations(bundle.FilePath)
 		if err != nil {
 			log.Printf("Warning: failed to load bundle: %v", err)
@@ -194,25 +187,17 @@ func (s *Server) handleGetBundleDIDs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get all bundles and find the one we want
-	bundles, err := s.db.GetAllBundles(ctx)
+	bundle, err := s.db.GetBundleByID(ctx, bundleID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "bundle not found", http.StatusNotFound)
 		return
 	}
 
-	for _, bundle := range bundles {
-		if bundle.ID == bundleID {
-			respondJSON(w, map[string]interface{}{
-				"bundle_id": bundleID,
-				"did_count": len(bundle.DIDs),
-				"dids":      bundle.DIDs,
-			})
-			return
-		}
-	}
-
-	http.Error(w, "bundle not found", http.StatusNotFound)
+	respondJSON(w, map[string]interface{}{
+		"bundle_id": bundleID,
+		"did_count": len(bundle.DIDs),
+		"dids":      bundle.DIDs,
+	})
 }
 
 // Helper to load bundle operations

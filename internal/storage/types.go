@@ -20,7 +20,8 @@ type PDS struct {
 	ResponseTime int64
 	ErrorMessage string
 	ServerInfo   interface{}
-	UserCount    int64
+	DIDs         []string // NEW: List of DIDs hosted on this PDS
+	UserCount    int64    // Calculated from len(DIDs)
 }
 
 // PDSUpdate contains fields to update for a PDS
@@ -30,6 +31,7 @@ type PDSUpdate struct {
 	ResponseTime int64
 	ErrorMessage string
 	ServerInfo   interface{}
+	DIDs         []string
 }
 
 // PDSFilter for querying PDS servers
