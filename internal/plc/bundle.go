@@ -26,21 +26,18 @@ func NewBundleManager(dir string, enabled bool, db storage.Database) (*BundleMan
 		return &BundleManager{enabled: false}, nil
 	}
 
-	// Create bundle directory if it doesn't exist
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create bundle dir: %w", err)
 	}
 
-	// Create zstd encoder with better compression
 	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
+		return nil, err
 	}
 
-	// Create zstd decoder
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
+		return nil, err
 	}
 
 	return &BundleManager{
@@ -61,18 +58,139 @@ func (bm *BundleManager) Close() {
 	}
 }
 
-// SaveBundle saves a complete bundle with DIDs as JSON array
-func (bm *BundleManager) SaveBundle(ctx context.Context, operations []PLCOperation, isComplete bool) error {
-	if !bm.enabled || !isComplete {
-		return nil
+// GetBundleFilename returns filename for bundle number (6-char hex)
+func (bm *BundleManager) GetBundleFilename(bundleNumber int) string {
+	return fmt.Sprintf("%06x.json.zst", bundleNumber)
+}
+
+// GetBundlePath returns full path for bundle number
+func (bm *BundleManager) GetBundlePath(bundleNumber int) string {
+	return filepath.Join(bm.dir, bm.GetBundleFilename(bundleNumber))
+}
+
+// BundleExists checks if bundle file exists locally
+func (bm *BundleManager) BundleExists(bundleNumber int) bool {
+	_, err := os.Stat(bm.GetBundlePath(bundleNumber))
+	return err == nil
+}
+
+// LoadBundle loads a bundle by number (from file or fetches from PLC)
+func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcClient *Client) ([]PLCOperation, error) {
+	if !bm.enabled {
+		return nil, fmt.Errorf("bundle manager disabled")
+	}
+
+	path := bm.GetBundlePath(bundleNumber)
+
+	// Try to load from local file first
+	if bm.BundleExists(bundleNumber) {
+		log.Printf("→ Loading bundle %06x from local file", bundleNumber)
+		return bm.loadBundleFromFile(path)
+	}
+
+	// Bundle doesn't exist locally - fetch from PLC directory
+	log.Printf("→ Bundle %06x not found locally, fetching from PLC directory...", bundleNumber)
+
+	// Get the cursor timestamp from previous bundle
+	var afterTimestamp string
+
+	if bundleNumber > 1 {
+		// Try to get previous bundle from database
+		prevBundle, err := bm.db.GetBundleByNumber(ctx, bundleNumber-1)
+		if err == nil && prevBundle != nil {
+			// Use end timestamp from previous bundle
+			afterTimestamp = prevBundle.EndTime.Format(time.RFC3339Nano)
+			log.Printf("  Using cursor from bundle %06x: %s", bundleNumber-1, afterTimestamp)
+		} else {
+			// Previous bundle not in database, try to load from file
+			if bm.BundleExists(bundleNumber - 1) {
+				prevOps, err := bm.loadBundleFromFile(bm.GetBundlePath(bundleNumber - 1))
+				if err == nil && len(prevOps) > 0 {
+					afterTimestamp = prevOps[len(prevOps)-1].CreatedAt.Format(time.RFC3339Nano)
+					log.Printf("  Using cursor from previous bundle file: %s", afterTimestamp)
+				}
+			}
+		}
+	}
+
+	// If still no timestamp (bundle 1 or couldn't get previous), start from beginning
+	if afterTimestamp == "" && bundleNumber > 1 {
+		return nil, fmt.Errorf("cannot determine cursor for bundle %06x (previous bundle not found)", bundleNumber)
+	}
+
+	operations, err := bm.fetchBundleFromPLC(ctx, plcClient, afterTimestamp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch bundle from PLC: %w", err)
 	}
 
 	if len(operations) == 0 {
-		return nil
+		return nil, fmt.Errorf("no operations returned for bundle %06x", bundleNumber)
 	}
 
-	startTime := operations[0].CreatedAt
-	endTime := operations[len(operations)-1].CreatedAt
+	// Save bundle locally
+	if err := bm.saveBundleFile(path, operations); err != nil {
+		log.Printf("Warning: failed to save bundle file: %v", err)
+	}
+
+	// Index in database
+	if err := bm.indexBundle(ctx, bundleNumber, operations, path); err != nil {
+		log.Printf("Warning: failed to index bundle: %v", err)
+	}
+
+	log.Printf("✓ Fetched and saved bundle %06x (%d operations, %s to %s)",
+		bundleNumber, len(operations),
+		operations[0].CreatedAt.Format("2006-01-02 15:04"),
+		operations[len(operations)-1].CreatedAt.Format("2006-01-02 15:04"))
+
+	return operations, nil
+}
+
+// fetchBundleFromPLC fetches operations from PLC directory using datetime cursor
+func (bm *BundleManager) fetchBundleFromPLC(ctx context.Context, client *Client, afterTimestamp string) ([]PLCOperation, error) {
+	// Fetch next batch of 1000 operations after the given timestamp
+	return client.Export(ctx, ExportOptions{
+		Count: 1000,
+		After: afterTimestamp, // ISO 8601 datetime from previous bundle
+	})
+}
+
+// saveBundleFile saves operations to a bundle file
+func (bm *BundleManager) saveBundleFile(path string, operations []PLCOperation) error {
+	jsonData, err := json.Marshal(operations)
+	if err != nil {
+		return err
+	}
+
+	compressed := bm.encoder.EncodeAll(jsonData, nil)
+
+	return os.WriteFile(path, compressed, 0644)
+}
+
+// loadBundleFromFile loads operations from bundle file
+func (bm *BundleManager) loadBundleFromFile(path string) ([]PLCOperation, error) {
+	compressedData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	decompressed, err := bm.decoder.DecodeAll(compressedData, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var operations []PLCOperation
+	if err := json.Unmarshal(decompressed, &operations); err != nil {
+		return nil, err
+	}
+
+	return operations, nil
+}
+
+// indexBundle stores bundle metadata in database
+func (bm *BundleManager) indexBundle(ctx context.Context, bundleNumber int, operations []PLCOperation, path string) error {
+	if len(operations) == 0 {
+		return nil
+	}
 
 	// Extract unique DIDs
 	didSet := make(map[string]bool)
@@ -85,200 +203,59 @@ func (bm *BundleManager) SaveBundle(ctx context.Context, operations []PLCOperati
 		dids = append(dids, did)
 	}
 
-	// Generate filename
-	filename := fmt.Sprintf("plc_bundle_%s.json.zst", startTime.Format("2006-01-02T15-04-05"))
-	filePath := filepath.Join(bm.dir, filename)
-
-	// Check if exists
-	if _, err := os.Stat(filePath); err == nil {
-		log.Printf("Bundle already exists: %s", filename)
-		return nil
+	fileInfo, _ := os.Stat(path)
+	fileSize := int64(0)
+	if fileInfo != nil {
+		fileSize = fileInfo.Size()
 	}
 
-	// Marshal and compress
-	jsonData, err := json.Marshal(operations)
-	if err != nil {
-		return fmt.Errorf("failed to marshal operations: %w", err)
-	}
-
-	compressed := bm.encoder.EncodeAll(jsonData, nil)
-
-	// Write to file
-	if err := os.WriteFile(filePath, compressed, 0644); err != nil {
-		return fmt.Errorf("failed to write bundle file: %w", err)
-	}
-
-	// Store metadata with DIDs as JSON
 	bundle := &storage.PLCBundle{
-		StartTime:      startTime,
-		EndTime:        endTime,
+		BundleNumber:   bundleNumber,
+		StartTime:      operations[0].CreatedAt,
+		EndTime:        operations[len(operations)-1].CreatedAt,
 		OperationCount: len(operations),
 		DIDs:           dids,
-		FilePath:       filePath,
-		FileSize:       int64(len(compressed)),
+		FilePath:       path,
+		FileSize:       fileSize,
 		Compressed:     true,
 		CreatedAt:      time.Now(),
 	}
 
-	if err := bm.db.CreateBundle(ctx, bundle); err != nil {
-		return fmt.Errorf("failed to store bundle metadata: %w", err)
-	}
-
-	return nil
+	return bm.db.CreateBundle(ctx, bundle)
 }
 
-// DiscoverAndIndexBundles - same logic
-func (bm *BundleManager) DiscoverAndIndexBundles(ctx context.Context) error {
+// CreateBundleFromMempool creates a bundle from mempool operations
+func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations []PLCOperation) (int, error) {
 	if !bm.enabled {
-		return nil
+		return 0, fmt.Errorf("bundle manager disabled")
 	}
 
-	log.Println("Discovering bundle files...")
+	if len(operations) != 1000 {
+		return 0, fmt.Errorf("bundle must have exactly 1000 operations, got %d", len(operations))
+	}
 
-	existingBundles, err := bm.db.GetBundles(ctx, 10000)
+	// Get next bundle number
+	lastBundle, err := bm.db.GetLastBundleNumber(ctx)
 	if err != nil {
-		existingBundles = []*storage.PLCBundle{}
+		return 0, err
+	}
+	bundleNumber := lastBundle + 1
+
+	path := bm.GetBundlePath(bundleNumber)
+
+	// Save bundle file
+	if err := bm.saveBundleFile(path, operations); err != nil {
+		return 0, err
 	}
 
-	existingPaths := make(map[string]bool)
-	for _, bundle := range existingBundles {
-		existingPaths[bundle.FilePath] = true
+	// Index bundle
+	if err := bm.indexBundle(ctx, bundleNumber, operations, path); err != nil {
+		return 0, err
 	}
 
-	pattern := filepath.Join(bm.dir, "*.zst")
-	files, err := filepath.Glob(pattern)
-	if err != nil {
-		return fmt.Errorf("failed to scan bundle directory: %w", err)
-	}
+	log.Printf("✓ Created bundle %06x from mempool (%d operations)", bundleNumber, len(operations))
 
-	if len(files) == 0 {
-		log.Println("No bundle files found")
-		return nil
-	}
-
-	log.Printf("Found %d bundle files", len(files))
-
-	newBundles := 0
-	for _, filePath := range files {
-		if existingPaths[filePath] {
-			continue
-		}
-
-		operations, err := bm.loadBundleFromFile(filePath)
-		if err != nil {
-			log.Printf("Warning: failed to load bundle %s: %v", filepath.Base(filePath), err)
-			continue
-		}
-
-		if len(operations) == 0 {
-			continue
-		}
-
-		// Extract unique DIDs
-		didSet := make(map[string]bool)
-		for _, op := range operations {
-			didSet[op.DID] = true
-		}
-
-		dids := make([]string, 0, len(didSet))
-		for did := range didSet {
-			dids = append(dids, did)
-		}
-
-		fileInfo, err := os.Stat(filePath)
-		if err != nil {
-			continue
-		}
-
-		bundle := &storage.PLCBundle{
-			StartTime:      operations[0].CreatedAt,
-			EndTime:        operations[len(operations)-1].CreatedAt,
-			OperationCount: len(operations),
-			DIDs:           dids,
-			FilePath:       filePath,
-			FileSize:       fileInfo.Size(),
-			Compressed:     true,
-			CreatedAt:      fileInfo.ModTime(),
-		}
-
-		if err := bm.db.CreateBundle(ctx, bundle); err != nil {
-			log.Printf("Warning: failed to index bundle %s: %v", filepath.Base(filePath), err)
-			continue
-		}
-
-		log.Printf("✓ Indexed bundle: %s (%d ops, %d DIDs, %.2f MB)",
-			filepath.Base(filePath), bundle.OperationCount, len(dids),
-			float64(bundle.FileSize)/1024/1024)
-
-		newBundles++
-	}
-
-	if newBundles > 0 {
-		log.Printf("Indexed %d new bundles", newBundles)
-	}
-
-	return nil
-}
-
-// FindBundle checks if a bundle exists for the given time (or next available)
-func (bm *BundleManager) FindBundle(ctx context.Context, afterTimestamp string) (*storage.PLCBundle, error) {
-	if !bm.enabled {
-		return nil, nil
-	}
-
-	var afterTime time.Time
-
-	if afterTimestamp == "" {
-		// Start from beginning of time to get first bundle
-		afterTime = time.Time{}
-	} else {
-		// Parse timestamp
-		var parseErr error
-		afterTime, parseErr = time.Parse(time.RFC3339Nano, afterTimestamp)
-		if parseErr != nil {
-			afterTime, parseErr = time.Parse(time.RFC3339, afterTimestamp)
-			if parseErr != nil {
-				return nil, nil // Can't parse, skip
-			}
-		}
-	}
-
-	// Get next bundle after this time (or first bundle if afterTime is zero)
-	bundle, err := bm.db.GetBundle(ctx, afterTime)
-	if err != nil || bundle == nil {
-		return nil, nil // No bundle found
-	}
-
-	// Verify file exists
-	if _, err := os.Stat(bundle.FilePath); err != nil {
-		log.Printf("Warning: bundle file not found: %s", bundle.FilePath)
-		return nil, nil
-	}
-
-	return bundle, nil
-}
-
-// LoadBundleFromFile loads operations from a bundle file
-func (bm *BundleManager) loadBundleFromFile(path string) ([]PLCOperation, error) {
-	// Read compressed file
-	compressedData, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read bundle file: %w", err)
-	}
-
-	// Decompress
-	decompressed, err := bm.decoder.DecodeAll(compressedData, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress bundle: %w", err)
-	}
-
-	// Unmarshal JSON
-	var operations []PLCOperation
-	if err := json.Unmarshal(decompressed, &operations); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal bundle: %w", err)
-	}
-
-	return operations, nil
+	return bundleNumber, nil
 }
 
 // GetStats returns bundle statistics
@@ -287,4 +264,23 @@ func (bm *BundleManager) GetStats(ctx context.Context) (int64, int64, error) {
 		return 0, 0, nil
 	}
 	return bm.db.GetBundleStats(ctx)
+}
+
+// EnsureBundleContinuity checks that all bundles from 1 to N exist
+func (bm *BundleManager) EnsureBundleContinuity(ctx context.Context, targetBundle int) error {
+	if !bm.enabled {
+		return nil
+	}
+
+	for i := 1; i < targetBundle; i++ {
+		if !bm.BundleExists(i) {
+			// Check if in database
+			_, err := bm.db.GetBundleByNumber(ctx, i)
+			if err != nil {
+				return fmt.Errorf("bundle %06x is missing (required for continuity)", i)
+			}
+		}
+	}
+
+	return nil
 }

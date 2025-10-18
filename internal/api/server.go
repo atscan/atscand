@@ -41,25 +41,28 @@ func (s *Server) setupRoutes() {
 
 	// PDS endpoints
 	api.HandleFunc("/pds", s.handleGetPDSList).Methods("GET")
-	api.HandleFunc("/pds/stats", s.handleGetPDSStats).Methods("GET")
 	api.HandleFunc("/pds/{endpoint}", s.handleGetPDS).Methods("GET")
+	api.HandleFunc("/pds/stats", s.handleGetPDSStats).Methods("GET")
 
 	// Metrics endpoints
 	api.HandleFunc("/metrics/plc", s.handleGetPLCMetrics).Methods("GET")
 
-	// Bundle endpoints
+	// Bundle endpoints - UPDATED to use bundle number
 	api.HandleFunc("/bundles", s.handleGetBundles).Methods("GET")
 	api.HandleFunc("/bundles/stats", s.handleGetBundleStats).Methods("GET")
-	api.HandleFunc("/bundles/{id}/dids", s.handleGetBundleDIDs).Methods("GET")
+	api.HandleFunc("/bundles/{number}/dids", s.handleGetBundleDIDs).Methods("GET") // Changed
+	api.HandleFunc("/bundles/{number}", s.handleGetBundle).Methods("GET")          // NEW
 
-	// PLC/DID endpoints - NEW
+	// PLC/DID endpoints
 	api.HandleFunc("/plc/{did}", s.handleGetDID).Methods("GET")
 	api.HandleFunc("/plc/{did}/history", s.handleGetDIDHistory).Methods("GET")
+
+	// Mempool endpoint - NEW
+	api.HandleFunc("/mempool/stats", s.handleGetMempoolStats).Methods("GET")
 
 	// Health check
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
 }
-
 func (s *Server) Start() error {
 	log.Printf("API server listening on %s", s.server.Addr)
 	return s.server.ListenAndServe()

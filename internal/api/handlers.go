@@ -188,26 +188,60 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, history)
 }
 
+func (s *Server) handleGetBundle(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+
+	bundleNumber, err := strconv.Atoi(vars["number"])
+	if err != nil {
+		http.Error(w, "invalid bundle number", http.StatusBadRequest)
+		return
+	}
+
+	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
+	if err != nil {
+		http.Error(w, "bundle not found", http.StatusNotFound)
+		return
+	}
+
+	respondJSON(w, bundle)
+}
+
 func (s *Server) handleGetBundleDIDs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
 
-	bundleID, err := strconv.ParseInt(vars["id"], 10, 64)
+	bundleNumber, err := strconv.Atoi(vars["number"])
 	if err != nil {
-		http.Error(w, "invalid bundle ID", http.StatusBadRequest)
+		http.Error(w, "invalid bundle number", http.StatusBadRequest)
 		return
 	}
 
-	bundle, err := s.db.GetBundleByID(ctx, bundleID)
+	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
 	if err != nil {
 		http.Error(w, "bundle not found", http.StatusNotFound)
 		return
 	}
 
 	respondJSON(w, map[string]interface{}{
-		"bundle_id": bundleID,
-		"did_count": len(bundle.DIDs),
-		"dids":      bundle.DIDs,
+		"bundle_number": bundle.BundleNumber,
+		"did_count":     len(bundle.DIDs),
+		"dids":          bundle.DIDs,
+	})
+}
+
+func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	count, err := s.db.GetMempoolCount(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{
+		"operation_count":   count,
+		"can_create_bundle": count >= 1000,
 	})
 }
 

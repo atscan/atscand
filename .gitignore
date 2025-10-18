@@ -1,5 +1,6 @@
-plc_cache
+plc_cache*
 *.db
 *.db-*
 atscanner
 .DS_Store
+plc_cache\.tmp/*

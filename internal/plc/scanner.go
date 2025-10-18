@@ -2,6 +2,7 @@ package plc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -42,221 +43,223 @@ func (s *Scanner) Scan(ctx context.Context) error {
 	startTime := time.Now()
 	log.Println("Starting PLC directory scan...")
 
-	// Auto-discover bundles if using cache
-	if s.config.UseCache {
-		if err := s.bundleManager.DiscoverAndIndexBundles(ctx); err != nil {
-			log.Printf("Warning: bundle discovery failed: %v", err)
-		}
-	}
-
-	// Print bundle stats
-	if s.config.UseCache {
-		count, size, _ := s.bundleManager.GetStats(ctx)
-		if count > 0 {
-			log.Printf("Bundles available: %d files, %.2f MB total", count, float64(size)/1024/1024)
-		} else {
-			log.Println("No bundles available (will fetch from API)")
-		}
-	}
-
-	// Get last cursor position
+	// Get cursor
 	cursor, err := s.db.GetScanCursor(ctx, "plc_directory")
 	if err != nil {
 		return fmt.Errorf("failed to get scan cursor: %w", err)
 	}
 
-	afterTimestamp := cursor.LastTimestamp
-
-	if afterTimestamp != "" {
-		log.Printf("Resuming from timestamp: %s", afterTimestamp)
+	currentBundle := cursor.LastBundleNumber
+	if currentBundle == 0 {
+		currentBundle = 1 // Start from bundle 1
 	} else {
-		log.Println("Starting fresh scan")
+		currentBundle++ // Continue from next bundle
 	}
-	metrics := &storage.PLCMetrics{
-		LastScanTime: startTime,
+
+	log.Printf("Starting from bundle %06x", currentBundle)
+
+	// Ensure bundle continuity (all previous bundles exist)
+	if currentBundle > 1 {
+		log.Printf("Checking bundle continuity...")
+		if err := s.bundleManager.EnsureBundleContinuity(ctx, currentBundle); err != nil {
+			return fmt.Errorf("bundle continuity check failed: %w", err)
+		}
 	}
 
 	totalProcessed := int64(0)
 	newPDSCount := int64(0)
-	latestTimestamp := afterTimestamp
-	consecutiveErrors := 0
-	maxConsecutiveErrors := 3
-	bundlesUsed := 0
-	apiFetches := 0
 
-	// Rest of the scanning logic stays the same...
+	// Process bundles sequentially
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Scan interrupted by context cancellation")
 			return ctx.Err()
 		default:
 		}
 
-		// Try to find a bundle first
-		var operations []PLCOperation
-		var fromBundle bool
+		log.Printf("→ Processing bundle %06x...", currentBundle)
 
-		bundle, err := s.bundleManager.FindBundle(ctx, afterTimestamp)
-		if err == nil && bundle != nil {
-			log.Printf("→ Using bundle: %s to %s (%d ops, %.2f MB)",
-				bundle.StartTime.Format("2006-01-02 15:04"),
-				bundle.EndTime.Format("2006-01-02 15:04"),
-				bundle.OperationCount,
-				float64(bundle.FileSize)/1024/1024)
-
-			ops, err := s.bundleManager.loadBundleFromFile(bundle.FilePath)
-			if err != nil {
-				log.Printf("Warning: failed to load bundle, falling back to API: %v", err)
-			} else {
-				operations = ops
-				fromBundle = true
-				bundlesUsed++
-
-				// Jump to end of this bundle for next iteration
-				afterTimestamp = bundle.EndTime.Format(time.RFC3339Nano)
-			}
-		}
-
-		// Fetch from API if no bundle
-		if !fromBundle {
-			ops, err := s.fetchWithRetry(ctx, afterTimestamp, 3)
-			if err != nil {
-				metrics.ErrorCount++
-				consecutiveErrors++
-
-				log.Printf("Error fetching operations (attempt %d/%d): %v",
-					consecutiveErrors, maxConsecutiveErrors, err)
-
-				if consecutiveErrors >= maxConsecutiveErrors {
-					return fmt.Errorf("failed after %d consecutive errors: %w", maxConsecutiveErrors, err)
-				}
-
-				backoff := time.Duration(consecutiveErrors) * 5 * time.Second
-				log.Printf("Backing off for %v before retry...", backoff)
-				time.Sleep(backoff)
-				continue
-			}
-			operations = ops
-			apiFetches++
-		}
-
-		consecutiveErrors = 0
-
-		if len(operations) == 0 {
-			log.Println("No more operations to process")
-			break
-		}
-
-		bundleStatus := ""
-		if fromBundle {
-			bundleStatus = " [bundled]"
-		}
-		log.Printf("Processing batch of %d operations%s", len(operations), bundleStatus)
-
-		// Process this batch
-		batchNewPDS, err := s.processBatch(ctx, operations)
+		// Load bundle (lazy-loaded from file or PLC)
+		operations, err := s.bundleManager.LoadBundle(ctx, currentBundle, s.client)
 		if err != nil {
-			log.Printf("Error processing batch: %v", err)
-			metrics.ErrorCount++
-		}
+			log.Printf("Failed to load bundle %06x: %v", currentBundle, err)
 
-		newPDSCount += batchNewPDS
-		totalProcessed += int64(len(operations))
+			// Check if this is just end of data (not an error)
+			if currentBundle > 1 {
+				// Try to fetch with cursor from previous bundle
+				log.Println("→ Checking if we've reached the end of available data...")
 
-		// Save as bundle if complete batch and not from bundle
-		isCompleteBundle := len(operations) == s.config.BatchSize
-		if !fromBundle && isCompleteBundle {
-			if err := s.bundleManager.SaveBundle(ctx, operations, true); err != nil {
-				log.Printf("Warning: failed to save bundle: %v", err)
-			} else {
-				log.Printf("✓ Saved bundle (%d operations)", len(operations))
+				// Get previous bundle to check timestamp
+				prevBundle, err := s.db.GetBundleByNumber(ctx, currentBundle-1)
+				if err == nil {
+					// Try fetching with after timestamp
+					afterTimestamp := prevBundle.EndTime.Format(time.RFC3339Nano)
+					ops, err := s.client.Export(ctx, ExportOptions{
+						Count: 1000,
+						After: afterTimestamp,
+					})
+
+					if err == nil && len(ops) > 0 {
+						// More data available, add to mempool
+						log.Printf("→ Found %d operations, adding to mempool", len(ops))
+						if err := s.addToMempool(ctx, ops); err != nil {
+							log.Printf("Error adding to mempool: %v", err)
+						}
+
+						// Process mempool
+						if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
+							log.Printf("Error processing mempool: %v", err)
+						}
+					}
+				}
 			}
+
+			break // End of available data
 		}
 
-		// Update timestamp to latest operation
-		if len(operations) > 0 && !fromBundle {
-			lastOp := operations[len(operations)-1]
-			latestTimestamp = lastOp.CreatedAt.Format(time.RFC3339Nano)
-			afterTimestamp = latestTimestamp
-		}
+		// Check if this is a complete bundle
+		isComplete := len(operations) == 1000
 
-		// Save cursor
-		if latestTimestamp != "" {
+		if isComplete {
+			// Process complete bundle
+			batchNewPDS, err := s.processBatch(ctx, operations)
+			if err != nil {
+				log.Printf("Error processing bundle: %v", err)
+			}
+
+			newPDSCount += batchNewPDS
+			totalProcessed += int64(len(operations))
+
+			log.Printf("✓ Processed bundle %06x: %d operations, %d new PDS",
+				currentBundle, len(operations), batchNewPDS)
+
+			// Update cursor
 			if err := s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
 				Source:           "plc_directory",
-				LastTimestamp:    latestTimestamp,
+				LastBundleNumber: currentBundle,
 				LastScanTime:     time.Now(),
 				RecordsProcessed: cursor.RecordsProcessed + totalProcessed,
 			}); err != nil {
 				log.Printf("Warning: failed to update cursor: %v", err)
 			}
+
+			currentBundle++
+		} else {
+			// Incomplete bundle - add to mempool
+			log.Printf("→ Bundle %06x incomplete (%d ops), adding to mempool", currentBundle, len(operations))
+
+			if err := s.addToMempool(ctx, operations); err != nil {
+				log.Printf("Error adding to mempool: %v", err)
+			}
+
+			// Process mempool
+			if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
+				log.Printf("Error processing mempool: %v", err)
+			}
+
+			break // End of scan
 		}
 
-		// Check if end of stream
-		if !fromBundle && len(operations) < s.config.BatchSize {
-			log.Println("Reached end of PLC export (partial batch)")
-			break
-		}
-
-		// Rate limiting (only for API fetches)
-		if !fromBundle {
-			time.Sleep(500 * time.Millisecond)
-		}
+		// Rate limiting
+		time.Sleep(200 * time.Millisecond)
 	}
-
-	// Final cursor update and metrics (same as before)
-	if latestTimestamp != cursor.LastTimestamp && latestTimestamp != "" {
-		s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
-			Source:           "plc_directory",
-			LastTimestamp:    latestTimestamp,
-			LastScanTime:     time.Now(),
-			RecordsProcessed: cursor.RecordsProcessed + totalProcessed,
-		})
-	}
-
-	metrics.TotalDIDs = totalProcessed
-	metrics.TotalPDS = newPDSCount
-	metrics.UniquePDS = newPDSCount
-	metrics.ScanDuration = time.Since(startTime).Milliseconds()
-
-	s.db.StorePLCMetrics(ctx, metrics)
 
 	log.Printf("PLC scan completed: %d operations, %d new PDS servers in %v",
 		totalProcessed, newPDSCount, time.Since(startTime))
-	log.Printf("Source: %d bundles, %d API fetches", bundlesUsed, apiFetches)
 
 	return nil
 }
 
-// ... rest of scanner methods stay the same
+// addToMempool adds operations to mempool and processes them for PDS discovery
+func (s *Scanner) addToMempool(ctx context.Context, operations []PLCOperation) error {
+	mempoolOps := make([]storage.MempoolOperation, len(operations))
 
-func (s *Scanner) fetchWithRetry(ctx context.Context, afterTimestamp string, maxRetries int) ([]PLCOperation, error) {
-	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		operations, err := s.client.Export(ctx, ExportOptions{
-			Count: s.config.BatchSize,
-			After: afterTimestamp,
-		})
-
-		if err == nil {
-			return operations, nil
-		}
-
-		lastErr = err
-
-		if attempt < maxRetries {
-			backoff := time.Duration(attempt) * 2 * time.Second
-			log.Printf("Fetch attempt %d/%d failed: %v, retrying in %v...",
-				attempt, maxRetries, err, backoff)
-			time.Sleep(backoff)
+	for i, op := range operations {
+		opJSON, _ := json.Marshal(op)
+		mempoolOps[i] = storage.MempoolOperation{
+			DID:       op.DID,
+			Operation: string(opJSON),
+			CID:       op.CID,
+			CreatedAt: op.CreatedAt,
 		}
 	}
 
-	return nil, fmt.Errorf("all retry attempts failed: %w", lastErr)
+	// Add to mempool
+	if err := s.db.AddToMempool(ctx, mempoolOps); err != nil {
+		return err
+	}
+
+	// Process for PDS discovery immediately
+	_, err := s.processBatch(ctx, operations)
+	return err
 }
 
+// processMempoolRecursive checks mempool and creates bundles when >= 1000 ops
+func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int64, currentBundle *int, totalProcessed *int64) error {
+	for {
+		// Check mempool size
+		count, err := s.db.GetMempoolCount(ctx)
+		if err != nil {
+			return err
+		}
+
+		log.Printf("Mempool contains %d operations", count)
+
+		if count < 1000 {
+			log.Println("Mempool has < 1000 operations, waiting for more data")
+			break
+		}
+
+		// Get first 1000 operations ordered by timestamp
+		mempoolOps, err := s.db.GetMempoolOperations(ctx, 1000)
+		if err != nil {
+			return err
+		}
+
+		// Convert to PLCOperations
+		operations := make([]PLCOperation, len(mempoolOps))
+		mempoolIDs := make([]int64, len(mempoolOps))
+
+		for i, mop := range mempoolOps {
+			var op PLCOperation
+			json.Unmarshal([]byte(mop.Operation), &op)
+			operations[i] = op
+			mempoolIDs[i] = mop.ID
+		}
+
+		// Create bundle from these operations
+		bundleNum, err := s.bundleManager.CreateBundleFromMempool(ctx, operations)
+		if err != nil {
+			return err
+		}
+
+		// Remove from mempool
+		if err := s.db.DeleteFromMempool(ctx, mempoolIDs); err != nil {
+			return err
+		}
+
+		// Process for PDS (already processed when added, but for consistency)
+		batchNewPDS, _ := s.processBatch(ctx, operations)
+		*newPDSCount += batchNewPDS
+		*totalProcessed += int64(len(operations))
+
+		*currentBundle = bundleNum
+
+		// Update cursor
+		s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
+			Source:           "plc_directory",
+			LastBundleNumber: bundleNum,
+			LastScanTime:     time.Now(),
+			RecordsProcessed: *totalProcessed,
+		})
+
+		log.Printf("✓ Created bundle %06x from mempool", bundleNum)
+	}
+
+	return nil
+}
+
+// processBatch processes operations for PDS discovery
 func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (int64, error) {
 	newPDSCount := int64(0)
 	seenInBatch := make(map[string]*PLCOperation)
@@ -278,27 +281,21 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 
 	for pdsEndpoint, firstOp := range seenInBatch {
 		exists, err := s.db.PDSExists(ctx, pdsEndpoint)
-		if err != nil {
+		if err != nil || exists {
 			continue
 		}
 
-		if exists {
-			continue
-		}
-
-		// New PDS! Use storage.PDSStatusUnknown constant
 		if err := s.db.UpsertPDS(ctx, &storage.PDS{
 			Endpoint:     pdsEndpoint,
 			DiscoveredAt: firstOp.CreatedAt,
 			LastChecked:  time.Time{},
-			Status:       storage.PDSStatusUnknown, // FIX: Use integer constant
+			Status:       storage.PDSStatusUnknown,
 		}); err != nil {
 			log.Printf("Error storing PDS %s: %v", pdsEndpoint, err)
 			continue
 		}
 
-		log.Printf("✓ Discovered new PDS: %s (first seen: %s)",
-			pdsEndpoint, firstOp.CreatedAt.Format("2006-01-02 15:04"))
+		log.Printf("✓ Discovered new PDS: %s", pdsEndpoint)
 		newPDSCount++
 	}
 

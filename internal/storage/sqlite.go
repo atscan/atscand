@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -35,12 +36,13 @@ func (s *SQLiteDB) Close() error {
 
 func (s *SQLiteDB) Migrate() error {
 	schema := `
+    -- PDS tables (same as before)
     CREATE TABLE IF NOT EXISTS pds_servers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         endpoint TEXT UNIQUE NOT NULL,
         discovered_at TIMESTAMP NOT NULL,
         last_checked TIMESTAMP,
-        status INTEGER DEFAULT 0,  -- 0=unknown, 1=online, 2=offline
+        status INTEGER DEFAULT 0,
         user_count INTEGER DEFAULT 0,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -53,8 +55,8 @@ func (s *SQLiteDB) Migrate() error {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pds_id INTEGER NOT NULL,
         status INTEGER NOT NULL,
-        response_time REAL,  -- milliseconds as float
-        scan_data TEXT,  -- JSON: {server_info, dids, did_count}
+        response_time REAL,
+        scan_data TEXT,
         scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (pds_id) REFERENCES pds_servers(id) ON DELETE CASCADE
     );
@@ -62,6 +64,7 @@ func (s *SQLiteDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_pds_scans_pds_id ON pds_scans(pds_id);
     CREATE INDEX IF NOT EXISTS idx_pds_scans_scanned_at ON pds_scans(scanned_at);
 
+    -- Metrics
     CREATE TABLE IF NOT EXISTS plc_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         total_dids INTEGER,
@@ -72,15 +75,18 @@ func (s *SQLiteDB) Migrate() error {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- Scan cursors with bundle number
     CREATE TABLE IF NOT EXISTS scan_cursors (
         source TEXT PRIMARY KEY,
-        last_timestamp TEXT NOT NULL,
+        last_bundle_number INTEGER DEFAULT 0,
         last_scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         records_processed INTEGER DEFAULT 0
     );
 
+    -- Bundles with bundle number
     CREATE TABLE IF NOT EXISTS plc_bundles (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bundle_number INTEGER UNIQUE NOT NULL,
         start_time TIMESTAMP NOT NULL,
         end_time TIMESTAMP NOT NULL,
         operation_count INTEGER NOT NULL,
@@ -91,26 +97,159 @@ func (s *SQLiteDB) Migrate() error {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE INDEX IF NOT EXISTS idx_plc_bundles_number ON plc_bundles(bundle_number);
     CREATE INDEX IF NOT EXISTS idx_plc_bundles_time ON plc_bundles(start_time, end_time);
+
+    -- NEW: Mempool for pending operations
+    CREATE TABLE IF NOT EXISTS plc_mempool (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        did TEXT NOT NULL,
+        operation TEXT NOT NULL,  -- Full operation as JSON
+        cid TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL,  -- Operation timestamp
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mempool_created_at ON plc_mempool(created_at);
+    CREATE INDEX IF NOT EXISTS idx_mempool_did ON plc_mempool(did);
     `
 
 	_, err := s.db.Exec(schema)
 	return err
 }
 
-// CreateBundle stores a new PLC bundle record
+// GetBundleByNumber retrieves a bundle by its number
+func (s *SQLiteDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*PLCBundle, error) {
+	query := `
+        SELECT id, bundle_number, start_time, end_time, operation_count, dids, file_path, file_size, compressed, created_at
+        FROM plc_bundles
+        WHERE bundle_number = ?
+    `
+
+	var bundle PLCBundle
+	var didsJSON string
+
+	err := s.db.QueryRowContext(ctx, query, bundleNumber).Scan(
+		&bundle.ID, &bundle.BundleNumber, &bundle.StartTime, &bundle.EndTime,
+		&bundle.OperationCount, &didsJSON, &bundle.FilePath, &bundle.FileSize,
+		&bundle.Compressed, &bundle.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	json.Unmarshal([]byte(didsJSON), &bundle.DIDs)
+	return &bundle, nil
+}
+
+// GetLastBundleNumber gets the highest bundle number
+func (s *SQLiteDB) GetLastBundleNumber(ctx context.Context) (int, error) {
+	query := "SELECT COALESCE(MAX(bundle_number), 0) FROM plc_bundles"
+	var num int
+	err := s.db.QueryRowContext(ctx, query).Scan(&num)
+	return num, err
+}
+
+// AddToMempool adds operations to the mempool
+func (s *SQLiteDB) AddToMempool(ctx context.Context, ops []MempoolOperation) error {
+	if len(ops) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+        INSERT INTO plc_mempool (did, operation, cid, created_at) 
+        VALUES (?, ?, ?, ?)
+    `)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, op := range ops {
+		_, err := stmt.ExecContext(ctx, op.DID, op.Operation, op.CID, op.CreatedAt)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetMempoolCount returns number of operations in mempool
+func (s *SQLiteDB) GetMempoolCount(ctx context.Context) (int, error) {
+	query := "SELECT COUNT(*) FROM plc_mempool"
+	var count int
+	err := s.db.QueryRowContext(ctx, query).Scan(&count)
+	return count, err
+}
+
+// GetMempoolOperations retrieves operations from mempool ordered by timestamp
+func (s *SQLiteDB) GetMempoolOperations(ctx context.Context, limit int) ([]MempoolOperation, error) {
+	query := `
+        SELECT id, did, operation, cid, created_at, added_at
+        FROM plc_mempool
+        ORDER BY created_at ASC
+        LIMIT ?
+    `
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ops []MempoolOperation
+	for rows.Next() {
+		var op MempoolOperation
+		err := rows.Scan(&op.ID, &op.DID, &op.Operation, &op.CID, &op.CreatedAt, &op.AddedAt)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, op)
+	}
+
+	return ops, rows.Err()
+}
+
+// DeleteFromMempool removes operations from mempool
+func (s *SQLiteDB) DeleteFromMempool(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf("DELETE FROM plc_mempool WHERE id IN (%s)",
+		strings.Join(placeholders, ","))
+
+	_, err := s.db.ExecContext(ctx, query, args...)
+	return err
+}
+
+// CreateBundle with bundle number
 func (s *SQLiteDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
 	didsJSON, err := json.Marshal(bundle.DIDs)
 	if err != nil {
-		return fmt.Errorf("failed to marshal DIDs: %w", err)
+		return err
 	}
 
 	query := `
-        INSERT INTO plc_bundles (start_time, end_time, operation_count, dids, file_path, file_size, compressed)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO plc_bundles (bundle_number, start_time, end_time, operation_count, dids, file_path, file_size, compressed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `
 	result, err := s.db.ExecContext(ctx, query,
-		bundle.StartTime, bundle.EndTime, bundle.OperationCount,
+		bundle.BundleNumber, bundle.StartTime, bundle.EndTime, bundle.OperationCount,
 		string(didsJSON), bundle.FilePath, bundle.FileSize, bundle.Compressed,
 	)
 	if err != nil {
@@ -541,40 +680,35 @@ func (s *SQLiteDB) GetPDSStats(ctx context.Context) (*PDSStats, error) {
 	return &stats, err
 }
 
-// GetScanCursor retrieves the last scan cursor for a source
+// GetScanCursor retrieves cursor with bundle number
 func (s *SQLiteDB) GetScanCursor(ctx context.Context, source string) (*ScanCursor, error) {
-	query := "SELECT source, last_timestamp, last_scan_time, records_processed FROM scan_cursors WHERE source = ?"
+	query := "SELECT source, last_bundle_number, last_scan_time, records_processed FROM scan_cursors WHERE source = ?"
 
 	var cursor ScanCursor
 	err := s.db.QueryRowContext(ctx, query, source).Scan(
-		&cursor.Source, &cursor.LastTimestamp, &cursor.LastScanTime, &cursor.RecordsProcessed,
+		&cursor.Source, &cursor.LastBundleNumber, &cursor.LastScanTime, &cursor.RecordsProcessed,
 	)
 	if err == sql.ErrNoRows {
-		// No cursor yet, return empty one
 		return &ScanCursor{
-			Source:        source,
-			LastTimestamp: "",
-			LastScanTime:  time.Time{},
+			Source:           source,
+			LastBundleNumber: 0,
+			LastScanTime:     time.Time{},
 		}, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	return &cursor, nil
+	return &cursor, err
 }
 
-// UpdateScanCursor updates or inserts a scan cursor
+// UpdateScanCursor updates cursor with bundle number
 func (s *SQLiteDB) UpdateScanCursor(ctx context.Context, cursor *ScanCursor) error {
 	query := `
-        INSERT INTO scan_cursors (source, last_timestamp, last_scan_time, records_processed)
+        INSERT INTO scan_cursors (source, last_bundle_number, last_scan_time, records_processed)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(source) DO UPDATE SET
-            last_timestamp = excluded.last_timestamp,
+            last_bundle_number = excluded.last_bundle_number,
             last_scan_time = excluded.last_scan_time,
             records_processed = excluded.records_processed
     `
-	_, err := s.db.ExecContext(ctx, query, cursor.Source, cursor.LastTimestamp, cursor.LastScanTime, cursor.RecordsProcessed)
+	_, err := s.db.ExecContext(ctx, query, cursor.Source, cursor.LastBundleNumber, cursor.LastScanTime, cursor.RecordsProcessed)
 	return err
 }
 

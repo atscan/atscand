@@ -81,23 +81,34 @@ type PLCMetrics struct {
 	ErrorCount   int       `json:"error_count"`
 }
 
-// ScanCursor tracks the last processed position in PLC directory
-type ScanCursor struct {
-	Source           string // "plc_directory"
-	LastTimestamp    string // ISO 8601 datetime string like "2023-04-26T06:19:25.508Z"
-	LastScanTime     time.Time
-	RecordsProcessed int64
-}
-
-// PLCBundle represents a cached bundle of PLC operations
+// PLCBundle now uses bundle numbers
 type PLCBundle struct {
 	ID             int64
+	BundleNumber   int // NEW: Sequential bundle number (hex filename)
 	StartTime      time.Time
 	EndTime        time.Time
 	OperationCount int
-	DIDs           []string // JSON array of DIDs
+	DIDs           []string
 	FilePath       string
 	FileSize       int64
 	Compressed     bool
 	CreatedAt      time.Time
+}
+
+// MempoolOperation represents an operation waiting to be bundled
+type MempoolOperation struct {
+	ID        int64
+	DID       string
+	Operation string // JSON of the full operation
+	CID       string
+	CreatedAt time.Time
+	AddedAt   time.Time
+}
+
+// ScanCursor now stores bundle number
+type ScanCursor struct {
+	Source           string
+	LastBundleNumber int // NEW: Last processed bundle number
+	LastScanTime     time.Time
+	RecordsProcessed int64
 }
