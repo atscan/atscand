@@ -43,7 +43,6 @@ func (s *Scanner) Scan(ctx context.Context) error {
 	startTime := time.Now()
 	log.Println("Starting PLC directory scan...")
 
-	// Get cursor
 	cursor, err := s.db.GetScanCursor(ctx, "plc_directory")
 	if err != nil {
 		return fmt.Errorf("failed to get scan cursor: %w", err)
@@ -51,12 +50,12 @@ func (s *Scanner) Scan(ctx context.Context) error {
 
 	currentBundle := cursor.LastBundleNumber
 	if currentBundle == 0 {
-		currentBundle = 1 // Start from bundle 1
+		currentBundle = 1
 	} else {
-		currentBundle++ // Continue from next bundle
+		currentBundle++
 	}
 
-	log.Printf("Starting from bundle %06x", currentBundle)
+	log.Printf("Starting from bundle %06d", currentBundle) // Changed from %06x
 
 	// Ensure bundle continuity (all previous bundles exist)
 	if currentBundle > 1 {
@@ -77,7 +76,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		default:
 		}
 
-		log.Printf("→ Processing bundle %06x...", currentBundle)
+		log.Printf("→ Processing bundle %06d...", currentBundle)
 
 		// Load bundle (lazy-loaded from file or PLC)
 		operations, err := s.bundleManager.LoadBundle(ctx, currentBundle, s.client)
@@ -130,7 +129,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			newPDSCount += batchNewPDS
 			totalProcessed += int64(len(operations))
 
-			log.Printf("✓ Processed bundle %06x: %d operations, %d new PDS",
+			log.Printf("✓ Processed bundle %06d: %d operations, %d new PDS",
 				currentBundle, len(operations), batchNewPDS)
 
 			// Update cursor
@@ -161,7 +160,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		}
 
 		// Rate limiting
-		time.Sleep(200 * time.Millisecond)
+		//time.Sleep(200 * time.Millisecond)
 	}
 
 	log.Printf("PLC scan completed: %d operations, %d new PDS servers in %v",

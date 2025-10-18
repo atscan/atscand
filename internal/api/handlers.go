@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -204,7 +206,19 @@ func (s *Server) handleGetBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, bundle)
+	// Return simplified response
+	response := map[string]interface{}{
+		"bundle_number":   bundle.BundleNumber,
+		"start_time":      bundle.StartTime,
+		"end_time":        bundle.EndTime,
+		"operation_count": bundle.OperationCount,
+		"did_count":       len(bundle.DIDs),
+		"file_size":       bundle.FileSize,
+		"hash":            bundle.Hash,
+		"created_at":      bundle.CreatedAt,
+	}
+
+	respondJSON(w, response)
 }
 
 func (s *Server) handleGetBundleDIDs(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +259,7 @@ func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Helper to load bundle operations
+// Helper to load bundle operations - UPDATED FOR JSONL FORMAT
 func (s *Server) loadBundleOperations(path string) ([]plc.PLCOperation, error) {
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
@@ -263,9 +277,30 @@ func (s *Server) loadBundleOperations(path string) ([]plc.PLCOperation, error) {
 		return nil, err
 	}
 
+	// Parse JSONL (newline-delimited JSON)
 	var operations []plc.PLCOperation
-	if err := json.Unmarshal(decompressed, &operations); err != nil {
-		return nil, err
+	scanner := bufio.NewScanner(bytes.NewReader(decompressed))
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Bytes()
+
+		// Skip empty lines
+		if len(line) == 0 {
+			continue
+		}
+
+		var op plc.PLCOperation
+		if err := json.Unmarshal(line, &op); err != nil {
+			return nil, fmt.Errorf("failed to parse operation on line %d: %w", lineNum, err)
+		}
+
+		operations = append(operations, op)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading JSONL: %w", err)
 	}
 
 	return operations, nil

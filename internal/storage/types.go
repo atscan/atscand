@@ -81,16 +81,16 @@ type PLCMetrics struct {
 	ErrorCount   int       `json:"error_count"`
 }
 
-// PLCBundle now uses bundle numbers
+// PLCBundle represents a cached bundle of PLC operations
 type PLCBundle struct {
-	ID             int64
-	BundleNumber   int // NEW: Sequential bundle number (hex filename)
+	BundleNumber   int // PRIMARY KEY (no separate ID needed)
 	StartTime      time.Time
 	EndTime        time.Time
 	OperationCount int
 	DIDs           []string
 	FilePath       string
 	FileSize       int64
+	Hash           string
 	Compressed     bool
 	CreatedAt      time.Time
 }

@@ -1,7 +1,11 @@
 package plc
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -58,9 +62,9 @@ func (bm *BundleManager) Close() {
 	}
 }
 
-// GetBundleFilename returns filename for bundle number (6-char hex)
+// GetBundleFilename returns filename for bundle number (6-digit decimal, JSONL format)
 func (bm *BundleManager) GetBundleFilename(bundleNumber int) string {
-	return fmt.Sprintf("%06x.json.zst", bundleNumber)
+	return fmt.Sprintf("%06d.jsonl.zst", bundleNumber)
 }
 
 // GetBundlePath returns full path for bundle number
@@ -75,6 +79,7 @@ func (bm *BundleManager) BundleExists(bundleNumber int) bool {
 }
 
 // LoadBundle loads a bundle by number (from file or fetches from PLC)
+// LoadBundle loads a bundle by number with hash verification and auto-indexing
 func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcClient *Client) ([]PLCOperation, error) {
 	if !bm.enabled {
 		return nil, fmt.Errorf("bundle manager disabled")
@@ -84,25 +89,70 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 
 	// Try to load from local file first
 	if bm.BundleExists(bundleNumber) {
-		log.Printf("→ Loading bundle %06x from local file", bundleNumber)
-		return bm.loadBundleFromFile(path)
+		log.Printf("→ Loading bundle %06d from local file", bundleNumber)
+
+		// Check if bundle exists in database
+		dbBundle, dbErr := bm.db.GetBundleByNumber(ctx, bundleNumber)
+		bundleInDB := dbErr == nil && dbBundle != nil
+
+		if bundleInDB {
+			// Verify hash if we have it
+			if dbBundle.Hash != "" {
+				valid, err := bm.verifyBundleHash(path, dbBundle.Hash)
+				if err != nil {
+					log.Printf("Warning: failed to verify hash for bundle %06d: %v", bundleNumber, err)
+				} else if !valid {
+					log.Printf("⚠ Hash mismatch for bundle %06d! File may be corrupted, re-fetching...", bundleNumber)
+					os.Remove(path)
+					return bm.LoadBundle(ctx, bundleNumber, plcClient)
+				} else {
+					log.Printf("✓ Hash verified for bundle %06d", bundleNumber)
+				}
+			}
+		} else {
+			// Bundle file exists but not in database - need to index it
+			log.Printf("→ Bundle %06d exists on disk but not in database, indexing...", bundleNumber)
+		}
+
+		// Load operations from file
+		operations, err := bm.loadBundleFromFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load bundle from file: %w", err)
+		}
+
+		// If not in database, index it now
+		if !bundleInDB {
+			// Calculate hash from existing file
+			fileData, err := os.ReadFile(path)
+			if err != nil {
+				log.Printf("Warning: failed to read file for hash calculation: %v", err)
+			} else {
+				hash := bm.calculateHash(fileData)
+
+				if err := bm.indexBundleWithHash(ctx, bundleNumber, operations, path, hash); err != nil {
+					log.Printf("Warning: failed to index bundle: %v", err)
+				} else {
+					log.Printf("✓ Indexed bundle %06d (hash: %s)", bundleNumber, hash[:16]+"...")
+				}
+			}
+		}
+
+		return operations, nil
 	}
 
 	// Bundle doesn't exist locally - fetch from PLC directory
-	log.Printf("→ Bundle %06x not found locally, fetching from PLC directory...", bundleNumber)
+	log.Printf("→ Bundle %06d not found locally, fetching from PLC directory...", bundleNumber)
 
 	// Get the cursor timestamp from previous bundle
 	var afterTimestamp string
 
 	if bundleNumber > 1 {
-		// Try to get previous bundle from database
 		prevBundle, err := bm.db.GetBundleByNumber(ctx, bundleNumber-1)
 		if err == nil && prevBundle != nil {
-			// Use end timestamp from previous bundle
 			afterTimestamp = prevBundle.EndTime.Format(time.RFC3339Nano)
-			log.Printf("  Using cursor from bundle %06x: %s", bundleNumber-1, afterTimestamp)
+			log.Printf("  Using cursor from bundle %06d: %s", bundleNumber-1, afterTimestamp)
 		} else {
-			// Previous bundle not in database, try to load from file
+			// Try loading previous bundle from file
 			if bm.BundleExists(bundleNumber - 1) {
 				prevOps, err := bm.loadBundleFromFile(bm.GetBundlePath(bundleNumber - 1))
 				if err == nil && len(prevOps) > 0 {
@@ -113,9 +163,8 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 		}
 	}
 
-	// If still no timestamp (bundle 1 or couldn't get previous), start from beginning
 	if afterTimestamp == "" && bundleNumber > 1 {
-		return nil, fmt.Errorf("cannot determine cursor for bundle %06x (previous bundle not found)", bundleNumber)
+		return nil, fmt.Errorf("cannot determine cursor for bundle %06d (previous bundle not found)", bundleNumber)
 	}
 
 	operations, err := bm.fetchBundleFromPLC(ctx, plcClient, afterTimestamp)
@@ -124,25 +173,51 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 	}
 
 	if len(operations) == 0 {
-		return nil, fmt.Errorf("no operations returned for bundle %06x", bundleNumber)
+		return nil, fmt.Errorf("no operations returned for bundle %06d", bundleNumber)
 	}
 
-	// Save bundle locally
-	if err := bm.saveBundleFile(path, operations); err != nil {
+	// Save bundle locally with hash
+	hash, err := bm.saveBundleFileWithHash(path, operations)
+	if err != nil {
 		log.Printf("Warning: failed to save bundle file: %v", err)
 	}
 
-	// Index in database
-	if err := bm.indexBundle(ctx, bundleNumber, operations, path); err != nil {
+	// Index in database with hash
+	if err := bm.indexBundleWithHash(ctx, bundleNumber, operations, path, hash); err != nil {
 		log.Printf("Warning: failed to index bundle: %v", err)
 	}
 
-	log.Printf("✓ Fetched and saved bundle %06x (%d operations, %s to %s)",
-		bundleNumber, len(operations),
-		operations[0].CreatedAt.Format("2006-01-02 15:04"),
-		operations[len(operations)-1].CreatedAt.Format("2006-01-02 15:04"))
+	log.Printf("✓ Fetched and saved bundle %06d (%d operations, hash: %s)",
+		bundleNumber, len(operations), hash[:16]+"...")
 
 	return operations, nil
+}
+
+// saveBundleFileWithHash saves operations and returns the hash
+func (bm *BundleManager) saveBundleFileWithHash(path string, operations []PLCOperation) (string, error) {
+	// Convert to JSONL format
+	var jsonlData []byte
+	for _, op := range operations {
+		lineJSON, err := json.Marshal(op)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal operation: %w", err)
+		}
+		jsonlData = append(jsonlData, lineJSON...)
+		jsonlData = append(jsonlData, '\n')
+	}
+
+	// Compress
+	compressed := bm.encoder.EncodeAll(jsonlData, nil)
+
+	// Calculate hash of compressed data
+	hash := bm.calculateHash(compressed)
+
+	// Write to file
+	if err := os.WriteFile(path, compressed, 0644); err != nil {
+		return "", err
+	}
+
+	return hash, nil
 }
 
 // fetchBundleFromPLC fetches operations from PLC directory using datetime cursor
@@ -150,44 +225,61 @@ func (bm *BundleManager) fetchBundleFromPLC(ctx context.Context, client *Client,
 	// Fetch next batch of 1000 operations after the given timestamp
 	return client.Export(ctx, ExportOptions{
 		Count: 1000,
-		After: afterTimestamp, // ISO 8601 datetime from previous bundle
+		After: afterTimestamp,
 	})
 }
 
-// saveBundleFile saves operations to a bundle file
+// saveBundleFile (keep for compatibility, calls saveBundleFileWithHash)
 func (bm *BundleManager) saveBundleFile(path string, operations []PLCOperation) error {
-	jsonData, err := json.Marshal(operations)
-	if err != nil {
-		return err
-	}
-
-	compressed := bm.encoder.EncodeAll(jsonData, nil)
-
-	return os.WriteFile(path, compressed, 0644)
+	_, err := bm.saveBundleFileWithHash(path, operations)
+	return err
 }
 
-// loadBundleFromFile loads operations from bundle file
+// loadBundleFromFile loads operations from bundle file (JSONL format)
 func (bm *BundleManager) loadBundleFromFile(path string) ([]PLCOperation, error) {
+	// Read compressed file
 	compressedData, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read bundle file: %w", err)
 	}
 
+	// Decompress
 	decompressed, err := bm.decoder.DecodeAll(compressedData, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decompress bundle: %w", err)
 	}
 
+	// Parse JSONL (newline-delimited JSON)
 	var operations []PLCOperation
-	if err := json.Unmarshal(decompressed, &operations); err != nil {
-		return nil, err
+	scanner := bufio.NewScanner(bytes.NewReader(decompressed))
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Bytes()
+
+		// Skip empty lines
+		if len(line) == 0 {
+			continue
+		}
+
+		var op PLCOperation
+		if err := json.Unmarshal(line, &op); err != nil {
+			return nil, fmt.Errorf("failed to parse operation on line %d: %w", lineNum, err)
+		}
+
+		operations = append(operations, op)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading JSONL: %w", err)
 	}
 
 	return operations, nil
 }
 
-// indexBundle stores bundle metadata in database
-func (bm *BundleManager) indexBundle(ctx context.Context, bundleNumber int, operations []PLCOperation, path string) error {
+// indexBundleWithHash stores bundle metadata with hash
+func (bm *BundleManager) indexBundleWithHash(ctx context.Context, bundleNumber int, operations []PLCOperation, path string, hash string) error {
 	if len(operations) == 0 {
 		return nil
 	}
@@ -210,18 +302,31 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNumber int, oper
 	}
 
 	bundle := &storage.PLCBundle{
-		BundleNumber:   bundleNumber,
+		BundleNumber:   bundleNumber, // This IS the primary key
 		StartTime:      operations[0].CreatedAt,
 		EndTime:        operations[len(operations)-1].CreatedAt,
 		OperationCount: len(operations),
 		DIDs:           dids,
 		FilePath:       path,
 		FileSize:       fileSize,
+		Hash:           hash,
 		Compressed:     true,
 		CreatedAt:      time.Now(),
 	}
 
 	return bm.db.CreateBundle(ctx, bundle)
+}
+
+// indexBundle (keep for compatibility)
+func (bm *BundleManager) indexBundle(ctx context.Context, bundleNumber int, operations []PLCOperation, path string) error {
+	// Calculate hash from file
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	hash := bm.calculateHash(data)
+
+	return bm.indexBundleWithHash(ctx, bundleNumber, operations, path, hash)
 }
 
 // CreateBundleFromMempool creates a bundle from mempool operations
@@ -234,7 +339,6 @@ func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations
 		return 0, fmt.Errorf("bundle must have exactly 1000 operations, got %d", len(operations))
 	}
 
-	// Get next bundle number
 	lastBundle, err := bm.db.GetLastBundleNumber(ctx)
 	if err != nil {
 		return 0, err
@@ -243,27 +347,21 @@ func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations
 
 	path := bm.GetBundlePath(bundleNumber)
 
-	// Save bundle file
-	if err := bm.saveBundleFile(path, operations); err != nil {
+	// Save bundle file with hash
+	hash, err := bm.saveBundleFileWithHash(path, operations)
+	if err != nil {
 		return 0, err
 	}
 
-	// Index bundle
-	if err := bm.indexBundle(ctx, bundleNumber, operations, path); err != nil {
+	// Index bundle with hash
+	if err := bm.indexBundleWithHash(ctx, bundleNumber, operations, path, hash); err != nil {
 		return 0, err
 	}
 
-	log.Printf("✓ Created bundle %06x from mempool (%d operations)", bundleNumber, len(operations))
+	log.Printf("✓ Created bundle %06d from mempool (%d operations, hash: %s)",
+		bundleNumber, len(operations), hash[:16]+"...")
 
 	return bundleNumber, nil
-}
-
-// GetStats returns bundle statistics
-func (bm *BundleManager) GetStats(ctx context.Context) (int64, int64, error) {
-	if !bm.enabled {
-		return 0, 0, nil
-	}
-	return bm.db.GetBundleStats(ctx)
 }
 
 // EnsureBundleContinuity checks that all bundles from 1 to N exist
@@ -277,10 +375,35 @@ func (bm *BundleManager) EnsureBundleContinuity(ctx context.Context, targetBundl
 			// Check if in database
 			_, err := bm.db.GetBundleByNumber(ctx, i)
 			if err != nil {
-				return fmt.Errorf("bundle %06x is missing (required for continuity)", i)
+				return fmt.Errorf("bundle %06d is missing (required for continuity)", i)
 			}
 		}
 	}
 
 	return nil
+}
+
+// GetStats returns bundle statistics
+func (bm *BundleManager) GetStats(ctx context.Context) (int64, int64, error) {
+	if !bm.enabled {
+		return 0, 0, nil
+	}
+	return bm.db.GetBundleStats(ctx)
+}
+
+// calculateHash computes SHA256 hash of data
+func (bm *BundleManager) calculateHash(data []byte) string {
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
+
+// verifyBundleHash checks if file hash matches expected hash
+func (bm *BundleManager) verifyBundleHash(path string, expectedHash string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+
+	actualHash := bm.calculateHash(data)
+	return actualHash == expectedHash, nil
 }

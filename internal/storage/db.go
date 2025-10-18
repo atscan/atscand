@@ -22,15 +22,16 @@ type Database interface {
 	GetScanCursor(ctx context.Context, source string) (*ScanCursor, error)
 	UpdateScanCursor(ctx context.Context, cursor *ScanCursor) error
 
-	// Bundle operations - UPDATED
+	// Bundle operations
 	CreateBundle(ctx context.Context, bundle *PLCBundle) error
 	GetBundleByNumber(ctx context.Context, bundleNumber int) (*PLCBundle, error)
+	// GetBundleByID removed - bundle_number IS the ID
 	GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error)
 	GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error)
 	GetBundleStats(ctx context.Context) (int64, int64, error)
-	GetLastBundleNumber(ctx context.Context) (int, error) // NEW
+	GetLastBundleNumber(ctx context.Context) (int, error)
 
-	// Mempool operations - NEW
+	// Mempool operations
 	AddToMempool(ctx context.Context, ops []MempoolOperation) error
 	GetMempoolCount(ctx context.Context) (int, error)
 	GetMempoolOperations(ctx context.Context, limit int) ([]MempoolOperation, error)

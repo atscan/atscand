@@ -41,8 +41,8 @@ func (s *Server) setupRoutes() {
 
 	// PDS endpoints
 	api.HandleFunc("/pds", s.handleGetPDSList).Methods("GET")
-	api.HandleFunc("/pds/{endpoint}", s.handleGetPDS).Methods("GET")
 	api.HandleFunc("/pds/stats", s.handleGetPDSStats).Methods("GET")
+	api.HandleFunc("/pds/{endpoint}", s.handleGetPDS).Methods("GET")
 
 	// Metrics endpoints
 	api.HandleFunc("/metrics/plc", s.handleGetPLCMetrics).Methods("GET")
