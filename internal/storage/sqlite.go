@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -80,12 +81,12 @@ func (s *SQLiteDB) Migrate() error {
         records_processed INTEGER DEFAULT 0
     );
 
-    -- NEW: PLC bundles table
     CREATE TABLE IF NOT EXISTS plc_bundles (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         start_time TIMESTAMP NOT NULL,
         end_time TIMESTAMP NOT NULL,
         operation_count INTEGER NOT NULL,
+        dids TEXT NOT NULL,              -- JSON array of DIDs
         file_path TEXT NOT NULL,
         file_size INTEGER NOT NULL,
         compressed BOOLEAN DEFAULT 1,
@@ -102,13 +103,18 @@ func (s *SQLiteDB) Migrate() error {
 
 // CreateBundle stores a new PLC bundle record
 func (s *SQLiteDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
+	didsJSON, err := json.Marshal(bundle.DIDs)
+	if err != nil {
+		return fmt.Errorf("failed to marshal DIDs: %w", err)
+	}
+
 	query := `
-        INSERT INTO plc_bundles (start_time, end_time, operation_count, file_path, file_size, compressed)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO plc_bundles (start_time, end_time, operation_count, dids, file_path, file_size, compressed)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     `
 	result, err := s.db.ExecContext(ctx, query,
 		bundle.StartTime, bundle.EndTime, bundle.OperationCount,
-		bundle.FilePath, bundle.FileSize, bundle.Compressed,
+		string(didsJSON), bundle.FilePath, bundle.FileSize, bundle.Compressed,
 	)
 	if err != nil {
 		return err
@@ -119,25 +125,22 @@ func (s *SQLiteDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
 	return nil
 }
 
-// GetBundle retrieves a bundle that covers a specific time range
-// If afterTime is zero, returns the first bundle
+// GetBundle retrieves the next bundle after the given timestamp
 func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBundle, error) {
 	var query string
 	var args []interface{}
 
 	if afterTime.IsZero() {
-		// Get first bundle
 		query = `
-            SELECT id, start_time, end_time, operation_count, file_path, file_size, compressed, created_at
+            SELECT id, start_time, end_time, operation_count, dids, file_path, file_size, compressed, created_at
             FROM plc_bundles
             ORDER BY start_time ASC
             LIMIT 1
         `
 		args = []interface{}{}
 	} else {
-		// Get next bundle after this time
 		query = `
-            SELECT id, start_time, end_time, operation_count, file_path, file_size, compressed, created_at
+            SELECT id, start_time, end_time, operation_count, dids, file_path, file_size, compressed, created_at
             FROM plc_bundles
             WHERE start_time >= ?
             ORDER BY start_time ASC
@@ -147,15 +150,22 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 	}
 
 	var bundle PLCBundle
+	var didsJSON string
+
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(
 		&bundle.ID, &bundle.StartTime, &bundle.EndTime, &bundle.OperationCount,
-		&bundle.FilePath, &bundle.FileSize, &bundle.Compressed, &bundle.CreatedAt,
+		&didsJSON, &bundle.FilePath, &bundle.FileSize, &bundle.Compressed, &bundle.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
-		return nil, nil // No bundle found
+		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	// Unmarshal DIDs
+	if err := json.Unmarshal([]byte(didsJSON), &bundle.DIDs); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal DIDs: %w", err)
 	}
 
 	return &bundle, nil
@@ -164,7 +174,7 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 // GetBundles retrieves recent bundles
 func (s *SQLiteDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error) {
 	query := `
-        SELECT id, start_time, end_time, operation_count, file_path, file_size, compressed, created_at
+        SELECT id, start_time, end_time, operation_count, dids, file_path, file_size, compressed, created_at
         FROM plc_bundles
         ORDER BY start_time DESC
         LIMIT ?
@@ -176,15 +186,47 @@ func (s *SQLiteDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, err
 	}
 	defer rows.Close()
 
+	return s.scanBundles(rows)
+}
+
+// GetAllBundles retrieves all bundles (for DID search)
+func (s *SQLiteDB) GetAllBundles(ctx context.Context) ([]*PLCBundle, error) {
+	query := `
+        SELECT id, start_time, end_time, operation_count, dids, file_path, file_size, compressed, created_at
+        FROM plc_bundles
+        ORDER BY start_time ASC
+    `
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return s.scanBundles(rows)
+}
+
+// Helper to scan bundle rows
+func (s *SQLiteDB) scanBundles(rows *sql.Rows) ([]*PLCBundle, error) {
 	var bundles []*PLCBundle
+
 	for rows.Next() {
 		var bundle PLCBundle
+		var didsJSON string
+
 		if err := rows.Scan(
 			&bundle.ID, &bundle.StartTime, &bundle.EndTime, &bundle.OperationCount,
-			&bundle.FilePath, &bundle.FileSize, &bundle.Compressed, &bundle.CreatedAt,
+			&didsJSON, &bundle.FilePath, &bundle.FileSize, &bundle.Compressed, &bundle.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
+
+		// Unmarshal DIDs
+		if err := json.Unmarshal([]byte(didsJSON), &bundle.DIDs); err != nil {
+			log.Printf("Warning: failed to unmarshal DIDs for bundle %d: %v", bundle.ID, err)
+			bundle.DIDs = []string{}
+		}
+
 		bundles = append(bundles, &bundle)
 	}
 

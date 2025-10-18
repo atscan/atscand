@@ -70,9 +70,10 @@ type ScanCursor struct {
 // PLCBundle represents a cached bundle of PLC operations
 type PLCBundle struct {
 	ID             int64
-	StartTime      time.Time // First operation timestamp
-	EndTime        time.Time // Last operation timestamp
+	StartTime      time.Time
+	EndTime        time.Time
 	OperationCount int
+	DIDs           []string // JSON array of DIDs
 	FilePath       string
 	FileSize       int64
 	Compressed     bool

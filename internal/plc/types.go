@@ -54,3 +54,16 @@ type Service struct {
 	Type            string `json:"type"`
 	ServiceEndpoint string `json:"serviceEndpoint"`
 }
+
+// DIDHistoryEntry represents a single operation in DID history
+type DIDHistoryEntry struct {
+	Operation PLCOperation `json:"operation"`
+	Bundle    string       `json:"bundle,omitempty"`
+}
+
+// DIDHistory represents the full history of a DID
+type DIDHistory struct {
+	DID        string            `json:"did"`
+	Current    *PLCOperation     `json:"current"`
+	Operations []DIDHistoryEntry `json:"operations"`
+}

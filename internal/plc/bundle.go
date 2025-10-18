@@ -61,7 +61,73 @@ func (bm *BundleManager) Close() {
 	}
 }
 
-// DiscoverAndIndexBundles scans the filesystem for bundle files and indexes them in the database
+// SaveBundle saves a complete bundle with DIDs as JSON array
+func (bm *BundleManager) SaveBundle(ctx context.Context, operations []PLCOperation, isComplete bool) error {
+	if !bm.enabled || !isComplete {
+		return nil
+	}
+
+	if len(operations) == 0 {
+		return nil
+	}
+
+	startTime := operations[0].CreatedAt
+	endTime := operations[len(operations)-1].CreatedAt
+
+	// Extract unique DIDs
+	didSet := make(map[string]bool)
+	for _, op := range operations {
+		didSet[op.DID] = true
+	}
+
+	dids := make([]string, 0, len(didSet))
+	for did := range didSet {
+		dids = append(dids, did)
+	}
+
+	// Generate filename
+	filename := fmt.Sprintf("plc_bundle_%s.json.zst", startTime.Format("2006-01-02T15-04-05"))
+	filePath := filepath.Join(bm.dir, filename)
+
+	// Check if exists
+	if _, err := os.Stat(filePath); err == nil {
+		log.Printf("Bundle already exists: %s", filename)
+		return nil
+	}
+
+	// Marshal and compress
+	jsonData, err := json.Marshal(operations)
+	if err != nil {
+		return fmt.Errorf("failed to marshal operations: %w", err)
+	}
+
+	compressed := bm.encoder.EncodeAll(jsonData, nil)
+
+	// Write to file
+	if err := os.WriteFile(filePath, compressed, 0644); err != nil {
+		return fmt.Errorf("failed to write bundle file: %w", err)
+	}
+
+	// Store metadata with DIDs as JSON
+	bundle := &storage.PLCBundle{
+		StartTime:      startTime,
+		EndTime:        endTime,
+		OperationCount: len(operations),
+		DIDs:           dids,
+		FilePath:       filePath,
+		FileSize:       int64(len(compressed)),
+		Compressed:     true,
+		CreatedAt:      time.Now(),
+	}
+
+	if err := bm.db.CreateBundle(ctx, bundle); err != nil {
+		return fmt.Errorf("failed to store bundle metadata: %w", err)
+	}
+
+	return nil
+}
+
+// DiscoverAndIndexBundles - same logic
 func (bm *BundleManager) DiscoverAndIndexBundles(ctx context.Context) error {
 	if !bm.enabled {
 		return nil
@@ -69,20 +135,16 @@ func (bm *BundleManager) DiscoverAndIndexBundles(ctx context.Context) error {
 
 	log.Println("Discovering bundle files...")
 
-	// Get existing bundles from database
 	existingBundles, err := bm.db.GetBundles(ctx, 10000)
 	if err != nil {
-		log.Printf("Warning: failed to get existing bundles: %v", err)
 		existingBundles = []*storage.PLCBundle{}
 	}
 
-	// Create map of existing bundle paths
 	existingPaths := make(map[string]bool)
 	for _, bundle := range existingBundles {
 		existingPaths[bundle.FilePath] = true
 	}
 
-	// Scan directory for .zst files
 	pattern := filepath.Join(bm.dir, "*.zst")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -98,12 +160,10 @@ func (bm *BundleManager) DiscoverAndIndexBundles(ctx context.Context) error {
 
 	newBundles := 0
 	for _, filePath := range files {
-		// Skip if already indexed
 		if existingPaths[filePath] {
 			continue
 		}
 
-		// Load bundle to extract metadata
 		operations, err := bm.loadBundleFromFile(filePath)
 		if err != nil {
 			log.Printf("Warning: failed to load bundle %s: %v", filepath.Base(filePath), err)
@@ -111,39 +171,43 @@ func (bm *BundleManager) DiscoverAndIndexBundles(ctx context.Context) error {
 		}
 
 		if len(operations) == 0 {
-			log.Printf("Warning: empty bundle %s", filepath.Base(filePath))
 			continue
 		}
 
-		// Get file size
+		// Extract unique DIDs
+		didSet := make(map[string]bool)
+		for _, op := range operations {
+			didSet[op.DID] = true
+		}
+
+		dids := make([]string, 0, len(didSet))
+		for did := range didSet {
+			dids = append(dids, did)
+		}
+
 		fileInfo, err := os.Stat(filePath)
 		if err != nil {
-			log.Printf("Warning: failed to stat bundle %s: %v", filepath.Base(filePath), err)
 			continue
 		}
 
-		// Create bundle metadata
 		bundle := &storage.PLCBundle{
 			StartTime:      operations[0].CreatedAt,
 			EndTime:        operations[len(operations)-1].CreatedAt,
 			OperationCount: len(operations),
+			DIDs:           dids,
 			FilePath:       filePath,
 			FileSize:       fileInfo.Size(),
 			Compressed:     true,
 			CreatedAt:      fileInfo.ModTime(),
 		}
 
-		// Index in database
 		if err := bm.db.CreateBundle(ctx, bundle); err != nil {
 			log.Printf("Warning: failed to index bundle %s: %v", filepath.Base(filePath), err)
 			continue
 		}
 
-		log.Printf("✓ Indexed bundle: %s (%s to %s, %d ops, %.2f MB)",
-			filepath.Base(filePath),
-			bundle.StartTime.Format("2006-01-02 15:04"),
-			bundle.EndTime.Format("2006-01-02 15:04"),
-			bundle.OperationCount,
+		log.Printf("✓ Indexed bundle: %s (%d ops, %d DIDs, %.2f MB)",
+			filepath.Base(filePath), bundle.OperationCount, len(dids),
 			float64(bundle.FileSize)/1024/1024)
 
 		newBundles++
@@ -151,63 +215,6 @@ func (bm *BundleManager) DiscoverAndIndexBundles(ctx context.Context) error {
 
 	if newBundles > 0 {
 		log.Printf("Indexed %d new bundles", newBundles)
-	} else {
-		log.Println("All bundles already indexed")
-	}
-
-	return nil
-}
-
-// SaveBundle saves a complete bundle to disk and database
-func (bm *BundleManager) SaveBundle(ctx context.Context, operations []PLCOperation, isComplete bool) error {
-	if !bm.enabled || !isComplete {
-		return nil
-	}
-
-	if len(operations) == 0 {
-		return nil
-	}
-
-	startTime := operations[0].CreatedAt
-	endTime := operations[len(operations)-1].CreatedAt
-
-	// Generate filename based on start time
-	filename := fmt.Sprintf("plc_bundle_%s.json.zst", startTime.Format("2006-01-02T15-04-05"))
-	filePath := filepath.Join(bm.dir, filename)
-
-	// Check if file already exists
-	if _, err := os.Stat(filePath); err == nil {
-		log.Printf("Bundle already exists: %s", filename)
-		return nil
-	}
-
-	// Marshal to JSON
-	jsonData, err := json.Marshal(operations)
-	if err != nil {
-		return fmt.Errorf("failed to marshal operations: %w", err)
-	}
-
-	// Compress
-	compressed := bm.encoder.EncodeAll(jsonData, nil)
-
-	// Write to file
-	if err := os.WriteFile(filePath, compressed, 0644); err != nil {
-		return fmt.Errorf("failed to write bundle file: %w", err)
-	}
-
-	// Store metadata in database
-	bundle := &storage.PLCBundle{
-		StartTime:      startTime,
-		EndTime:        endTime,
-		OperationCount: len(operations),
-		FilePath:       filePath,
-		FileSize:       int64(len(compressed)),
-		Compressed:     true,
-		CreatedAt:      time.Now(),
-	}
-
-	if err := bm.db.CreateBundle(ctx, bundle); err != nil {
-		return fmt.Errorf("failed to store bundle metadata: %w", err)
 	}
 
 	return nil
