@@ -259,7 +259,7 @@ func (s *Scanner) fetchWithRetry(ctx context.Context, afterTimestamp string, max
 
 func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (int64, error) {
 	newPDSCount := int64(0)
-	seenInBatch := make(map[string]*PLCOperation) // Store operation, not just bool
+	seenInBatch := make(map[string]*PLCOperation)
 
 	for _, op := range operations {
 		if op.IsNullified() {
@@ -271,13 +271,11 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 			continue
 		}
 
-		// Track first occurrence in this batch
 		if _, seen := seenInBatch[pdsEndpoint]; !seen {
 			seenInBatch[pdsEndpoint] = &op
 		}
 	}
 
-	// Now process unique PDS endpoints
 	for pdsEndpoint, firstOp := range seenInBatch {
 		exists, err := s.db.PDSExists(ctx, pdsEndpoint)
 		if err != nil {
@@ -288,12 +286,12 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 			continue
 		}
 
-		// New PDS! Use the operation timestamp as discovered_at
+		// New PDS! Use storage.PDSStatusUnknown constant
 		if err := s.db.UpsertPDS(ctx, &storage.PDS{
 			Endpoint:     pdsEndpoint,
-			DiscoveredAt: firstOp.CreatedAt, // Use operation timestamp!
+			DiscoveredAt: firstOp.CreatedAt,
 			LastChecked:  time.Time{},
-			Status:       "unknown",
+			Status:       storage.PDSStatusUnknown, // FIX: Use integer constant
 		}); err != nil {
 			log.Printf("Error storing PDS %s: %v", pdsEndpoint, err)
 			continue

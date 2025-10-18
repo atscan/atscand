@@ -13,26 +13,46 @@ type DID struct {
 
 // PDS represents a Personal Data Server
 type PDS struct {
-	Endpoint     string
+	ID           int64  // NEW: Primary key
+	Endpoint     string // UNIQUE but not primary key
 	DiscoveredAt time.Time
 	LastChecked  time.Time
-	Status       string
-	ResponseTime int64
-	ErrorMessage string
-	ServerInfo   interface{}
-	DIDs         []string // NEW: List of DIDs hosted on this PDS
-	UserCount    int64    // Calculated from len(DIDs)
+	Status       int // 0=unknown, 1=online, 2=offline
+	UserCount    int64
+	UpdatedAt    time.Time
 }
 
 // PDSUpdate contains fields to update for a PDS
 type PDSUpdate struct {
-	Status       string
+	Status       int
 	LastChecked  time.Time
-	ResponseTime int64
-	ErrorMessage string
-	ServerInfo   interface{}
-	DIDs         []string
+	ResponseTime float64 // milliseconds as float
+	ScanData     *PDSScanData
 }
+
+// PDSScanData contains data from a PDS scan
+type PDSScanData struct {
+	ServerInfo interface{} `json:"server_info,omitempty"`
+	DIDs       []string    `json:"dids,omitempty"`
+	DIDCount   int         `json:"did_count"`
+}
+
+// PDSScan represents a historical PDS scan
+type PDSScan struct {
+	ID           int64
+	PDSID        int64
+	Status       int
+	ResponseTime float64
+	ScanData     *PDSScanData
+	ScannedAt    time.Time
+}
+
+// Status constants
+const (
+	PDSStatusUnknown = 0
+	PDSStatusOnline  = 1
+	PDSStatusOffline = 2
+)
 
 // PDSFilter for querying PDS servers
 type PDSFilter struct {

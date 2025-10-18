@@ -28,7 +28,6 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	startTime := time.Now()
 	log.Println("Starting PDS availability scan...")
 
-	// Get all PDS servers to check
 	servers, err := s.db.GetPDSServers(ctx, nil)
 	if err != nil {
 		return err
@@ -49,7 +48,6 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 		}()
 	}
 
-	// Send jobs
 	go func() {
 		for _, server := range servers {
 			jobs <- server
@@ -57,7 +55,6 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 		close(jobs)
 	}()
 
-	// Collect results
 	go func() {
 		wg.Wait()
 		close(results)
@@ -69,15 +66,27 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	totalUsers := int64(0)
 
 	for status := range results {
-		if err := s.db.UpdatePDSStatus(ctx, status.Endpoint, &storage.PDSUpdate{
-			Status:       s.statusString(status.Available),
+		// Determine status code
+		statusCode := storage.PDSStatusOffline
+		if status.Available {
+			statusCode = storage.PDSStatusOnline
+		}
+
+		// Build scan data
+		scanData := &storage.PDSScanData{
+			ServerInfo: status.Description,
+			DIDs:       status.DIDs,
+			DIDCount:   len(status.DIDs),
+		}
+
+		// Update using PDS ID
+		if err := s.db.UpdatePDSStatus(ctx, status.PDSID, &storage.PDSUpdate{
+			Status:       statusCode,
 			LastChecked:  status.LastChecked,
-			ResponseTime: status.ResponseTime.Milliseconds(),
-			ErrorMessage: status.ErrorMessage,
-			ServerInfo:   status.Description,
-			DIDs:         status.DIDs, // NEW: Store DIDs
+			ResponseTime: status.ResponseTime.Seconds() * 1000, // Convert to ms
+			ScanData:     scanData,
 		}); err != nil {
-			log.Printf("Error updating PDS %s: %v", status.Endpoint, err)
+			log.Printf("Error updating PDS ID %d: %v", status.PDSID, err)
 		}
 
 		if status.Available {
@@ -100,14 +109,15 @@ func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.PDS, results 
 		case <-ctx.Done():
 			return
 		default:
-			status := s.scanPDS(ctx, server.Endpoint)
+			status := s.scanPDS(ctx, server.ID, server.Endpoint)
 			results <- status
 		}
 	}
 }
 
-func (s *Scanner) scanPDS(ctx context.Context, endpoint string) *PDSStatus {
+func (s *Scanner) scanPDS(ctx context.Context, pdsID int64, endpoint string) *PDSStatus {
 	status := &PDSStatus{
+		PDSID:       pdsID, // Store ID
 		Endpoint:    endpoint,
 		LastChecked: time.Now(),
 	}
@@ -135,11 +145,11 @@ func (s *Scanner) scanPDS(ctx context.Context, endpoint string) *PDSStatus {
 		status.Description = desc
 	}
 
-	// List repos (DIDs) - NEW
+	// List repos (DIDs)
 	dids, err := s.client.ListRepos(ctx, endpoint)
 	if err != nil {
 		log.Printf("Warning: failed to list repos for %s: %v", endpoint, err)
-		status.DIDs = []string{} // Empty if failed
+		status.DIDs = []string{}
 	} else {
 		status.DIDs = dids
 		log.Printf("  → Found %d users on %s", len(dids), endpoint)

@@ -21,6 +21,7 @@ type Contact struct {
 }
 
 type PDSStatus struct {
+	PDSID        int64 // NEW: PDS ID
 	Endpoint     string
 	Available    bool
 	ResponseTime time.Duration

@@ -42,7 +42,20 @@ func (s *Server) handleGetPDSList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, servers)
+	// Convert status codes to strings for API
+	response := make([]map[string]interface{}, len(servers))
+	for i, srv := range servers {
+		response[i] = map[string]interface{}{
+			"id":            srv.ID,
+			"endpoint":      srv.Endpoint,
+			"discovered_at": srv.DiscoveredAt,
+			"last_checked":  srv.LastChecked,
+			"status":        statusToString(srv.Status),
+			"user_count":    srv.UserCount,
+		}
+	}
+
+	respondJSON(w, response)
 }
 
 func (s *Server) handleGetPDS(w http.ResponseWriter, r *http.Request) {
@@ -52,23 +65,21 @@ func (s *Server) handleGetPDS(w http.ResponseWriter, r *http.Request) {
 
 	pds, err := s.db.GetPDS(ctx, endpoint)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		http.Error(w, "PDS not found", http.StatusNotFound)
 		return
 	}
 
-	// Optionally include DIDs list or just count
-	includeDIDs := r.URL.Query().Get("include_dids") == "true"
+	// Get recent scans
+	scans, _ := s.db.GetPDSScans(ctx, pds.ID, 10)
 
 	response := map[string]interface{}{
+		"id":            pds.ID,
 		"endpoint":      pds.Endpoint,
 		"discovered_at": pds.DiscoveredAt,
 		"last_checked":  pds.LastChecked,
-		"status":        pds.Status,
+		"status":        statusToString(pds.Status),
 		"user_count":    pds.UserCount,
-	}
-
-	if includeDIDs {
-		response["dids"] = pds.DIDs
+		"recent_scans":  scans,
 	}
 
 	respondJSON(w, response)
@@ -287,4 +298,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func respondJSON(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
+}
+
+// Helper function
+func statusToString(status int) string {
+	switch status {
+	case storage.PDSStatusOnline:
+		return "online"
+	case storage.PDSStatusOffline:
+		return "offline"
+	default:
+		return "unknown"
+	}
 }
