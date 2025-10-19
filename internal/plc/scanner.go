@@ -42,6 +42,7 @@ func (s *Scanner) Close() {
 func (s *Scanner) Scan(ctx context.Context) error {
 	startTime := time.Now()
 	log.Println("Starting PLC directory scan...")
+	log.Println("⚠ Note: PLC directory has rate limit of 500 requests per 5 minutes")
 
 	cursor, err := s.db.GetScanCursor(ctx, "plc_directory")
 	if err != nil {
@@ -82,6 +83,13 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		operations, err := s.bundleManager.LoadBundle(ctx, currentBundle, s.client)
 		if err != nil {
 			log.Printf("Failed to load bundle %06x: %v", currentBundle, err)
+
+			// If rate limited, wait longer before retrying
+			if contains(err.Error(), "rate limited") {
+				log.Println("⚠ Rate limit hit, pausing for 5 minutes...")
+				time.Sleep(5 * time.Minute)
+				continue // Retry same bundle
+			}
 
 			// Check if this is just end of data (not an error)
 			if currentBundle > 1 {
@@ -314,4 +322,8 @@ func (s *Scanner) extractPDSFromOperation(op PLCOperation) string {
 		}
 	}
 	return ""
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && s[:len(substr)] == substr
 }

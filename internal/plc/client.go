@@ -8,35 +8,101 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 )
 
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL     string
+	httpClient  *http.Client
+	rateLimiter *RateLimiter
 }
 
 func NewClient(baseURL string) *Client {
+	// Rate limit: 90 requests per minute (leaving buffer below 100/min limit)
+	rateLimiter := NewRateLimiter(90, time.Minute)
+
 	return &Client{
 		baseURL: baseURL,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+		rateLimiter: rateLimiter,
+	}
+}
+
+func (c *Client) Close() {
+	if c.rateLimiter != nil {
+		c.rateLimiter.Stop()
 	}
 }
 
 type ExportOptions struct {
 	Count int
-	After string // ISO 8601 datetime string like "2023-04-26T06:19:25.508Z"
+	After string // ISO 8601 datetime string
 }
 
-// Export fetches export data from PLC directory with pagination
+// Export fetches export data from PLC directory with rate limiting and retry
 func (c *Client) Export(ctx context.Context, opts ExportOptions) ([]PLCOperation, error) {
+	return c.exportWithRetry(ctx, opts, 5)
+}
+
+// exportWithRetry implements retry logic with exponential backoff for rate limits
+func (c *Client) exportWithRetry(ctx context.Context, opts ExportOptions, maxRetries int) ([]PLCOperation, error) {
+	var lastErr error
+	backoff := 1 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Wait for rate limiter token
+		if err := c.rateLimiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+
+		operations, retryAfter, err := c.doExport(ctx, opts)
+
+		if err == nil {
+			return operations, nil
+		}
+
+		lastErr = err
+
+		// Check if it's a rate limit error (429)
+		if retryAfter > 0 {
+			log.Printf("⚠ Rate limited by PLC directory, waiting %v before retry %d/%d",
+				retryAfter, attempt, maxRetries)
+
+			select {
+			case <-time.After(retryAfter):
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		// Other errors - exponential backoff
+		if attempt < maxRetries {
+			log.Printf("Request failed (attempt %d/%d): %v, retrying in %v",
+				attempt, maxRetries, err, backoff)
+
+			select {
+			case <-time.After(backoff):
+				backoff *= 2 // Exponential backoff
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// doExport performs the actual HTTP request
+func (c *Client) doExport(ctx context.Context, opts ExportOptions) ([]PLCOperation, time.Duration, error) {
 	url := fmt.Sprintf("%s/export", c.baseURL)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Add query parameters
@@ -49,17 +115,27 @@ func (c *Client) Export(ctx context.Context, opts ExportOptions) ([]PLCOperation
 	}
 	req.URL.RawQuery = q.Encode()
 
-	log.Printf("→ Requesting: %s", req.URL.String())
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Handle rate limiting (429)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		retryAfter := parseRetryAfter(resp)
+
+		// Also check x-ratelimit headers for info
+		if limit := resp.Header.Get("x-ratelimit-limit"); limit != "" {
+			log.Printf("Rate limit: %s", limit)
+		}
+
+		return nil, retryAfter, fmt.Errorf("rate limited (429)")
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
+		return nil, 0, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
 	}
 
 	var operations []PLCOperation
@@ -87,16 +163,41 @@ func (c *Client) Export(ctx context.Context, opts ExportOptions) ([]PLCOperation
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading response: %w", err)
+		return nil, 0, fmt.Errorf("error reading response: %w", err)
 	}
 
-	log.Printf("← Received %d operations", len(operations))
+	return operations, 0, nil
+}
 
-	return operations, nil
+// parseRetryAfter parses the Retry-After header
+func parseRetryAfter(resp *http.Response) time.Duration {
+	retryAfter := resp.Header.Get("Retry-After")
+	if retryAfter == "" {
+		// Default to 5 minutes if no header
+		return 5 * time.Minute
+	}
+
+	// Try parsing as seconds
+	if seconds, err := strconv.Atoi(retryAfter); err == nil {
+		return time.Duration(seconds) * time.Second
+	}
+
+	// Try parsing as HTTP date
+	if t, err := http.ParseTime(retryAfter); err == nil {
+		return time.Until(t)
+	}
+
+	// Default
+	return 5 * time.Minute
 }
 
 // GetDID fetches a specific DID document from PLC
 func (c *Client) GetDID(ctx context.Context, did string) (*DIDDocument, error) {
+	// Wait for rate limiter
+	if err := c.rateLimiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+
 	url := fmt.Sprintf("%s/%s", c.baseURL, did)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -109,6 +210,11 @@ func (c *Client) GetDID(ctx context.Context, did string) (*DIDDocument, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		retryAfter := parseRetryAfter(resp)
+		return nil, fmt.Errorf("rate limited, retry after %v", retryAfter)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

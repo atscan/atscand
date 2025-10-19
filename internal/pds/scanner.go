@@ -146,14 +146,14 @@ func (s *Scanner) scanPDS(ctx context.Context, pdsID int64, endpoint string) *PD
 	}
 
 	// List repos (DIDs)
-	dids, err := s.client.ListRepos(ctx, endpoint)
+	/*dids, err := s.client.ListRepos(ctx, endpoint)
 	if err != nil {
 		log.Printf("Warning: failed to list repos for %s: %v", endpoint, err)
 		status.DIDs = []string{}
 	} else {
 		status.DIDs = dids
 		log.Printf("  → Found %d users on %s", len(dids), endpoint)
-	}
+	}*/
 
 	return status
 }
