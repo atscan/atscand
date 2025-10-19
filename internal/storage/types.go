@@ -83,16 +83,20 @@ type PLCMetrics struct {
 
 // PLCBundle represents a cached bundle of PLC operations
 type PLCBundle struct {
-	BundleNumber   int // PRIMARY KEY (no separate ID needed)
-	StartTime      time.Time
-	EndTime        time.Time
-	OperationCount int
-	DIDs           []string
-	FilePath       string
-	FileSize       int64
-	Hash           string
-	Compressed     bool
-	CreatedAt      time.Time
+	BundleNumber int // PRIMARY KEY
+	StartTime    time.Time
+	EndTime      time.Time
+	DIDs         []string
+	FilePath     string
+	FileSize     int64
+	Hash         string
+	Compressed   bool
+	CreatedAt    time.Time
+}
+
+// OperationCount() returns 1000 (all bundles have exactly 1000 operations)
+func (b *PLCBundle) OperationCount() int {
+	return 1000
 }
 
 // MempoolOperation represents an operation waiting to be bundled

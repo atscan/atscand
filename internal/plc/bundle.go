@@ -284,6 +284,10 @@ func (bm *BundleManager) indexBundleWithHash(ctx context.Context, bundleNumber i
 		return nil
 	}
 
+	if len(operations) != 1000 {
+		return fmt.Errorf("Invalid number of operations")
+	}
+
 	// Extract unique DIDs
 	didSet := make(map[string]bool)
 	for _, op := range operations {
@@ -302,16 +306,15 @@ func (bm *BundleManager) indexBundleWithHash(ctx context.Context, bundleNumber i
 	}
 
 	bundle := &storage.PLCBundle{
-		BundleNumber:   bundleNumber, // This IS the primary key
-		StartTime:      operations[0].CreatedAt,
-		EndTime:        operations[len(operations)-1].CreatedAt,
-		OperationCount: len(operations),
-		DIDs:           dids,
-		FilePath:       path,
-		FileSize:       fileSize,
-		Hash:           hash,
-		Compressed:     true,
-		CreatedAt:      time.Now(),
+		BundleNumber: bundleNumber, // This IS the primary key
+		StartTime:    operations[0].CreatedAt,
+		EndTime:      operations[len(operations)-1].CreatedAt,
+		DIDs:         dids,
+		FilePath:     path,
+		FileSize:     fileSize,
+		Hash:         hash,
+		Compressed:   true,
+		CreatedAt:    time.Now(),
 	}
 
 	return bm.db.CreateBundle(ctx, bundle)

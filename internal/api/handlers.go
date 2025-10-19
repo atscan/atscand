@@ -206,12 +206,11 @@ func (s *Server) handleGetBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return simplified response
 	response := map[string]interface{}{
 		"bundle_number":   bundle.BundleNumber,
 		"start_time":      bundle.StartTime,
 		"end_time":        bundle.EndTime,
-		"operation_count": bundle.OperationCount,
+		"operation_count": 1000, // Always 1000
 		"did_count":       len(bundle.DIDs),
 		"file_size":       bundle.FileSize,
 		"hash":            bundle.Hash,
@@ -341,7 +340,21 @@ func (s *Server) handleGetBundles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, bundles)
+	// Format response
+	response := make([]map[string]interface{}, len(bundles))
+	for i, bundle := range bundles {
+		response[i] = map[string]interface{}{
+			"bundle_number":   bundle.BundleNumber,
+			"start_time":      bundle.StartTime,
+			"end_time":        bundle.EndTime,
+			"operation_count": 1000, // Always 1000
+			"did_count":       len(bundle.DIDs),
+			"file_size":       bundle.FileSize,
+			"hash":            bundle.Hash[:16] + "...", // Shortened hash
+		}
+	}
+
+	respondJSON(w, response)
 }
 
 func (s *Server) handleGetBundleStats(w http.ResponseWriter, r *http.Request) {

@@ -85,10 +85,9 @@ func (s *SQLiteDB) Migrate() error {
 
     -- Bundles with bundle number
     CREATE TABLE IF NOT EXISTS plc_bundles (
-        bundle_number INTEGER PRIMARY KEY,  -- No AUTOINCREMENT, this IS the primary key
+        bundle_number INTEGER PRIMARY KEY,
         start_time TIMESTAMP NOT NULL,
         end_time TIMESTAMP NOT NULL,
-        operation_count INTEGER NOT NULL,
         dids TEXT NOT NULL,
         file_path TEXT NOT NULL,
         file_size INTEGER NOT NULL,
@@ -121,7 +120,7 @@ func (s *SQLiteDB) Migrate() error {
 // GetBundleByNumber - simplified
 func (s *SQLiteDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*PLCBundle, error) {
 	query := `
-        SELECT bundle_number, start_time, end_time, operation_count, dids, file_path, file_size, hash, compressed, created_at
+        SELECT bundle_number, start_time, end_time, dids, file_path, file_size, hash, compressed, created_at
         FROM plc_bundles
         WHERE bundle_number = ?
     `
@@ -131,7 +130,7 @@ func (s *SQLiteDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*PL
 
 	err := s.db.QueryRowContext(ctx, query, bundleNumber).Scan(
 		&bundle.BundleNumber, &bundle.StartTime, &bundle.EndTime,
-		&bundle.OperationCount, &didsJSON, &bundle.FilePath, &bundle.FileSize,
+		&didsJSON, &bundle.FilePath, &bundle.FileSize,
 		&bundle.Hash, &bundle.Compressed, &bundle.CreatedAt,
 	)
 	if err != nil {
@@ -245,12 +244,11 @@ func (s *SQLiteDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
 	}
 
 	query := `
-        INSERT INTO plc_bundles (bundle_number, start_time, end_time, operation_count, dids, file_path, file_size, hash, compressed)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO plc_bundles (bundle_number, start_time, end_time, dids, file_path, file_size, hash, compressed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(bundle_number) DO UPDATE SET
             start_time = excluded.start_time,
             end_time = excluded.end_time,
-            operation_count = excluded.operation_count,
             dids = excluded.dids,
             file_path = excluded.file_path,
             file_size = excluded.file_size,
@@ -258,7 +256,7 @@ func (s *SQLiteDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
             compressed = excluded.compressed
     `
 	_, err = s.db.ExecContext(ctx, query,
-		bundle.BundleNumber, bundle.StartTime, bundle.EndTime, bundle.OperationCount,
+		bundle.BundleNumber, bundle.StartTime, bundle.EndTime,
 		string(didsJSON), bundle.FilePath, bundle.FileSize, bundle.Hash, bundle.Compressed,
 	)
 
@@ -280,7 +278,7 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 		args = []interface{}{}
 	} else {
 		query = `
-            SELECT id, start_time, end_time, operation_count, dids, file_path, file_size, compressed, created_at
+            SELECT id, start_time, end_time, dids, file_path, file_size, compressed, created_at
             FROM plc_bundles
             WHERE start_time >= ?
             ORDER BY start_time ASC
@@ -293,7 +291,7 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 	var didsJSON string
 
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(
-		&bundle.BundleNumber, &bundle.StartTime, &bundle.EndTime, &bundle.OperationCount,
+		&bundle.BundleNumber, &bundle.StartTime, &bundle.EndTime,
 		&didsJSON, &bundle.FilePath, &bundle.FileSize, &bundle.Compressed, &bundle.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -314,7 +312,7 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 // GetBundles retrieves recent bundles
 func (s *SQLiteDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error) {
 	query := `
-        SELECT bundle_number, start_time, end_time, operation_count, dids, file_path, file_size, hash, compressed, created_at
+        SELECT bundle_number, start_time, end_time, dids, file_path, file_size, hash, compressed, created_at
         FROM plc_bundles
         ORDER BY bundle_number DESC
         LIMIT ?
@@ -349,7 +347,7 @@ func (s *SQLiteDB) GetAllBundles(ctx context.Context) ([]*PLCBundle, error) {
 // GetBundlesForDID finds bundles containing a specific DID using JSON functions
 func (s *SQLiteDB) GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error) {
 	query := `
-        SELECT bundle_number, start_time, end_time, operation_count, dids, file_path, file_size, hash, compressed, created_at
+        SELECT bundle_number, start_time, end_time, dids, file_path, file_size, hash, compressed, created_at
         FROM plc_bundles
         WHERE EXISTS (
             SELECT 1 FROM json_each(dids) 
@@ -377,7 +375,7 @@ func (s *SQLiteDB) scanBundles(rows *sql.Rows) ([]*PLCBundle, error) {
 
 		if err := rows.Scan(
 			&bundle.BundleNumber, &bundle.StartTime, &bundle.EndTime,
-			&bundle.OperationCount, &didsJSON, &bundle.FilePath, &bundle.FileSize,
+			&didsJSON, &bundle.FilePath, &bundle.FileSize,
 			&bundle.Hash, &bundle.Compressed, &bundle.CreatedAt,
 		); err != nil {
 			return nil, err
