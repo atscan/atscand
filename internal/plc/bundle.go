@@ -186,15 +186,7 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 func (bm *BundleManager) saveBundleFileWithHash(path string, operations []PLCOperation) (string, string, error) {
 	var jsonlData []byte
 	for i, op := range operations {
-		if len(op.RawJSON) > 0 {
-			jsonlData = append(jsonlData, op.RawJSON...)
-		} else {
-			lineJSON, err := json.Marshal(op)
-			if err != nil {
-				return "", "", fmt.Errorf("failed to marshal operation: %w", err)
-			}
-			jsonlData = append(jsonlData, lineJSON...)
-		}
+		jsonlData = append(jsonlData, op.RawJSON...)
 
 		// Add newline ONLY between operations (not after last)
 		if i < len(operations)-1 {
