@@ -216,6 +216,7 @@ func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 		"did_count":         len(bundle.DIDs),
 		"file_size":         bundle.FileSize,
 		"hash":              bundle.Hash,
+		"prev_bundle_hash":  bundle.PrevBundleHash, // NEW: Chain link
 		"created_at":        bundle.CreatedAt,
 	}
 
@@ -352,7 +353,8 @@ func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 			"operation_count":   1000, // Always 1000
 			"did_count":         len(bundle.DIDs),
 			"file_size":         bundle.FileSize,
-			"hash":              bundle.Hash, // Shortened hash
+			"hash":              bundle.Hash,
+			"prev_bundle_hash":  bundle.PrevBundleHash, // NEW: Chain link
 		}
 	}
 
@@ -435,6 +437,104 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		"verified":      verified,
 		"local_hash":    bundle.Hash,
 		"remote_hash":   remoteHash,
+	})
+}
+
+func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get last bundle number
+	lastBundle, err := s.db.GetLastBundleNumber(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if lastBundle == 0 {
+		respondJSON(w, map[string]interface{}{
+			"status":  "empty",
+			"message": "No bundles to verify",
+		})
+		return
+	}
+
+	// Verify chain
+	valid := true
+	var brokenAt int
+	var errorMsg string
+
+	for i := 1; i <= lastBundle; i++ {
+		bundle, err := s.db.GetBundleByNumber(ctx, i)
+		if err != nil {
+			valid = false
+			brokenAt = i
+			errorMsg = fmt.Sprintf("Bundle %06d not found", i)
+			break
+		}
+
+		// Verify chain link
+		if i > 1 {
+			prevBundle, err := s.db.GetBundleByNumber(ctx, i-1)
+			if err != nil {
+				valid = false
+				brokenAt = i
+				errorMsg = fmt.Sprintf("Previous bundle %06d not found", i-1)
+				break
+			}
+
+			if bundle.PrevBundleHash != prevBundle.Hash {
+				valid = false
+				brokenAt = i
+				errorMsg = fmt.Sprintf("Chain broken: bundle %06d prev_hash doesn't match bundle %06d hash", i, i-1)
+				break
+			}
+		}
+	}
+
+	response := map[string]interface{}{
+		"chain_length": lastBundle,
+		"valid":        valid,
+	}
+
+	if !valid {
+		response["broken_at"] = brokenAt
+		response["error"] = errorMsg
+	}
+
+	respondJSON(w, response)
+}
+
+func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	lastBundle, err := s.db.GetLastBundleNumber(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if lastBundle == 0 {
+		respondJSON(w, map[string]interface{}{
+			"chain_length": 0,
+			"status":       "empty",
+		})
+		return
+	}
+
+	firstBundle, _ := s.db.GetBundleByNumber(ctx, 1)
+	lastBundleData, _ := s.db.GetBundleByNumber(ctx, lastBundle)
+
+	count, size, _ := s.db.GetBundleStats(ctx)
+
+	respondJSON(w, map[string]interface{}{
+		"chain_length":     lastBundle,
+		"total_bundles":    count,
+		"total_size_mb":    float64(size) / 1024 / 1024,
+		"chain_start_time": firstBundle.StartTime,
+		"chain_end_time":   lastBundleData.EndTime,
+		"chain_head_hash":  lastBundleData.Hash,
+		"first_prev_hash":  firstBundle.PrevBundleHash, // Should be empty
+		"last_prev_hash":   lastBundleData.PrevBundleHash,
 	})
 }
 

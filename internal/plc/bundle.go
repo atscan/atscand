@@ -278,7 +278,7 @@ func (bm *BundleManager) loadBundleFromFile(path string) ([]PLCOperation, error)
 	return operations, nil
 }
 
-// indexBundleWithHash stores bundle metadata with hash
+// indexBundleWithHash stores bundle with chain hash
 func (bm *BundleManager) indexBundleWithHash(ctx context.Context, bundleNumber int, operations []PLCOperation, path string, hash string) error {
 	if len(operations) == 0 {
 		return nil
@@ -286,6 +286,18 @@ func (bm *BundleManager) indexBundleWithHash(ctx context.Context, bundleNumber i
 
 	if len(operations) != 1000 {
 		return fmt.Errorf("Invalid number of operations")
+	}
+
+	// Get previous bundle's hash
+	var prevBundleHash string
+	if bundleNumber > 1 {
+		prevBundle, err := bm.db.GetBundleByNumber(ctx, bundleNumber-1)
+		if err == nil && prevBundle != nil {
+			prevBundleHash = prevBundle.Hash
+			log.Verbose("  Linking to previous bundle %06d (hash: %s)", bundleNumber-1, prevBundleHash[:16]+"...")
+		} else {
+			log.Error("Warning: Cannot link to previous bundle %06d", bundleNumber-1)
+		}
 	}
 
 	// Extract unique DIDs
@@ -306,15 +318,16 @@ func (bm *BundleManager) indexBundleWithHash(ctx context.Context, bundleNumber i
 	}
 
 	bundle := &storage.PLCBundle{
-		BundleNumber: bundleNumber, // This IS the primary key
-		StartTime:    operations[0].CreatedAt,
-		EndTime:      operations[len(operations)-1].CreatedAt,
-		DIDs:         dids,
-		FilePath:     path,
-		FileSize:     fileSize,
-		Hash:         hash,
-		Compressed:   true,
-		CreatedAt:    time.Now(),
+		BundleNumber:   bundleNumber,
+		StartTime:      operations[0].CreatedAt,
+		EndTime:        operations[len(operations)-1].CreatedAt,
+		DIDs:           dids,
+		FilePath:       path,
+		FileSize:       fileSize,
+		Hash:           hash,
+		PrevBundleHash: prevBundleHash, // NEW: Chain link
+		Compressed:     true,
+		CreatedAt:      time.Now(),
 	}
 
 	return bm.db.CreateBundle(ctx, bundle)
@@ -409,4 +422,89 @@ func (bm *BundleManager) verifyBundleHash(path string, expectedHash string) (boo
 
 	actualHash := bm.calculateHash(data)
 	return actualHash == expectedHash, nil
+}
+
+// VerifyChain verifies the entire bundle chain from 1 to N
+func (bm *BundleManager) VerifyChain(ctx context.Context, endBundle int) error {
+	if !bm.enabled {
+		return fmt.Errorf("bundle manager disabled")
+	}
+
+	log.Info("Verifying bundle chain from 1 to %06d...", endBundle)
+
+	for i := 1; i <= endBundle; i++ {
+		bundle, err := bm.db.GetBundleByNumber(ctx, i)
+		if err != nil {
+			return fmt.Errorf("bundle %06d not found: %w", i, err)
+		}
+
+		// Verify file hash
+		valid, err := bm.verifyBundleHash(bundle.FilePath, bundle.Hash)
+		if err != nil {
+			return fmt.Errorf("bundle %06d hash verification failed: %w", i, err)
+		}
+		if !valid {
+			return fmt.Errorf("bundle %06d hash mismatch!", i)
+		}
+
+		// Verify chain link
+		if i > 1 {
+			prevBundle, err := bm.db.GetBundleByNumber(ctx, i-1)
+			if err != nil {
+				return fmt.Errorf("bundle %06d missing (required by %06d)", i-1, i)
+			}
+
+			if bundle.PrevBundleHash != prevBundle.Hash {
+				return fmt.Errorf("bundle %06d chain broken! Expected prev_hash=%s, got=%s",
+					i, prevBundle.Hash[:16], bundle.PrevBundleHash[:16])
+			}
+		} else {
+			// First bundle should have no previous hash
+			if bundle.PrevBundleHash != "" {
+				return fmt.Errorf("bundle %06d should not have prev_bundle_hash", i)
+			}
+		}
+
+		if i%100 == 0 {
+			log.Verbose("  ✓ Verified bundles 1-%06d", i)
+		}
+	}
+
+	log.Info("✓ Chain verification complete: bundles 1-%06d are valid and continuous", endBundle)
+	return nil
+}
+
+// GetChainInfo returns information about the bundle chain
+func (bm *BundleManager) GetChainInfo(ctx context.Context) (map[string]interface{}, error) {
+	lastBundle, err := bm.db.GetLastBundleNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if lastBundle == 0 {
+		return map[string]interface{}{
+			"chain_length": 0,
+			"status":       "empty",
+		}, nil
+	}
+
+	// Quick check first and last
+	firstBundle, err := bm.db.GetBundleByNumber(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	lastBundleData, err := bm.db.GetBundleByNumber(ctx, lastBundle)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"chain_length":     lastBundle,
+		"first_bundle":     1,
+		"last_bundle":      lastBundle,
+		"chain_start_time": firstBundle.StartTime,
+		"chain_end_time":   lastBundleData.EndTime,
+		"chain_head_hash":  lastBundleData.Hash,
+	}, nil
 }
