@@ -82,23 +82,23 @@ func (s *SQLiteDB) Migrate() error {
         records_processed INTEGER DEFAULT 0
     );
 
-    -- Bundles with chaining
+    -- Bundles with dual hashing
     CREATE TABLE IF NOT EXISTS plc_bundles (
         bundle_number INTEGER PRIMARY KEY,
         start_time TIMESTAMP NOT NULL,
         end_time TIMESTAMP NOT NULL,
         dids TEXT NOT NULL,
-        file_path TEXT NOT NULL,
-        file_size INTEGER NOT NULL,
-        hash TEXT NOT NULL,
-        prev_bundle_hash TEXT,        -- NEW: Links to previous bundle
+        hash TEXT NOT NULL,                -- SHA256 of uncompressed JSONL
+        compressed_hash TEXT NOT NULL,     -- SHA256 of compressed file
+        compressed_size INTEGER NOT NULL,  -- Size of compressed file
+        prev_bundle_hash TEXT,             -- Chain link
         compressed BOOLEAN DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE INDEX IF NOT EXISTS idx_plc_bundles_time ON plc_bundles(start_time, end_time);
     CREATE INDEX IF NOT EXISTS idx_plc_bundles_hash ON plc_bundles(hash);
-    CREATE INDEX IF NOT EXISTS idx_plc_bundles_prev ON plc_bundles(prev_bundle_hash);  -- NEW
+    CREATE INDEX IF NOT EXISTS idx_plc_bundles_prev ON plc_bundles(prev_bundle_hash);
 
     -- NEW: Mempool for pending operations
     CREATE TABLE IF NOT EXISTS plc_mempool (
@@ -121,7 +121,7 @@ func (s *SQLiteDB) Migrate() error {
 // GetBundleByNumber
 func (s *SQLiteDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*PLCBundle, error) {
 	query := `
-        SELECT bundle_number, start_time, end_time, dids, file_path, file_size, hash, prev_bundle_hash, compressed, created_at
+        SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, compressed_size, prev_bundle_hash, compressed, created_at
         FROM plc_bundles
         WHERE bundle_number = ?
     `
@@ -132,8 +132,8 @@ func (s *SQLiteDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*PL
 
 	err := s.db.QueryRowContext(ctx, query, bundleNumber).Scan(
 		&bundle.BundleNumber, &bundle.StartTime, &bundle.EndTime,
-		&didsJSON, &bundle.FilePath, &bundle.FileSize,
-		&bundle.Hash, &prevHash, &bundle.Compressed, &bundle.CreatedAt,
+		&didsJSON, &bundle.Hash, &bundle.CompressedHash,
+		&bundle.CompressedSize, &prevHash, &bundle.Compressed, &bundle.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -251,31 +251,34 @@ func (s *SQLiteDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
 	}
 
 	query := `
-        INSERT INTO plc_bundles (bundle_number, start_time, end_time, dids, file_path, file_size, hash, prev_bundle_hash, compressed)
+        INSERT INTO plc_bundles (
+            bundle_number, start_time, end_time, dids, 
+            hash, compressed_hash, compressed_size, prev_bundle_hash, compressed
+        )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(bundle_number) DO UPDATE SET
             start_time = excluded.start_time,
             end_time = excluded.end_time,
             dids = excluded.dids,
-            file_path = excluded.file_path,
-            file_size = excluded.file_size,
             hash = excluded.hash,
+            compressed_hash = excluded.compressed_hash,
+            compressed_size = excluded.compressed_size,
             prev_bundle_hash = excluded.prev_bundle_hash,
             compressed = excluded.compressed
     `
 	_, err = s.db.ExecContext(ctx, query,
 		bundle.BundleNumber, bundle.StartTime, bundle.EndTime,
-		string(didsJSON), bundle.FilePath, bundle.FileSize,
-		bundle.Hash, bundle.PrevBundleHash, bundle.Compressed,
+		string(didsJSON), bundle.Hash, bundle.CompressedHash,
+		bundle.CompressedSize, bundle.PrevBundleHash, bundle.Compressed,
 	)
 
 	return err
 }
 
-// GetBundles - FIX: Add prev_bundle_hash to SELECT
+// GetBundles
 func (s *SQLiteDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error) {
 	query := `
-        SELECT bundle_number, start_time, end_time, dids, file_path, file_size, hash, prev_bundle_hash, compressed, created_at
+        SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, compressed_size, prev_bundle_hash, compressed, created_at
         FROM plc_bundles
         ORDER BY bundle_number DESC
         LIMIT ?
@@ -290,10 +293,10 @@ func (s *SQLiteDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, err
 	return s.scanBundles(rows)
 }
 
-// GetBundlesForDID - FIX: Add prev_bundle_hash to SELECT
+// GetBundlesForDID
 func (s *SQLiteDB) GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error) {
 	query := `
-        SELECT bundle_number, start_time, end_time, dids, file_path, file_size, hash, prev_bundle_hash, compressed, created_at
+        SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, compressed_size, prev_bundle_hash, compressed, created_at
         FROM plc_bundles
         WHERE EXISTS (
             SELECT 1 FROM json_each(dids) 
@@ -311,14 +314,14 @@ func (s *SQLiteDB) GetBundlesForDID(ctx context.Context, did string) ([]*PLCBund
 	return s.scanBundles(rows)
 }
 
-// GetBundle - FIX: Add prev_bundle_hash to SELECT (if this method exists)
+// GetBundle retrieves bundle by time (if needed, otherwise can be removed)
 func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBundle, error) {
 	var query string
 	var args []interface{}
 
 	if afterTime.IsZero() {
 		query = `
-            SELECT bundle_number, start_time, end_time, dids, file_path, file_size, hash, prev_bundle_hash, compressed, created_at
+            SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, compressed_size, prev_bundle_hash, compressed, created_at
             FROM plc_bundles
             ORDER BY start_time ASC
             LIMIT 1
@@ -326,7 +329,7 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 		args = []interface{}{}
 	} else {
 		query = `
-            SELECT bundle_number, start_time, end_time, dids, file_path, file_size, hash, prev_bundle_hash, compressed, created_at
+            SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, compressed_size, prev_bundle_hash, compressed, created_at
             FROM plc_bundles
             WHERE start_time >= ?
             ORDER BY start_time ASC
@@ -340,9 +343,16 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 	var prevHash sql.NullString
 
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(
-		&bundle.BundleNumber, &bundle.StartTime, &bundle.EndTime,
-		&didsJSON, &bundle.FilePath, &bundle.FileSize,
-		&bundle.Hash, &prevHash, &bundle.Compressed, &bundle.CreatedAt,
+		&bundle.BundleNumber,
+		&bundle.StartTime,
+		&bundle.EndTime,
+		&didsJSON,
+		&bundle.Hash,           // Uncompressed hash
+		&bundle.CompressedHash, // Compressed hash
+		&bundle.CompressedSize, // Compressed size (not FileSize!)
+		&prevHash,              // Previous bundle hash
+		&bundle.Compressed,
+		&bundle.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -368,16 +378,16 @@ func (s *SQLiteDB) scanBundles(rows *sql.Rows) ([]*PLCBundle, error) {
 		var didsJSON string
 		var prevHash sql.NullString
 
-		// Scan 10 columns: bundle_number, start_time, end_time, dids, file_path, file_size, hash, prev_bundle_hash, compressed, created_at
+		// Scan: bundle_number, start_time, end_time, dids, hash, compressed_hash, compressed_size, prev_bundle_hash, compressed, created_at
 		if err := rows.Scan(
 			&bundle.BundleNumber,
 			&bundle.StartTime,
 			&bundle.EndTime,
 			&didsJSON,
-			&bundle.FilePath,
-			&bundle.FileSize,
-			&bundle.Hash,
-			&prevHash, // NEW: 8th column
+			&bundle.Hash,           // Uncompressed hash
+			&bundle.CompressedHash, // Compressed hash
+			&bundle.CompressedSize, // Compressed size
+			&prevHash,
 			&bundle.Compressed,
 			&bundle.CreatedAt,
 		); err != nil {
@@ -395,10 +405,10 @@ func (s *SQLiteDB) scanBundles(rows *sql.Rows) ([]*PLCBundle, error) {
 	return bundles, rows.Err()
 }
 
-// GetBundleStats returns bundle statistics
+// GetBundleStats - update to use compressed_size
 func (s *SQLiteDB) GetBundleStats(ctx context.Context) (int64, int64, error) {
 	query := `
-        SELECT COUNT(*), COALESCE(SUM(file_size), 0)
+        SELECT COUNT(*), COALESCE(SUM(compressed_size), 0)
         FROM plc_bundles
     `
 

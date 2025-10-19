@@ -1,6 +1,10 @@
 package storage
 
-import "time"
+import (
+	"fmt"
+	"path/filepath"
+	"time"
+)
 
 // DID represents a decentralized identifier
 type DID struct {
@@ -87,12 +91,17 @@ type PLCBundle struct {
 	StartTime      time.Time
 	EndTime        time.Time
 	DIDs           []string
-	FilePath       string
-	FileSize       int64
-	Hash           string // Hash of THIS bundle
-	PrevBundleHash string // NEW: Hash of previous bundle (creates chain)
+	Hash           string // SHA256 of uncompressed JSONL (verifiable against PLC)
+	CompressedHash string // SHA256 of compressed file on disk
+	CompressedSize int64  // Size of compressed file in bytes
+	PrevBundleHash string // Hash of previous bundle (for chain)
 	Compressed     bool
 	CreatedAt      time.Time
+}
+
+// GetFilePath returns the computed file path for this bundle
+func (b *PLCBundle) GetFilePath(cacheDir string) string {
+	return filepath.Join(cacheDir, fmt.Sprintf("%06d.jsonl.zst", b.BundleNumber))
 }
 
 // OperationCount() returns 1000 (all bundles have exactly 1000 operations)

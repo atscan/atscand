@@ -100,12 +100,12 @@ func (s *Server) handleGetPDSStats(w http.ResponseWriter, r *http.Request) {
 
 	respondJSON(w, stats)
 }
+
 func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
 	did := vars["did"]
 
-	// Use SQL JSON query to find bundles
 	bundles, err := s.db.GetBundlesForDID(ctx, did)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -117,10 +117,12 @@ func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load the last bundle (most recent)
 	lastBundle := bundles[len(bundles)-1]
 
-	operations, err := s.loadBundleOperations(lastBundle.FilePath)
+	// Compute file path
+	filePath := filepath.Join(s.plcCacheDir, fmt.Sprintf("%06d.jsonl.zst", lastBundle.BundleNumber))
+
+	operations, err := s.loadBundleOperations(filePath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to load bundle: %v", err), http.StatusInternalServerError)
 		return
@@ -148,7 +150,6 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	did := vars["did"]
 
-	// Use SQL JSON query
 	bundles, err := s.db.GetBundlesForDID(ctx, did)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -163,9 +164,11 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	var allOperations []plc.DIDHistoryEntry
 	var currentOp *plc.PLCOperation
 
-	// Load all relevant bundles
 	for _, bundle := range bundles {
-		operations, err := s.loadBundleOperations(bundle.FilePath)
+		// Compute file path
+		filePath := filepath.Join(s.plcCacheDir, fmt.Sprintf("%06d.jsonl.zst", bundle.BundleNumber))
+
+		operations, err := s.loadBundleOperations(filePath)
 		if err != nil {
 			log.Error("Warning: failed to load bundle: %v", err)
 			continue
@@ -175,7 +178,7 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 			if op.DID == did {
 				entry := plc.DIDHistoryEntry{
 					Operation: op,
-					PLCBundle: filepath.Base(bundle.FilePath),
+					PLCBundle: fmt.Sprintf("%06d", bundle.BundleNumber),
 				}
 				allOperations = append(allOperations, entry)
 				currentOp = &op
@@ -212,11 +215,12 @@ func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 		"plc_bundle_number": bundle.BundleNumber,
 		"start_time":        bundle.StartTime,
 		"end_time":          bundle.EndTime,
-		"operation_count":   1000, // Always 1000
+		"operation_count":   1000,
 		"did_count":         len(bundle.DIDs),
-		"file_size":         bundle.FileSize,
-		"hash":              bundle.Hash,
-		"prev_bundle_hash":  bundle.PrevBundleHash, // NEW: Chain link
+		"hash":              bundle.Hash,           // Uncompressed (verifiable)
+		"compressed_hash":   bundle.CompressedHash, // File integrity
+		"compressed_size":   bundle.CompressedSize,
+		"prev_bundle_hash":  bundle.PrevBundleHash,
 		"created_at":        bundle.CreatedAt,
 	}
 
@@ -343,18 +347,18 @@ func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Format response
 	response := make([]map[string]interface{}, len(bundles))
 	for i, bundle := range bundles {
 		response[i] = map[string]interface{}{
 			"plc_bundle_number": bundle.BundleNumber,
 			"start_time":        bundle.StartTime,
 			"end_time":          bundle.EndTime,
-			"operation_count":   1000, // Always 1000
+			"operation_count":   1000,
 			"did_count":         len(bundle.DIDs),
-			"file_size":         bundle.FileSize,
 			"hash":              bundle.Hash,
-			"prev_bundle_hash":  bundle.PrevBundleHash, // NEW: Chain link
+			"compressed_hash":   bundle.CompressedHash,
+			"compressed_size":   bundle.CompressedSize,
+			"prev_bundle_hash":  bundle.PrevBundleHash,
 		}
 	}
 
@@ -392,14 +396,14 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Get bundle from DB
+	// Get bundle from DB
 	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
 	if err != nil {
 		http.Error(w, "Bundle not found", http.StatusNotFound)
 		return
 	}
 
-	// 2. Get previous bundle for 'after' timestamp
+	// Get previous bundle for 'after' timestamp
 	prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNumber-1)
 	if err != nil && bundleNumber > 1 {
 		http.Error(w, "Failed to get previous bundle", http.StatusInternalServerError)
@@ -411,9 +415,9 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		after = prevBundle.EndTime.Format("2006-01-02T15:04:05.000Z")
 	}
 
-	// 3. Fetch from PLC directory
+	// Fetch from PLC directory
 	remoteOps, err := s.plcClient.Export(ctx, plc.ExportOptions{
-		Count: 1000, // Bundles always have 1000 operations
+		Count: 1000,
 		After: after,
 	})
 	if err != nil {
@@ -421,17 +425,16 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Compute remote hash
+	// Compute remote hash (uncompressed JSONL)
 	remoteHash, err := computeRemoteOperationsHash(remoteOps)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to compute remote hash: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// 5. Compare hashes
+	// Compare hashes (use uncompressed hash)
 	verified := bundle.Hash == remoteHash
 
-	// 6. Return response
 	respondJSON(w, map[string]interface{}{
 		"bundle_number": bundleNumber,
 		"verified":      verified,
@@ -539,7 +542,7 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func computeRemoteOperationsHash(ops []plc.PLCOperation) (string, error) {
-	// Convert to JSONL format
+	// Convert to JSONL format (uncompressed)
 	var jsonlData []byte
 	for _, op := range ops {
 		lineJSON, err := json.Marshal(op)
@@ -550,15 +553,8 @@ func computeRemoteOperationsHash(ops []plc.PLCOperation) (string, error) {
 		jsonlData = append(jsonlData, '\n')
 	}
 
-	// Compress
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-	if err != nil {
-		return "", err
-	}
-	compressed := encoder.EncodeAll(jsonlData, nil)
-
-	// Calculate hash of compressed data
-	hash := sha256.Sum256(compressed)
+	// Calculate hash of uncompressed JSONL
+	hash := sha256.Sum256(jsonlData)
 	return hex.EncodeToString(hash[:]), nil
 }
 
