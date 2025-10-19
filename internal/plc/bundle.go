@@ -128,8 +128,7 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 				// Calculate uncompressed hash
 				var jsonlData []byte
 				for i, op := range operations {
-					lineJSON, _ := json.Marshal(op)
-					jsonlData = append(jsonlData, lineJSON...)
+					jsonlData = append(jsonlData, op.RawJSON...)
 
 					// Add newline ONLY if not the last operation
 					if i < len(operations)-1 {
@@ -261,6 +260,10 @@ func (bm *BundleManager) loadBundleFromFile(path string) ([]PLCOperation, error)
 		if err := json.Unmarshal(line, &op); err != nil {
 			return nil, fmt.Errorf("failed to parse operation on line %d: %w", lineNum, err)
 		}
+
+		// CRITICAL: Store the original raw JSON bytes
+		op.RawJSON = make([]byte, len(line))
+		copy(op.RawJSON, line)
 
 		operations = append(operations, op)
 	}
