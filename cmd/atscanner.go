@@ -19,12 +19,18 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
+	verbose := flag.Bool("verbose", false, "enable verbose logging")
 	flag.Parse()
 
 	// Load configuration
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal("Failed to load config: %v", err)
+	}
+
+	// Override verbose setting if flag is provided
+	if *verbose {
+		cfg.API.Verbose = true
 	}
 
 	// Initialize logger
