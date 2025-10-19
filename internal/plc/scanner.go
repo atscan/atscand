@@ -80,56 +80,31 @@ func (s *Scanner) Scan(ctx context.Context) error {
 
 		log.Verbose("→ Processing bundle %06d...", currentBundle)
 
-		// Load bundle (lazy-loaded from file or PLC)
-		operations, err := s.bundleManager.LoadBundle(ctx, currentBundle, s.client)
+		// Load bundle (returns operations, isComplete flag, and error)
+		operations, isComplete, err := s.bundleManager.LoadBundle(ctx, currentBundle, s.client)
 		if err != nil {
-			log.Error("Failed to load bundle %06x: %v", currentBundle, err)
+			log.Error("Failed to load bundle %06d: %v", currentBundle, err)
 
-			// If rate limited, wait longer before retrying
+			// If rate limited, wait and retry
 			if contains(err.Error(), "rate limited") {
 				log.Info("⚠ Rate limit hit, pausing for 5 minutes...")
 				time.Sleep(5 * time.Minute)
-				continue // Retry same bundle
+				continue
 			}
 
-			// Check if this is just end of data (not an error)
+			// Check if this is just end of data
 			if currentBundle > 1 {
-				// Try to fetch with cursor from previous bundle
-				log.Info("→ Checking if we've reached the end of available data...")
-
-				// Get previous bundle to check timestamp
-				prevBundle, err := s.db.GetBundleByNumber(ctx, currentBundle-1)
-				if err == nil {
-					// Try fetching with after timestamp
-					afterTimestamp := prevBundle.EndTime.Format(time.RFC3339Nano)
-					ops, err := s.client.Export(ctx, ExportOptions{
-						Count: 1000,
-						After: afterTimestamp,
-					})
-
-					if err == nil && len(ops) > 0 {
-						// More data available, add to mempool
-						log.Info("→ Found %d operations, adding to mempool", len(ops))
-						if err := s.addToMempool(ctx, ops); err != nil {
-							log.Error("Error adding to mempool: %v", err)
-						}
-
-						// Process mempool
-						if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
-							log.Error("Error processing mempool: %v", err)
-						}
-					}
+				log.Info("→ Reached end of available data")
+				// Try mempool processing
+				if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
+					log.Error("Error processing mempool: %v", err)
 				}
 			}
-
-			break // End of available data
+			break
 		}
 
-		// Check if this is a complete bundle
-		isComplete := len(operations) == 1000
-
 		if isComplete {
-			// Process complete bundle
+			// Complete bundle (1000 operations fetched, even if some were duplicates)
 			batchNewPDS, err := s.processBatch(ctx, operations)
 			if err != nil {
 				log.Error("Error processing bundle: %v", err)
@@ -138,7 +113,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			newPDSCount += batchNewPDS
 			totalProcessed += int64(len(operations))
 
-			log.Verbose("✓ Processed bundle %06d: %d operations, %d new PDS",
+			log.Verbose("✓ Processed bundle %06d: %d operations (after dedup), %d new PDS",
 				currentBundle, len(operations), batchNewPDS)
 
 			// Update cursor
@@ -153,8 +128,8 @@ func (s *Scanner) Scan(ctx context.Context) error {
 
 			currentBundle++
 		} else {
-			// Incomplete bundle - add to mempool
-			log.Info("→ Bundle %06x incomplete (%d ops), adding to mempool", currentBundle, len(operations))
+			// Incomplete bundle - we've reached the end of available data
+			log.Info("→ Bundle %06d incomplete (%d ops), adding to mempool", currentBundle, len(operations))
 
 			if err := s.addToMempool(ctx, operations); err != nil {
 				log.Error("Error adding to mempool: %v", err)
@@ -167,9 +142,6 @@ func (s *Scanner) Scan(ctx context.Context) error {
 
 			break // End of scan
 		}
-
-		// Rate limiting
-		//time.Sleep(200 * time.Millisecond)
 	}
 
 	log.Info("PLC scan completed: %d operations, %d new PDS servers in %v",

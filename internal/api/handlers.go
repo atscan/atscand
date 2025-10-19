@@ -403,16 +403,26 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get previous bundle for 'after' timestamp
-	prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNumber-1)
-	if err != nil && bundleNumber > 1 {
-		http.Error(w, "Failed to get previous bundle", http.StatusInternalServerError)
-		return
-	}
-
+	// Get previous bundle for boundary state
 	var after string
-	if prevBundle != nil {
+	var prevBoundaryCIDs map[string]bool
+
+	if bundleNumber > 1 {
+		prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNumber-1)
+		if err != nil {
+			http.Error(w, "Failed to get previous bundle", http.StatusInternalServerError)
+			return
+		}
+
 		after = prevBundle.EndTime.Format("2006-01-02T15:04:05.000Z")
+
+		// Convert stored boundary CIDs to map
+		if len(prevBundle.BoundaryCIDs) > 0 {
+			prevBoundaryCIDs = make(map[string]bool)
+			for _, cid := range prevBundle.BoundaryCIDs {
+				prevBoundaryCIDs[cid] = true
+			}
+		}
 	}
 
 	// Fetch from PLC directory
@@ -423,6 +433,11 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch from PLC directory: %v", err), http.StatusInternalServerError)
 		return
+	}
+
+	// Apply same deduplication logic as when creating bundles
+	if after != "" && len(prevBoundaryCIDs) > 0 {
+		remoteOps = plc.StripBoundaryDuplicates(remoteOps, after, prevBoundaryCIDs)
 	}
 
 	// Compute remote hash (uncompressed JSONL)
@@ -436,10 +451,13 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 	verified := bundle.Hash == remoteHash
 
 	respondJSON(w, map[string]interface{}{
-		"bundle_number": bundleNumber,
-		"verified":      verified,
-		"local_hash":    bundle.Hash,
-		"remote_hash":   remoteHash,
+		"bundle_number":      bundleNumber,
+		"verified":           verified,
+		"local_hash":         bundle.Hash,
+		"remote_hash":        remoteHash,
+		"local_op_count":     bundle.OperationCount,
+		"remote_op_count":    len(remoteOps),
+		"boundary_cids_used": len(prevBoundaryCIDs),
 	})
 }
 

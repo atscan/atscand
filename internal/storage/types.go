@@ -90,6 +90,7 @@ type PLCBundle struct {
 	BundleNumber   int // PRIMARY KEY
 	StartTime      time.Time
 	EndTime        time.Time
+	BoundaryCIDs   []string
 	DIDs           []string
 	Hash           string // SHA256 of uncompressed JSONL (verifiable against PLC)
 	CompressedHash string // SHA256 of compressed file on disk
