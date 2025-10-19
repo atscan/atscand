@@ -17,6 +17,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// BUNDLE_SIZE is the number of operations per bundle
+const BUNDLE_SIZE = 10000
+
 type BundleManager struct {
 	dir     string
 	enabled bool
@@ -179,7 +182,7 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 		}
 	}
 
-	// Collect operations until we have exactly 1000 unique ones
+	// Collect operations until we have exactly BUNDLE_SIZE unique ones
 	var allOperations []PLCOperation
 	seenCIDs := make(map[string]bool)
 
@@ -189,25 +192,28 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 	}
 
 	currentAfter := afterTimestamp
-	maxFetches := 10 // Safety limit
+
+	// Scale maxFetches based on bundle size
+	// Assume worst case: 90% dedup rate, need buffer
+	maxFetches := (BUNDLE_SIZE / 900) + 5 // For 10k: ~16 fetches, for 1k: ~6 fetches
 	fetchCount := 0
 
-	for len(allOperations) < 1000 && fetchCount < maxFetches {
+	for len(allOperations) < BUNDLE_SIZE && fetchCount < maxFetches {
 		fetchCount++
 
 		// Calculate how many more operations we need
-		remaining := 1000 - len(allOperations)
+		remaining := BUNDLE_SIZE - len(allOperations)
 
 		// Determine fetch size based on remaining operations
 		var fetchSize int
 		if fetchCount == 1 {
-			// First fetch: always get 1000
+			// First fetch: always get 1000 (PLC limit)
 			fetchSize = 1000
 		} else if remaining < 100 {
-			// Need less than 100: fetch 50-100 (small buffer for duplicates)
+			// Need less than 100: fetch 50
 			fetchSize = 50
 		} else if remaining < 500 {
-			// Need 100-500: fetch 200 (some buffer for duplicates)
+			// Need 100-500: fetch 200
 			fetchSize = 200
 		} else {
 			// Need 500+: fetch 1000
@@ -215,6 +221,8 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 		}
 
 		// Fetch next batch
+		log.Verbose("  Fetch #%d: need %d more, requesting %d", fetchCount, remaining, fetchSize)
+
 		rawOperations, err := bm.fetchBundleFromPLCWithCount(ctx, plcClient, currentAfter, fetchSize)
 		if err != nil {
 			return nil, false, fmt.Errorf("failed to fetch bundle from PLC: %w", err)
@@ -222,12 +230,12 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 
 		if len(rawOperations) == 0 {
 			// No more data available
-			log.Info("  No more operations available after %d fetches", fetchCount)
+			log.Info("  No more operations available after %d fetches (got %d/%d)",
+				fetchCount, len(allOperations), BUNDLE_SIZE)
 			break
 		}
 
-		log.Verbose("  Fetch #%d: requested %d, got %d raw operations (need %d more)",
-			fetchCount, fetchSize, len(rawOperations), remaining)
+		log.Verbose("    Got %d raw operations", len(rawOperations))
 
 		// Filter out duplicates and add unique operations
 		newOpsAdded := 0
@@ -237,15 +245,16 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 				allOperations = append(allOperations, op)
 				newOpsAdded++
 
-				if len(allOperations) >= 1000 {
+				if len(allOperations) >= BUNDLE_SIZE {
 					break
 				}
 			}
 		}
 
-		log.Verbose("  Added %d unique operations (total: %d/1000)", newOpsAdded, len(allOperations))
+		log.Verbose("    Added %d unique operations (total: %d/%d, %d dupes)",
+			newOpsAdded, len(allOperations), BUNDLE_SIZE, len(rawOperations)-newOpsAdded)
 
-		// If we added no new operations, we're stuck in a loop
+		// If we added no new operations, we're stuck
 		if newOpsAdded == 0 {
 			log.Error("  No new unique operations found, stopping")
 			break
@@ -264,16 +273,23 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 		}
 	}
 
-	// Check if we got exactly 1000 operations
-	isComplete := len(allOperations) >= 1000
-
-	if len(allOperations) > 1000 {
-		// Trim to exactly 1000
-		allOperations = allOperations[:1000]
+	// Warn if we hit the fetch limit
+	if fetchCount >= maxFetches {
+		log.Verbose("  ⚠ Hit maxFetches limit (%d) with only %d/%d operations",
+			maxFetches, len(allOperations), BUNDLE_SIZE)
 	}
 
-	log.Info("  Collected %d unique operations after %d fetches (complete=%v)",
-		len(allOperations), fetchCount, isComplete)
+	// Check if we got exactly BUNDLE_SIZE operations
+	isComplete := len(allOperations) >= BUNDLE_SIZE
+
+	if len(allOperations) > BUNDLE_SIZE {
+		// Trim to exactly BUNDLE_SIZE
+		log.Verbose("  Trimming from %d to %d operations", len(allOperations), BUNDLE_SIZE)
+		allOperations = allOperations[:BUNDLE_SIZE]
+	}
+
+	log.Info("  Collected %d unique operations after %d fetches (complete=%v, target=%d)",
+		len(allOperations), fetchCount, isComplete, BUNDLE_SIZE)
 
 	// Only save as bundle if complete
 	if isComplete {
@@ -534,8 +550,8 @@ func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations
 		return 0, fmt.Errorf("bundle manager disabled")
 	}
 
-	if len(operations) != 1000 {
-		return 0, fmt.Errorf("bundle must have exactly 1000 operations, got %d", len(operations))
+	if len(operations) != BUNDLE_SIZE {
+		return 0, fmt.Errorf("bundle must have exactly %d operations, got %d", BUNDLE_SIZE, len(operations))
 	}
 
 	lastBundle, err := bm.db.GetLastBundleNumber(ctx)

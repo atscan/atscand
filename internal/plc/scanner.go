@@ -185,13 +185,13 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 
 		log.Verbose("Mempool contains %d operations", count)
 
-		if count < 1000 {
-			log.Info("Mempool has < 1000 operations, waiting for more data")
+		if count < BUNDLE_SIZE { // Changed from 1000
+			log.Info("Mempool has < %d operations, waiting for more data", BUNDLE_SIZE)
 			break
 		}
 
-		// Get first 1000 operations ordered by timestamp
-		mempoolOps, err := s.db.GetMempoolOperations(ctx, 1000)
+		// Get first BUNDLE_SIZE operations ordered by timestamp
+		mempoolOps, err := s.db.GetMempoolOperations(ctx, BUNDLE_SIZE) // Changed from 1000
 		if err != nil {
 			return err
 		}
