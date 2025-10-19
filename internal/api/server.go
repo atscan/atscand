@@ -8,6 +8,7 @@ import (
 
 	"github.com/atscan/atscanner/internal/config"
 	"github.com/atscan/atscanner/internal/log"
+	"github.com/atscan/atscanner/internal/plc"
 	"github.com/atscan/atscanner/internal/storage"
 	"github.com/gorilla/mux"
 )
@@ -16,18 +17,20 @@ type Server struct {
 	router *mux.Router
 	server *http.Server
 	db     storage.Database
+	plcClient *plc.Client
 }
 
-func NewServer(db storage.Database, cfg config.APIConfig) *Server {
+func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCConfig) *Server {
 	s := &Server{
 		router: mux.NewRouter(),
 		db:     db,
+		plcClient: plc.NewClient(plcCfg.DirectoryURL),
 	}
 
 	s.setupRoutes()
 
 	s.server = &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Addr:         fmt.Sprintf("%s:%d", apiCfg.Host, apiCfg.Port),
 		Handler:      s.router,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -51,6 +54,7 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/plc-bundles", s.handleGetPLCBundles).Methods("GET")
 	api.HandleFunc("/plc-bundles/stats", s.handleGetPLCBundleStats).Methods("GET")
 	api.HandleFunc("/plc-bundles/{number}/dids", s.handleGetPLCBundleDIDs).Methods("GET")
+	api.HandleFunc("/plc-bundles/{bundleNumber}/verify", s.handleVerifyPLCBundle).Methods("POST")
 	api.HandleFunc("/plc-bundles/{number}", s.handleGetPLCBundle).Methods("GET")
 
 	// PLC/DID endpoints

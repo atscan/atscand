@@ -74,7 +74,7 @@ func main() {
 	})
 
 	// Start API server
-	apiServer := api.NewServer(db, cfg.API)
+	apiServer := api.NewServer(db, cfg.API, cfg.PLC)
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			log.Fatal("API server error: %v", err)

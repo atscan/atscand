@@ -3,6 +3,8 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -375,6 +377,89 @@ func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+	bundleNumberStr := vars["bundleNumber"]
+
+	bundleNumber, err := strconv.Atoi(bundleNumberStr)
+	if err != nil {
+		http.Error(w, "Invalid bundle number", http.StatusBadRequest)
+		return
+	}
+
+	// 1. Get bundle from DB
+	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
+	if err != nil {
+		http.Error(w, "Bundle not found", http.StatusNotFound)
+		return
+	}
+
+	// 2. Get previous bundle for 'after' timestamp
+	prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNumber-1)
+	if err != nil && bundleNumber > 1 {
+		http.Error(w, "Failed to get previous bundle", http.StatusInternalServerError)
+		return
+	}
+
+	var after string
+	if prevBundle != nil {
+		after = prevBundle.EndTime.Format("2006-01-02T15:04:05.000Z")
+	}
+
+	// 3. Fetch from PLC directory
+	remoteOps, err := s.plcClient.Export(ctx, plc.ExportOptions{
+		Count: 1000, // Bundles always have 1000 operations
+		After: after,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to fetch from PLC directory: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// 4. Compute remote hash
+	remoteHash, err := computeRemoteOperationsHash(remoteOps)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to compute remote hash: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// 5. Compare hashes
+	verified := bundle.Hash == remoteHash
+
+	// 6. Return response
+	respondJSON(w, map[string]interface{}{
+		"bundle_number": bundleNumber,
+		"verified":      verified,
+		"local_hash":    bundle.Hash,
+		"remote_hash":   remoteHash,
+	})
+}
+
+func computeRemoteOperationsHash(ops []plc.PLCOperation) (string, error) {
+	// Convert to JSONL format
+	var jsonlData []byte
+	for _, op := range ops {
+		lineJSON, err := json.Marshal(op)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal operation: %w", err)
+		}
+		jsonlData = append(jsonlData, lineJSON...)
+		jsonlData = append(jsonlData, '\n')
+	}
+
+	// Compress
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
+	if err != nil {
+		return "", err
+	}
+	compressed := encoder.EncodeAll(jsonlData, nil)
+
+	// Calculate hash of compressed data
+	hash := sha256.Sum256(compressed)
+	return hex.EncodeToString(hash[:]), nil
 }
 
 func respondJSON(w http.ResponseWriter, data interface{}) {
