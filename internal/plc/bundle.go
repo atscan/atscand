@@ -187,8 +187,8 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 		log.Error("Warning: failed to index bundle: %v", err)
 	}
 
-	log.Info("✓ Fetched and saved bundle %06d (%d operations, hash: %s)",
-		bundleNumber, len(operations), hash[:16]+"...")
+	log.Info("✓ Bundle %06d processed [%s]",
+		bundleNumber, hash)
 
 	return operations, nil
 }
