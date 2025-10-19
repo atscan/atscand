@@ -127,10 +127,14 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 
 				// Calculate uncompressed hash
 				var jsonlData []byte
-				for _, op := range operations {
+				for i, op := range operations {
 					lineJSON, _ := json.Marshal(op)
 					jsonlData = append(jsonlData, lineJSON...)
-					jsonlData = append(jsonlData, '\n')
+
+					// Add newline ONLY if not the last operation
+					if i < len(operations)-1 {
+						jsonlData = append(jsonlData, '\n')
+					}
 				}
 				uncompressedHash := bm.calculateHash(jsonlData)
 
@@ -181,15 +185,19 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 
 // saveBundleFileWithHash saves operations and returns both hashes
 func (bm *BundleManager) saveBundleFileWithHash(path string, operations []PLCOperation) (string, string, error) {
-	// Convert to JSONL format
+	// Convert to JSONL format (matching PLC directory format)
 	var jsonlData []byte
-	for _, op := range operations {
+	for i, op := range operations {
 		lineJSON, err := json.Marshal(op)
 		if err != nil {
 			return "", "", fmt.Errorf("failed to marshal operation: %w", err)
 		}
 		jsonlData = append(jsonlData, lineJSON...)
-		jsonlData = append(jsonlData, '\n')
+
+		// Add newline ONLY if not the last operation
+		if i < len(operations)-1 {
+			jsonlData = append(jsonlData, '\n')
+		}
 	}
 
 	// Calculate hash of uncompressed JSONL (primary hash)
@@ -328,14 +336,17 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNumber int, oper
 
 	// Calculate uncompressed hash from operations
 	var jsonlData []byte
-	for _, op := range operations {
+	for i, op := range operations {
 		lineJSON, _ := json.Marshal(op)
 		jsonlData = append(jsonlData, lineJSON...)
-		jsonlData = append(jsonlData, '\n')
+
+		// Add newline ONLY if not the last operation
+		if i < len(operations)-1 {
+			jsonlData = append(jsonlData, '\n')
+		}
 	}
 	uncompressedHash := bm.calculateHash(jsonlData)
 
-	// Call with both hashes
 	return bm.indexBundleWithHash(ctx, bundleNumber, operations, path, uncompressedHash, compressedHash)
 }
 
