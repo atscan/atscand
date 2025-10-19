@@ -147,7 +147,42 @@ func (s *SQLiteDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*PL
 	return &bundle, nil
 }
 
-// Update GetBundles, GetBundlesForDID similarly
+// GetBundleForTimestamp finds the bundle that should contain operations at or after the given time
+func (s *SQLiteDB) GetBundleForTimestamp(ctx context.Context, afterTime time.Time) (int, error) {
+	query := `
+		SELECT bundle_number 
+		FROM plc_bundles 
+		WHERE start_time <= ? AND end_time >= ?
+		ORDER BY bundle_number ASC 
+		LIMIT 1
+	`
+
+	var bundleNum int
+	err := s.db.QueryRowContext(ctx, query, afterTime, afterTime).Scan(&bundleNum)
+	if err == sql.ErrNoRows {
+		// No exact match, find the closest bundle before this time
+		query = `
+			SELECT bundle_number 
+			FROM plc_bundles 
+			WHERE end_time < ?
+			ORDER BY bundle_number DESC 
+			LIMIT 1
+		`
+		err = s.db.QueryRowContext(ctx, query, afterTime).Scan(&bundleNum)
+		if err == sql.ErrNoRows {
+			return 1, nil // Start from first bundle
+		}
+		if err != nil {
+			return 0, err
+		}
+		return bundleNum, nil // Return the bundle just before
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	return bundleNum, nil
+}
 
 // GetLastBundleNumber gets the highest bundle number
 func (s *SQLiteDB) GetLastBundleNumber(ctx context.Context) (int, error) {

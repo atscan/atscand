@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"time"
 )
 
 type Database interface {
@@ -30,6 +31,7 @@ type Database interface {
 	GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error)
 	GetBundleStats(ctx context.Context) (int64, int64, error)
 	GetLastBundleNumber(ctx context.Context) (int, error)
+	GetBundleForTimestamp(ctx context.Context, afterTime time.Time) (int, error)
 
 	// Mempool operations
 	AddToMempool(ctx context.Context, ops []MempoolOperation) error

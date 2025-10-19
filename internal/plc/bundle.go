@@ -302,8 +302,8 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 			if err := bm.indexBundleWithHash(ctx, bundleNumber, allOperations, path, uncompressedHash, compressedHash); err != nil {
 				log.Error("Warning: failed to index bundle: %v", err)
 			} else {
-				log.Info("✓ Bundle %06d saved [1000 ops, hash: %s, compressed: %s]",
-					bundleNumber, uncompressedHash[:16]+"...", compressedHash[:16]+"...")
+				log.Info("✓ Bundle %06d saved [%d ops, hash: %s, compressed: %s]",
+					bundleNumber, len(allOperations), uncompressedHash[:16]+"...", compressedHash[:16]+"...")
 			}
 		}
 	}
@@ -322,13 +322,9 @@ func (bm *BundleManager) fetchBundleFromPLCWithCount(ctx context.Context, client
 // saveBundleFileWithHash - NO trailing newline
 func (bm *BundleManager) saveBundleFileWithHash(path string, operations []PLCOperation) (string, string, error) {
 	var jsonlData []byte
-	for i, op := range operations {
+	for _, op := range operations {
 		jsonlData = append(jsonlData, op.RawJSON...)
-
-		// Add newline ONLY between operations (not after last)
-		if i < len(operations)-1 {
-			jsonlData = append(jsonlData, '\n')
-		}
+		jsonlData = append(jsonlData, '\n')
 	}
 
 	uncompressedHash := bm.calculateHash(jsonlData)

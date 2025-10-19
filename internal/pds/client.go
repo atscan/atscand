@@ -86,7 +86,7 @@ func (c *Client) ListRepos(ctx context.Context, endpoint string) ([]string, erro
 func (c *Client) DescribeServer(ctx context.Context, endpoint string) (*ServerDescription, error) {
 	url := fmt.Sprintf("%s/xrpc/com.atproto.server.describeServer", endpoint)
 
-	fmt.Println(url)
+	//fmt.Println(url)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {

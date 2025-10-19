@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/plc"
@@ -215,7 +216,7 @@ func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 		"plc_bundle_number": bundle.BundleNumber,
 		"start_time":        bundle.StartTime,
 		"end_time":          bundle.EndTime,
-		"operation_count":   1000,
+		"operation_count":   plc.BUNDLE_SIZE,
 		"did_count":         len(bundle.DIDs),
 		"hash":              bundle.Hash,           // Uncompressed (verifiable)
 		"compressed_hash":   bundle.CompressedHash, // File integrity
@@ -301,6 +302,10 @@ func (s *Server) loadBundleOperations(path string) ([]plc.PLCOperation, error) {
 		if err := json.Unmarshal(line, &op); err != nil {
 			return nil, fmt.Errorf("failed to parse operation on line %d: %w", lineNum, err)
 		}
+
+		// CRITICAL: Store the original raw JSON bytes
+		op.RawJSON = make([]byte, len(line))
+		copy(op.RawJSON, line)
 
 		operations = append(operations, op)
 	}
@@ -425,23 +430,63 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fetch from PLC directory
-	remoteOps, err := s.plcClient.Export(ctx, plc.ExportOptions{
-		Count: 1000,
-		After: after,
-	})
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to fetch from PLC directory: %v", err), http.StatusInternalServerError)
-		return
+	// Collect remote operations (may need multiple fetches for large bundles)
+	var allRemoteOps []plc.PLCOperation
+	seenCIDs := make(map[string]bool)
+
+	// Track boundary CIDs
+	for cid := range prevBoundaryCIDs {
+		seenCIDs[cid] = true
 	}
 
-	// Apply same deduplication logic as when creating bundles
-	if after != "" && len(prevBoundaryCIDs) > 0 {
-		remoteOps = plc.StripBoundaryDuplicates(remoteOps, after, prevBoundaryCIDs)
+	currentAfter := after
+	maxFetches := 20 // Enough for up to 20k operations
+
+	for fetchNum := 0; fetchNum < maxFetches && len(allRemoteOps) < plc.BUNDLE_SIZE; fetchNum++ {
+		// Fetch from PLC directory
+		batch, err := s.plcClient.Export(ctx, plc.ExportOptions{
+			Count: 1000,
+			After: currentAfter,
+		})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to fetch from PLC directory: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		if len(batch) == 0 {
+			break
+		}
+
+		// Deduplicate and add unique operations
+		for _, op := range batch {
+			if !seenCIDs[op.CID] {
+				seenCIDs[op.CID] = true
+				allRemoteOps = append(allRemoteOps, op)
+				if len(allRemoteOps) >= plc.BUNDLE_SIZE {
+					break
+				}
+			}
+		}
+
+		// Update cursor for next fetch
+		if len(batch) > 0 {
+			lastOp := batch[len(batch)-1]
+			currentAfter = lastOp.CreatedAt.Format("2006-01-02T15:04:05.000Z")
+		}
+
+		// If we got less than 1000, we've reached the end
+		if len(batch) < 1000 {
+			break
+		}
+	}
+
+	// Trim to exact bundle size
+	if len(allRemoteOps) > plc.BUNDLE_SIZE {
+		allRemoteOps = allRemoteOps[:plc.BUNDLE_SIZE]
 	}
 
 	// Compute remote hash (uncompressed JSONL)
-	remoteHash, err := computeRemoteOperationsHash(remoteOps)
+	remoteHash, err := computeRemoteOperationsHash(allRemoteOps)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to compute remote hash: %v", err), http.StatusInternalServerError)
 		return
@@ -456,7 +501,7 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		"local_hash":         bundle.Hash,
 		"remote_hash":        remoteHash,
 		"local_op_count":     bundle.OperationCount,
-		"remote_op_count":    len(remoteOps),
+		"remote_op_count":    len(allRemoteOps),
 		"boundary_cids_used": len(prevBoundaryCIDs),
 	})
 }
@@ -557,6 +602,132 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 		"first_prev_hash":  firstBundle.PrevBundleHash, // Should be empty
 		"last_prev_hash":   lastBundleData.PrevBundleHash,
 	})
+}
+
+// handlePLCExport simulates PLC directory /export endpoint using cached bundles
+func (s *Server) handlePLCExport(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Parse query parameters
+	countStr := r.URL.Query().Get("count")
+	afterStr := r.URL.Query().Get("after")
+
+	count := 1000 // Default
+	if countStr != "" {
+		if c, err := strconv.Atoi(countStr); err == nil && c > 0 {
+			count = c
+			if count > 10000 {
+				count = 10000 // Max limit
+			}
+		}
+	}
+
+	var afterTime time.Time
+	if afterStr != "" {
+		// Try multiple timestamp formats (from most specific to least)
+		formats := []string{
+			time.RFC3339Nano,           // 2023-11-09T03:55:00.123456789Z
+			time.RFC3339,               // 2023-11-09T03:55:00Z
+			"2006-01-02T15:04:05.000Z", // 2023-11-09T03:55:00.000Z
+			"2006-01-02T15:04:05",      // 2023-11-09T03:55:00
+			"2006-01-02T15:04",         // 2023-11-09T03:55
+			"2006-01-02",               // 2023-11-09
+		}
+
+		var parsed time.Time
+		var parseErr error
+		parsed = time.Time{} // zero value
+
+		for _, format := range formats {
+			parsed, parseErr = time.Parse(format, afterStr)
+			if parseErr == nil {
+				afterTime = parsed
+				break
+			}
+		}
+
+		if parseErr != nil {
+			http.Error(w, fmt.Sprintf("Invalid after parameter: %v", parseErr), http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Find starting bundle (FAST - single query)
+	startBundle := 1
+	if !afterTime.IsZero() {
+		foundBundle, err := s.db.GetBundleForTimestamp(ctx, afterTime)
+		if err != nil {
+			log.Error("Failed to find bundle for timestamp: %v", err)
+			// Fallback to bundle 1
+		} else {
+			startBundle = foundBundle
+			// Go back one bundle to catch boundary timestamps
+			if startBundle > 1 {
+				startBundle--
+			}
+		}
+	}
+
+	// Collect operations from bundles
+	var allOps []plc.PLCOperation
+	seenCIDs := make(map[string]bool)
+
+	// Load bundles sequentially until we have enough operations
+	lastBundle, _ := s.db.GetLastBundleNumber(ctx)
+
+	for bundleNum := startBundle; bundleNum <= lastBundle && len(allOps) < count; bundleNum++ {
+		bundlePath := filepath.Join(s.plcCacheDir, fmt.Sprintf("%06d.jsonl.zst", bundleNum))
+
+		ops, err := s.loadBundleOperations(bundlePath)
+		if err != nil {
+			log.Error("Warning: failed to load bundle %d: %v", bundleNum, err)
+			continue
+		}
+
+		// Filter operations
+		for _, op := range ops {
+			// Skip if STRICTLY BEFORE "after" timestamp
+			// Include operations AT or AFTER the timestamp
+			if !afterTime.IsZero() && op.CreatedAt.Before(afterTime) {
+				continue
+			}
+
+			// Skip duplicates (by CID)
+			if seenCIDs[op.CID] {
+				continue
+			}
+
+			seenCIDs[op.CID] = true
+			allOps = append(allOps, op)
+
+			if len(allOps) >= count {
+				break
+			}
+		}
+	}
+
+	// Set headers for JSONL response
+	w.Header().Set("Content-Type", "application/jsonl")
+	w.Header().Set("X-Operation-Count", strconv.Itoa(len(allOps)))
+
+	// Write JSONL response (newline-delimited JSON with trailing newline)
+	for _, op := range allOps {
+		// Use raw JSON if available
+		if len(op.RawJSON) > 0 {
+			w.Write(op.RawJSON)
+		} else {
+			// Fallback: marshal the operation
+			jsonData, err := json.Marshal(op)
+			if err != nil {
+				log.Error("Failed to marshal operation: %v", err)
+				continue
+			}
+			w.Write(jsonData)
+		}
+
+		// Always add newline after each operation (including the last)
+		w.Write([]byte("\n"))
+	}
 }
 
 // computeRemoteOperationsHash - matching format
