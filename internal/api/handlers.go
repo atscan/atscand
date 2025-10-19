@@ -541,19 +541,22 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// computeRemoteOperationsHash - matching format
 func computeRemoteOperationsHash(ops []plc.PLCOperation) (string, error) {
-	// Convert to JSONL format (uncompressed)
 	var jsonlData []byte
-	for _, op := range ops {
-		lineJSON, err := json.Marshal(op)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal operation: %w", err)
+	for i, op := range ops {
+		if len(op.RawJSON) > 0 {
+			jsonlData = append(jsonlData, op.RawJSON...)
+		} else {
+			return "", fmt.Errorf("operation %d missing raw JSON data", i)
 		}
-		jsonlData = append(jsonlData, lineJSON...)
-		jsonlData = append(jsonlData, '\n')
+
+		// Add newline ONLY between operations
+		if i < len(ops)-1 {
+			jsonlData = append(jsonlData, '\n')
+		}
 	}
 
-	// Calculate hash of uncompressed JSONL
 	hash := sha256.Sum256(jsonlData)
 	return hex.EncodeToString(hash[:]), nil
 }

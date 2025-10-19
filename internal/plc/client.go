@@ -162,8 +162,8 @@ func (c *Client) doExport(ctx context.Context, opts ExportOptions) ([]PLCOperati
 		}
 
 		// CRITICAL: Store the original raw JSON bytes
-		op.rawJSON = make([]byte, len(line))
-		copy(op.rawJSON, line)
+		op.RawJSON = make([]byte, len(line))
+		copy(op.RawJSON, line)
 
 		operations = append(operations, op)
 	}

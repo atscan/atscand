@@ -9,8 +9,7 @@ type PLCOperation struct {
 	Nullified interface{}            `json:"nullified,omitempty"`
 	CreatedAt time.Time              `json:"createdAt"`
 
-	// NEW: Store original raw JSON line
-	rawJSON []byte `json:"-"` // Don't serialize this field
+	RawJSON []byte `json:"-"` // ✅ Exported (capital R)
 }
 
 // Helper method to check if nullified
