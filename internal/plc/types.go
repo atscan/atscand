@@ -8,6 +8,9 @@ type PLCOperation struct {
 	CID       string                 `json:"cid"`
 	Nullified interface{}            `json:"nullified,omitempty"`
 	CreatedAt time.Time              `json:"createdAt"`
+
+	// NEW: Store original raw JSON line
+	rawJSON []byte `json:"-"` // Don't serialize this field
 }
 
 // Helper method to check if nullified
@@ -58,7 +61,7 @@ type Service struct {
 // DIDHistoryEntry represents a single operation in DID history
 type DIDHistoryEntry struct {
 	Operation PLCOperation `json:"operation"`
-	PLCBundle    string       `json:"plc_bundle,omitempty"`
+	PLCBundle string       `json:"plc_bundle,omitempty"`
 }
 
 // DIDHistory represents the full history of a DID

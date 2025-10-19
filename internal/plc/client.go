@@ -160,6 +160,11 @@ func (c *Client) doExport(ctx context.Context, opts ExportOptions) ([]PLCOperati
 			log.Error("Warning: failed to parse operation on line %d: %v", lineCount, err)
 			continue
 		}
+
+		// CRITICAL: Store the original raw JSON bytes
+		op.rawJSON = make([]byte, len(line))
+		copy(op.rawJSON, line)
+
 		operations = append(operations, op)
 	}
 
@@ -168,6 +173,7 @@ func (c *Client) doExport(ctx context.Context, opts ExportOptions) ([]PLCOperati
 	}
 
 	return operations, 0, nil
+
 }
 
 // parseRetryAfter parses the Retry-After header

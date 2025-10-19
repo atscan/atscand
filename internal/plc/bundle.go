@@ -185,17 +185,20 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 
 // saveBundleFileWithHash saves operations and returns both hashes
 func (bm *BundleManager) saveBundleFileWithHash(path string, operations []PLCOperation) (string, string, error) {
-	// Convert to JSONL format (matching PLC directory format)
+	// Convert to JSONL format using ORIGINAL raw JSON
 	var jsonlData []byte
-	for i, op := range operations {
-		lineJSON, err := json.Marshal(op)
-		if err != nil {
-			return "", "", fmt.Errorf("failed to marshal operation: %w", err)
-		}
-		jsonlData = append(jsonlData, lineJSON...)
-
-		// Add newline ONLY if not the last operation
-		if i < len(operations)-1 {
+	for _, op := range operations {
+		if len(op.rawJSON) > 0 {
+			// Use preserved raw JSON from PLC directory
+			jsonlData = append(jsonlData, op.rawJSON...)
+			jsonlData = append(jsonlData, '\n')
+		} else {
+			// Fallback for operations without raw JSON (shouldn't happen for new data)
+			lineJSON, err := json.Marshal(op)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to marshal operation: %w", err)
+			}
+			jsonlData = append(jsonlData, lineJSON...)
 			jsonlData = append(jsonlData, '\n')
 		}
 	}
