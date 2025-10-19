@@ -175,7 +175,7 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 			if op.DID == did {
 				entry := plc.DIDHistoryEntry{
 					Operation: op,
-					PLCBundle:    filepath.Base(bundle.FilePath),
+					PLCBundle: filepath.Base(bundle.FilePath),
 				}
 				allOperations = append(allOperations, entry)
 				currentOp = &op
@@ -209,14 +209,14 @@ func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"plc_bundle_number":   bundle.BundleNumber,
-		"start_time":      bundle.StartTime,
-		"end_time":        bundle.EndTime,
-		"operation_count": 1000, // Always 1000
-		"did_count":       len(bundle.DIDs),
-		"file_size":       bundle.FileSize,
-		"hash":            bundle.Hash,
-		"created_at":      bundle.CreatedAt,
+		"plc_bundle_number": bundle.BundleNumber,
+		"start_time":        bundle.StartTime,
+		"end_time":          bundle.EndTime,
+		"operation_count":   1000, // Always 1000
+		"did_count":         len(bundle.DIDs),
+		"file_size":         bundle.FileSize,
+		"hash":              bundle.Hash,
+		"created_at":        bundle.CreatedAt,
 	}
 
 	respondJSON(w, response)
@@ -240,8 +240,8 @@ func (s *Server) handleGetPLCBundleDIDs(w http.ResponseWriter, r *http.Request) 
 
 	respondJSON(w, map[string]interface{}{
 		"plc_bundle_number": bundle.BundleNumber,
-		"did_count":     len(bundle.DIDs),
-		"dids":          bundle.DIDs,
+		"did_count":         len(bundle.DIDs),
+		"dids":              bundle.DIDs,
 	})
 }
 
@@ -346,13 +346,13 @@ func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 	response := make([]map[string]interface{}, len(bundles))
 	for i, bundle := range bundles {
 		response[i] = map[string]interface{}{
-			"plc_bundle_number":   bundle.BundleNumber,
-			"start_time":      bundle.StartTime,
-			"end_time":        bundle.EndTime,
-			"operation_count": 1000, // Always 1000
-			"did_count":       len(bundle.DIDs),
-			"file_size":       bundle.FileSize,
-			"hash":            bundle.Hash[:16] + "...", // Shortened hash
+			"plc_bundle_number": bundle.BundleNumber,
+			"start_time":        bundle.StartTime,
+			"end_time":          bundle.EndTime,
+			"operation_count":   1000, // Always 1000
+			"did_count":         len(bundle.DIDs),
+			"file_size":         bundle.FileSize,
+			"hash":              bundle.Hash, // Shortened hash
 		}
 	}
 
@@ -369,9 +369,9 @@ func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondJSON(w, map[string]interface{}{
-		"plc_bundle_count":  count,
-		"total_size":    size,
-		"total_size_mb": float64(size) / 1024 / 1024,
+		"plc_bundle_count": count,
+		"total_size":       size,
+		"total_size_mb":    float64(size) / 1024 / 1024,
 	})
 }
 
