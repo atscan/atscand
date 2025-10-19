@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/atscan/atscanner/internal/log"
 )
 
 type Client struct {
@@ -68,7 +69,7 @@ func (c *Client) exportWithRetry(ctx context.Context, opts ExportOptions, maxRet
 
 		// Check if it's a rate limit error (429)
 		if retryAfter > 0 {
-			log.Printf("⚠ Rate limited by PLC directory, waiting %v before retry %d/%d",
+			log.Info("⚠ Rate limited by PLC directory, waiting %v before retry %d/%d",
 				retryAfter, attempt, maxRetries)
 
 			select {
@@ -81,7 +82,7 @@ func (c *Client) exportWithRetry(ctx context.Context, opts ExportOptions, maxRet
 
 		// Other errors - exponential backoff
 		if attempt < maxRetries {
-			log.Printf("Request failed (attempt %d/%d): %v, retrying in %v",
+			log.Verbose("Request failed (attempt %d/%d): %v, retrying in %v",
 				attempt, maxRetries, err, backoff)
 
 			select {
@@ -127,7 +128,7 @@ func (c *Client) doExport(ctx context.Context, opts ExportOptions) ([]PLCOperati
 
 		// Also check x-ratelimit headers for info
 		if limit := resp.Header.Get("x-ratelimit-limit"); limit != "" {
-			log.Printf("Rate limit: %s", limit)
+			log.Verbose("Rate limit: %s", limit)
 		}
 
 		return nil, retryAfter, fmt.Errorf("rate limited (429)")
@@ -156,7 +157,7 @@ func (c *Client) doExport(ctx context.Context, opts ExportOptions) ([]PLCOperati
 
 		var op PLCOperation
 		if err := json.Unmarshal(line, &op); err != nil {
-			log.Printf("Warning: failed to parse operation on line %d: %v", lineCount, err)
+			log.Error("Warning: failed to parse operation on line %d: %v", lineCount, err)
 			continue
 		}
 		operations = append(operations, op)

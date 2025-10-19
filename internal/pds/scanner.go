@@ -2,11 +2,12 @@ package pds
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
 
+	"github.com/acarl005/stripansi"
 	"github.com/atscan/atscanner/internal/config"
+	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/storage"
 )
 
@@ -26,14 +27,14 @@ func NewScanner(db storage.Database, cfg config.PDSConfig) *Scanner {
 
 func (s *Scanner) ScanAll(ctx context.Context) error {
 	startTime := time.Now()
-	log.Println("Starting PDS availability scan...")
+	log.Info("Starting PDS availability scan...")
 
 	servers, err := s.db.GetPDSServers(ctx, nil)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Scanning %d PDS servers...", len(servers))
+	log.Info("Scanning %d PDS servers...", len(servers))
 
 	// Worker pool
 	jobs := make(chan *storage.PDS, len(servers))
@@ -86,7 +87,7 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 			ResponseTime: status.ResponseTime.Seconds() * 1000, // Convert to ms
 			ScanData:     scanData,
 		}); err != nil {
-			log.Printf("Error updating PDS ID %d: %v", status.PDSID, err)
+			log.Error("Error updating PDS ID %d: %v", status.PDSID, err)
 		}
 
 		if status.Available {
@@ -97,7 +98,7 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 		}
 	}
 
-	log.Printf("PDS scan completed: %d available, %d unavailable, %d total users in %v",
+	log.Info("PDS scan completed: %d available, %d unavailable, %d total users in %v",
 		successCount, failureCount, totalUsers, time.Since(startTime))
 
 	return nil
@@ -140,7 +141,7 @@ func (s *Scanner) scanPDS(ctx context.Context, pdsID int64, endpoint string) *PD
 	// Describe server
 	desc, err := s.client.DescribeServer(ctx, endpoint)
 	if err != nil {
-		log.Printf("Warning: failed to describe server %s: %v", endpoint, err)
+		log.Verbose("Warning: failed to describe server %s: %v", stripansi.Strip(endpoint), err)
 	} else {
 		status.Description = desc
 	}
@@ -148,11 +149,11 @@ func (s *Scanner) scanPDS(ctx context.Context, pdsID int64, endpoint string) *PD
 	// List repos (DIDs)
 	/*dids, err := s.client.ListRepos(ctx, endpoint)
 	if err != nil {
-		log.Printf("Warning: failed to list repos for %s: %v", endpoint, err)
+		log.Verbose("Warning: failed to list repos for %s: %v", endpoint, err)
 		status.DIDs = []string{}
 	} else {
 		status.DIDs = dids
-		log.Printf("  → Found %d users on %s", len(dids), endpoint)
+		log.Verbose("  → Found %d users on %s", len(dids), endpoint)
 	}*/
 
 	return status

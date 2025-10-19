@@ -8,11 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/storage"
 	"github.com/klauspost/compress/zstd"
 )
@@ -89,7 +89,7 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 
 	// Try to load from local file first
 	if bm.BundleExists(bundleNumber) {
-		log.Printf("→ Loading bundle %06d from local file", bundleNumber)
+		log.Verbose("→ Loading bundle %06d from local file", bundleNumber)
 
 		// Check if bundle exists in database
 		dbBundle, dbErr := bm.db.GetBundleByNumber(ctx, bundleNumber)
@@ -100,18 +100,18 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 			if dbBundle.Hash != "" {
 				valid, err := bm.verifyBundleHash(path, dbBundle.Hash)
 				if err != nil {
-					log.Printf("Warning: failed to verify hash for bundle %06d: %v", bundleNumber, err)
+					log.Error("Warning: failed to verify hash for bundle %06d: %v", bundleNumber, err)
 				} else if !valid {
-					log.Printf("⚠ Hash mismatch for bundle %06d! File may be corrupted, re-fetching...", bundleNumber)
+					log.Error("⚠ Hash mismatch for bundle %06d! File may be corrupted, re-fetching...", bundleNumber)
 					os.Remove(path)
 					return bm.LoadBundle(ctx, bundleNumber, plcClient)
 				} else {
-					log.Printf("✓ Hash verified for bundle %06d", bundleNumber)
+					log.Verbose("✓ Hash verified for bundle %06d", bundleNumber)
 				}
 			}
 		} else {
 			// Bundle file exists but not in database - need to index it
-			log.Printf("→ Bundle %06d exists on disk but not in database, indexing...", bundleNumber)
+			log.Info("→ Bundle %06d exists on disk but not in database, indexing...", bundleNumber)
 		}
 
 		// Load operations from file
@@ -125,14 +125,14 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 			// Calculate hash from existing file
 			fileData, err := os.ReadFile(path)
 			if err != nil {
-				log.Printf("Warning: failed to read file for hash calculation: %v", err)
+				log.Error("Warning: failed to read file for hash calculation: %v", err)
 			} else {
 				hash := bm.calculateHash(fileData)
 
 				if err := bm.indexBundleWithHash(ctx, bundleNumber, operations, path, hash); err != nil {
-					log.Printf("Warning: failed to index bundle: %v", err)
+					log.Error("Warning: failed to index bundle: %v", err)
 				} else {
-					log.Printf("✓ Indexed bundle %06d (hash: %s)", bundleNumber, hash[:16]+"...")
+					log.Info("✓ Indexed bundle %06d (hash: %s)", bundleNumber, hash[:16]+"...")
 				}
 			}
 		}
@@ -141,7 +141,7 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 	}
 
 	// Bundle doesn't exist locally - fetch from PLC directory
-	log.Printf("→ Bundle %06d not found locally, fetching from PLC directory...", bundleNumber)
+	log.Info("→ Bundle %06d not found locally, fetching from PLC directory...", bundleNumber)
 
 	// Get the cursor timestamp from previous bundle
 	var afterTimestamp string
@@ -150,14 +150,14 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 		prevBundle, err := bm.db.GetBundleByNumber(ctx, bundleNumber-1)
 		if err == nil && prevBundle != nil {
 			afterTimestamp = prevBundle.EndTime.Format(time.RFC3339Nano)
-			log.Printf("  Using cursor from bundle %06d: %s", bundleNumber-1, afterTimestamp)
+			log.Verbose("  Using cursor from bundle %06d: %s", bundleNumber-1, afterTimestamp)
 		} else {
 			// Try loading previous bundle from file
 			if bm.BundleExists(bundleNumber - 1) {
 				prevOps, err := bm.loadBundleFromFile(bm.GetBundlePath(bundleNumber - 1))
 				if err == nil && len(prevOps) > 0 {
 					afterTimestamp = prevOps[len(prevOps)-1].CreatedAt.Format(time.RFC3339Nano)
-					log.Printf("  Using cursor from previous bundle file: %s", afterTimestamp)
+					log.Verbose("  Using cursor from previous bundle file: %s", afterTimestamp)
 				}
 			}
 		}
@@ -179,15 +179,15 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 	// Save bundle locally with hash
 	hash, err := bm.saveBundleFileWithHash(path, operations)
 	if err != nil {
-		log.Printf("Warning: failed to save bundle file: %v", err)
+		log.Error("Warning: failed to save bundle file: %v", err)
 	}
 
 	// Index in database with hash
 	if err := bm.indexBundleWithHash(ctx, bundleNumber, operations, path, hash); err != nil {
-		log.Printf("Warning: failed to index bundle: %v", err)
+		log.Error("Warning: failed to index bundle: %v", err)
 	}
 
-	log.Printf("✓ Fetched and saved bundle %06d (%d operations, hash: %s)",
+	log.Info("✓ Fetched and saved bundle %06d (%d operations, hash: %s)",
 		bundleNumber, len(operations), hash[:16]+"...")
 
 	return operations, nil
@@ -361,7 +361,7 @@ func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations
 		return 0, err
 	}
 
-	log.Printf("✓ Created bundle %06d from mempool (%d operations, hash: %s)",
+	log.Info("✓ Created bundle %06d from mempool (%d operations, hash: %s)",
 		bundleNumber, len(operations), hash[:16]+"...")
 
 	return bundleNumber, nil

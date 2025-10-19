@@ -3,11 +3,11 @@ package api
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/atscan/atscanner/internal/config"
+	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/storage"
 	"github.com/gorilla/mux"
 )
@@ -47,11 +47,11 @@ func (s *Server) setupRoutes() {
 	// Metrics endpoints
 	api.HandleFunc("/metrics/plc", s.handleGetPLCMetrics).Methods("GET")
 
-	// Bundle endpoints - UPDATED to use bundle number
-	api.HandleFunc("/bundles", s.handleGetBundles).Methods("GET")
-	api.HandleFunc("/bundles/stats", s.handleGetBundleStats).Methods("GET")
-	api.HandleFunc("/bundles/{number}/dids", s.handleGetBundleDIDs).Methods("GET") // Changed
-	api.HandleFunc("/bundles/{number}", s.handleGetBundle).Methods("GET")          // NEW
+	// PLC Bundle endpoints
+	api.HandleFunc("/plc-bundles", s.handleGetPLCBundles).Methods("GET")
+	api.HandleFunc("/plc-bundles/stats", s.handleGetPLCBundleStats).Methods("GET")
+	api.HandleFunc("/plc-bundles/{number}/dids", s.handleGetPLCBundleDIDs).Methods("GET")
+	api.HandleFunc("/plc-bundles/{number}", s.handleGetPLCBundle).Methods("GET")
 
 	// PLC/DID endpoints
 	api.HandleFunc("/plc/{did}", s.handleGetDID).Methods("GET")
@@ -64,7 +64,7 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
 }
 func (s *Server) Start() error {
-	log.Printf("API server listening on %s", s.server.Addr)
+	log.Info("API server listening on %s", s.server.Addr)
 	return s.server.ListenAndServe()
 }
 

@@ -5,12 +5,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 
+	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/plc"
 	"github.com/atscan/atscanner/internal/storage"
 	"github.com/gorilla/mux"
@@ -165,7 +165,7 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	for _, bundle := range bundles {
 		operations, err := s.loadBundleOperations(bundle.FilePath)
 		if err != nil {
-			log.Printf("Warning: failed to load bundle: %v", err)
+			log.Error("Warning: failed to load bundle: %v", err)
 			continue
 		}
 
@@ -173,7 +173,7 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 			if op.DID == did {
 				entry := plc.DIDHistoryEntry{
 					Operation: op,
-					Bundle:    filepath.Base(bundle.FilePath),
+					PLCBundle:    filepath.Base(bundle.FilePath),
 				}
 				allOperations = append(allOperations, entry)
 				currentOp = &op
@@ -190,7 +190,7 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, history)
 }
 
-func (s *Server) handleGetBundle(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
 
@@ -207,7 +207,7 @@ func (s *Server) handleGetBundle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"bundle_number":   bundle.BundleNumber,
+		"plc_bundle_number":   bundle.BundleNumber,
 		"start_time":      bundle.StartTime,
 		"end_time":        bundle.EndTime,
 		"operation_count": 1000, // Always 1000
@@ -220,7 +220,7 @@ func (s *Server) handleGetBundle(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, response)
 }
 
-func (s *Server) handleGetBundleDIDs(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetPLCBundleDIDs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
 
@@ -237,7 +237,7 @@ func (s *Server) handleGetBundleDIDs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, map[string]interface{}{
-		"bundle_number": bundle.BundleNumber,
+		"plc_bundle_number": bundle.BundleNumber,
 		"did_count":     len(bundle.DIDs),
 		"dids":          bundle.DIDs,
 	})
@@ -324,7 +324,7 @@ func (s *Server) handleGetPLCMetrics(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, metrics)
 }
 
-func (s *Server) handleGetBundles(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	limit := 50
@@ -344,7 +344,7 @@ func (s *Server) handleGetBundles(w http.ResponseWriter, r *http.Request) {
 	response := make([]map[string]interface{}, len(bundles))
 	for i, bundle := range bundles {
 		response[i] = map[string]interface{}{
-			"bundle_number":   bundle.BundleNumber,
+			"plc_bundle_number":   bundle.BundleNumber,
 			"start_time":      bundle.StartTime,
 			"end_time":        bundle.EndTime,
 			"operation_count": 1000, // Always 1000
@@ -357,7 +357,7 @@ func (s *Server) handleGetBundles(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, response)
 }
 
-func (s *Server) handleGetBundleStats(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	count, size, err := s.db.GetBundleStats(ctx)
@@ -367,7 +367,7 @@ func (s *Server) handleGetBundleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, map[string]interface{}{
-		"bundle_count":  count,
+		"plc_bundle_count":  count,
 		"total_size":    size,
 		"total_size_mb": float64(size) / 1024 / 1024,
 	})

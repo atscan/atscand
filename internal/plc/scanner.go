@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
+	"github.com/acarl005/stripansi"
 	"github.com/atscan/atscanner/internal/config"
+	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/storage"
 )
 
@@ -21,7 +22,7 @@ type Scanner struct {
 func NewScanner(db storage.Database, cfg config.PLCConfig) *Scanner {
 	bundleManager, err := NewBundleManager(cfg.CacheDir, cfg.UseCache, db)
 	if err != nil {
-		log.Printf("Warning: failed to initialize bundle manager: %v", err)
+		log.Error("Warning: failed to initialize bundle manager: %v", err)
 		bundleManager = &BundleManager{enabled: false}
 	}
 
@@ -41,8 +42,8 @@ func (s *Scanner) Close() {
 
 func (s *Scanner) Scan(ctx context.Context) error {
 	startTime := time.Now()
-	log.Println("Starting PLC directory scan...")
-	log.Println("⚠ Note: PLC directory has rate limit of 500 requests per 5 minutes")
+	log.Info("Starting PLC directory scan...")
+	log.Info("⚠ Note: PLC directory has rate limit of 500 requests per 5 minutes")
 
 	cursor, err := s.db.GetScanCursor(ctx, "plc_directory")
 	if err != nil {
@@ -56,11 +57,11 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		currentBundle++
 	}
 
-	log.Printf("Starting from bundle %06d", currentBundle) // Changed from %06x
+	log.Info("Starting from bundle %06d", currentBundle) // Changed from %06x
 
 	// Ensure bundle continuity (all previous bundles exist)
 	if currentBundle > 1 {
-		log.Printf("Checking bundle continuity...")
+		log.Info("Checking bundle continuity...")
 		if err := s.bundleManager.EnsureBundleContinuity(ctx, currentBundle); err != nil {
 			return fmt.Errorf("bundle continuity check failed: %w", err)
 		}
@@ -77,16 +78,16 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		default:
 		}
 
-		log.Printf("→ Processing bundle %06d...", currentBundle)
+		log.Verbose("→ Processing bundle %06d...", currentBundle)
 
 		// Load bundle (lazy-loaded from file or PLC)
 		operations, err := s.bundleManager.LoadBundle(ctx, currentBundle, s.client)
 		if err != nil {
-			log.Printf("Failed to load bundle %06x: %v", currentBundle, err)
+			log.Error("Failed to load bundle %06x: %v", currentBundle, err)
 
 			// If rate limited, wait longer before retrying
 			if contains(err.Error(), "rate limited") {
-				log.Println("⚠ Rate limit hit, pausing for 5 minutes...")
+				log.Info("⚠ Rate limit hit, pausing for 5 minutes...")
 				time.Sleep(5 * time.Minute)
 				continue // Retry same bundle
 			}
@@ -94,7 +95,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			// Check if this is just end of data (not an error)
 			if currentBundle > 1 {
 				// Try to fetch with cursor from previous bundle
-				log.Println("→ Checking if we've reached the end of available data...")
+				log.Info("→ Checking if we've reached the end of available data...")
 
 				// Get previous bundle to check timestamp
 				prevBundle, err := s.db.GetBundleByNumber(ctx, currentBundle-1)
@@ -108,14 +109,14 @@ func (s *Scanner) Scan(ctx context.Context) error {
 
 					if err == nil && len(ops) > 0 {
 						// More data available, add to mempool
-						log.Printf("→ Found %d operations, adding to mempool", len(ops))
+						log.Info("→ Found %d operations, adding to mempool", len(ops))
 						if err := s.addToMempool(ctx, ops); err != nil {
-							log.Printf("Error adding to mempool: %v", err)
+							log.Error("Error adding to mempool: %v", err)
 						}
 
 						// Process mempool
 						if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
-							log.Printf("Error processing mempool: %v", err)
+							log.Error("Error processing mempool: %v", err)
 						}
 					}
 				}
@@ -131,13 +132,13 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			// Process complete bundle
 			batchNewPDS, err := s.processBatch(ctx, operations)
 			if err != nil {
-				log.Printf("Error processing bundle: %v", err)
+				log.Error("Error processing bundle: %v", err)
 			}
 
 			newPDSCount += batchNewPDS
 			totalProcessed += int64(len(operations))
 
-			log.Printf("✓ Processed bundle %06d: %d operations, %d new PDS",
+			log.Verbose("✓ Processed bundle %06d: %d operations, %d new PDS",
 				currentBundle, len(operations), batchNewPDS)
 
 			// Update cursor
@@ -147,21 +148,21 @@ func (s *Scanner) Scan(ctx context.Context) error {
 				LastScanTime:     time.Now(),
 				RecordsProcessed: cursor.RecordsProcessed + totalProcessed,
 			}); err != nil {
-				log.Printf("Warning: failed to update cursor: %v", err)
+				log.Error("Warning: failed to update cursor: %v", err)
 			}
 
 			currentBundle++
 		} else {
 			// Incomplete bundle - add to mempool
-			log.Printf("→ Bundle %06x incomplete (%d ops), adding to mempool", currentBundle, len(operations))
+			log.Info("→ Bundle %06x incomplete (%d ops), adding to mempool", currentBundle, len(operations))
 
 			if err := s.addToMempool(ctx, operations); err != nil {
-				log.Printf("Error adding to mempool: %v", err)
+				log.Error("Error adding to mempool: %v", err)
 			}
 
 			// Process mempool
 			if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
-				log.Printf("Error processing mempool: %v", err)
+				log.Error("Error processing mempool: %v", err)
 			}
 
 			break // End of scan
@@ -171,7 +172,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		//time.Sleep(200 * time.Millisecond)
 	}
 
-	log.Printf("PLC scan completed: %d operations, %d new PDS servers in %v",
+	log.Info("PLC scan completed: %d operations, %d new PDS servers in %v",
 		totalProcessed, newPDSCount, time.Since(startTime))
 
 	return nil
@@ -210,10 +211,10 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 			return err
 		}
 
-		log.Printf("Mempool contains %d operations", count)
+		log.Verbose("Mempool contains %d operations", count)
 
 		if count < 1000 {
-			log.Println("Mempool has < 1000 operations, waiting for more data")
+			log.Info("Mempool has < 1000 operations, waiting for more data")
 			break
 		}
 
@@ -260,7 +261,7 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 			RecordsProcessed: *totalProcessed,
 		})
 
-		log.Printf("✓ Created bundle %06x from mempool", bundleNum)
+		log.Verbose("✓ Created bundle %06x from mempool", bundleNum)
 	}
 
 	return nil
@@ -298,11 +299,11 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 			LastChecked:  time.Time{},
 			Status:       storage.PDSStatusUnknown,
 		}); err != nil {
-			log.Printf("Error storing PDS %s: %v", pdsEndpoint, err)
+			log.Error("Error storing PDS %s: %v", stripansi.Strip(pdsEndpoint), err)
 			continue
 		}
 
-		log.Printf("✓ Discovered new PDS: %s", pdsEndpoint)
+		log.Info("✓ Discovered new PDS: %s", stripansi.Strip(pdsEndpoint))
 		newPDSCount++
 	}
 

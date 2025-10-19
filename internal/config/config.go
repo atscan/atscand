@@ -35,8 +35,9 @@ type PDSConfig struct {
 }
 
 type APIConfig struct {
-	Host string `yaml:"host"`
-	Port int    `yaml:"port"`
+	Host    string `yaml:"host"`
+	Port    int    `yaml:"port"`
+	Verbose bool   `yaml:"verbose"`
 }
 
 func Load(path string) (*Config, error) {

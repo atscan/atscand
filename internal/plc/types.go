@@ -58,7 +58,7 @@ type Service struct {
 // DIDHistoryEntry represents a single operation in DID history
 type DIDHistoryEntry struct {
 	Operation PLCOperation `json:"operation"`
-	Bundle    string       `json:"bundle,omitempty"`
+	PLCBundle    string       `json:"plc_bundle,omitempty"`
 }
 
 // DIDHistory represents the full history of a DID

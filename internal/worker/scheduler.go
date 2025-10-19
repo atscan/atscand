@@ -2,9 +2,10 @@ package worker
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
+
+	"github.com/atscan/atscanner/internal/log"
 )
 
 type Job struct {
@@ -50,16 +51,16 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 	defer ticker.Stop()
 
 	// Run immediately
-	log.Printf("Starting job: %s", job.Name)
+	log.Info("Starting job: %s", job.Name)
 	job.Fn()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("Stopping job: %s", job.Name)
+			log.Info("Stopping job: %s", job.Name)
 			return
 		case <-ticker.C:
-			log.Printf("Running job: %s", job.Name)
+			log.Info("Running job: %s", job.Name)
 			job.Fn()
 		}
 	}
