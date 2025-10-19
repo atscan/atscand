@@ -5,8 +5,8 @@ database:
 plc:
   directory_url: "https://plc.directory"
   scan_interval: "6h"
-  cache_dir: "./plc_cache"    # Cache directory
-  use_cache: true             # Enable caching
+  bundle_dir: "./plc_bundles"
+  use_cache: true
 
 pds:
   scan_interval: "15m"

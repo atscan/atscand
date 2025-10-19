@@ -14,19 +14,19 @@ import (
 )
 
 type Server struct {
-	router      *mux.Router
-	server      *http.Server
-	db          storage.Database
-	plcClient   *plc.Client
-	plcCacheDir string // NEW: Store cache dir
+	router       *mux.Router
+	server       *http.Server
+	db           storage.Database
+	plcClient    *plc.Client
+	plcBundleDir string // NEW: Store cache dir
 }
 
 func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCConfig) *Server {
 	s := &Server{
-		router:      mux.NewRouter(),
-		db:          db,
-		plcClient:   plc.NewClient(plcCfg.DirectoryURL),
-		plcCacheDir: plcCfg.CacheDir, // NEW
+		router:       mux.NewRouter(),
+		db:           db,
+		plcClient:    plc.NewClient(plcCfg.DirectoryURL),
+		plcBundleDir: plcCfg.BundleDir, // NEW
 	}
 
 	s.setupRoutes()

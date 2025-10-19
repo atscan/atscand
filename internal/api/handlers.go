@@ -121,7 +121,7 @@ func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
 	lastBundle := bundles[len(bundles)-1]
 
 	// Compute file path
-	filePath := filepath.Join(s.plcCacheDir, fmt.Sprintf("%06d.jsonl.zst", lastBundle.BundleNumber))
+	filePath := filepath.Join(s.plcBundleDir, fmt.Sprintf("%06d.jsonl.zst", lastBundle.BundleNumber))
 
 	operations, err := s.loadBundleOperations(filePath)
 	if err != nil {
@@ -167,7 +167,7 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 
 	for _, bundle := range bundles {
 		// Compute file path
-		filePath := filepath.Join(s.plcCacheDir, fmt.Sprintf("%06d.jsonl.zst", bundle.BundleNumber))
+		filePath := filepath.Join(s.plcBundleDir, fmt.Sprintf("%06d.jsonl.zst", bundle.BundleNumber))
 
 		operations, err := s.loadBundleOperations(filePath)
 		if err != nil {
@@ -676,7 +676,7 @@ func (s *Server) handlePLCExport(w http.ResponseWriter, r *http.Request) {
 	lastBundle, _ := s.db.GetLastBundleNumber(ctx)
 
 	for bundleNum := startBundle; bundleNum <= lastBundle && len(allOps) < count; bundleNum++ {
-		bundlePath := filepath.Join(s.plcCacheDir, fmt.Sprintf("%06d.jsonl.zst", bundleNum))
+		bundlePath := filepath.Join(s.plcBundleDir, fmt.Sprintf("%06d.jsonl.zst", bundleNum))
 
 		ops, err := s.loadBundleOperations(bundlePath)
 		if err != nil {

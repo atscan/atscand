@@ -101,8 +101,8 @@ type PLCBundle struct {
 }
 
 // GetFilePath returns the computed file path for this bundle
-func (b *PLCBundle) GetFilePath(cacheDir string) string {
-	return filepath.Join(cacheDir, fmt.Sprintf("%06d.jsonl.zst", b.BundleNumber))
+func (b *PLCBundle) GetFilePath(bundleDir string) string {
+	return filepath.Join(bundleDir, fmt.Sprintf("%06d.jsonl.zst", b.BundleNumber))
 }
 
 // OperationCount() returns 1000 (all bundles have exactly 1000 operations)

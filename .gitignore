@@ -4,3 +4,4 @@ plc_cache*
 atscanner
 .DS_Store
 plc_cache\.tmp/*
+plc_bundles*
