@@ -130,11 +130,9 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcCl
 
 				// Calculate uncompressed hash
 				var jsonlData []byte
-				for i, op := range operations {
+				for _, op := range operations {
 					jsonlData = append(jsonlData, op.RawJSON...)
-					if i < len(operations)-1 {
-						jsonlData = append(jsonlData, '\n')
-					}
+					jsonlData = append(jsonlData, '\n')
 				}
 				uncompressedHash := bm.calculateHash(jsonlData)
 
