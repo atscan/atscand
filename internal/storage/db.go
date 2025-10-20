@@ -38,6 +38,7 @@ type Database interface {
 	GetMempoolCount(ctx context.Context) (int, error)
 	GetMempoolOperations(ctx context.Context, limit int) ([]MempoolOperation, error)
 	DeleteFromMempool(ctx context.Context, ids []int64) error
+	GetLastMempoolOperation(ctx context.Context) (*MempoolOperation, error)
 
 	// Metrics
 	StorePLCMetrics(ctx context.Context, metrics *PLCMetrics) error

@@ -57,7 +57,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		currentBundle++
 	}
 
-	log.Info("Starting from bundle %06d", currentBundle) // Changed from %06x
+	log.Info("Starting from bundle %06d", currentBundle)
 
 	// Ensure bundle continuity (all previous bundles exist)
 	if currentBundle > 1 {
@@ -70,7 +70,32 @@ func (s *Scanner) Scan(ctx context.Context) error {
 	totalProcessed := int64(0)
 	newPDSCount := int64(0)
 
-	// Process bundles sequentially
+	// ✅ CHECK MEMPOOL FIRST - if it has data, continue filling it instead of fetching new bundle
+	mempoolCount, err := s.db.GetMempoolCount(ctx)
+	if err != nil {
+		return err
+	}
+
+	if mempoolCount > 0 {
+		log.Info("→ Mempool has %d operations, continuing to fill it before fetching new bundles", mempoolCount)
+
+		// Fill mempool until we have 10,000
+		if err := s.fillMempoolToSize(ctx, &newPDSCount, &totalProcessed); err != nil {
+			log.Error("Error filling mempool: %v", err)
+			return err
+		}
+
+		// Try to create bundles from mempool
+		if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
+			log.Error("Error processing mempool: %v", err)
+		}
+
+		log.Info("PLC scan completed: %d operations, %d new PDS servers in %v",
+			totalProcessed, newPDSCount, time.Since(startTime))
+		return nil
+	}
+
+	// Process bundles sequentially (normal flow when mempool is empty)
 	for {
 		select {
 		case <-ctx.Done():
@@ -104,7 +129,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		}
 
 		if isComplete {
-			// Complete bundle (1000 operations fetched, even if some were duplicates)
+			// Complete bundle
 			batchNewPDS, err := s.processBatch(ctx, operations)
 			if err != nil {
 				log.Error("Error processing bundle: %v", err)
@@ -135,6 +160,11 @@ func (s *Scanner) Scan(ctx context.Context) error {
 				log.Error("Error adding to mempool: %v", err)
 			}
 
+			// ✅ Now fill mempool to 10,000
+			if err := s.fillMempoolToSize(ctx, &newPDSCount, &totalProcessed); err != nil {
+				log.Error("Error filling mempool: %v", err)
+			}
+
 			// Process mempool
 			if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
 				log.Error("Error processing mempool: %v", err)
@@ -148,6 +178,85 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		totalProcessed, newPDSCount, time.Since(startTime))
 
 	return nil
+}
+
+func (s *Scanner) fillMempoolToSize(ctx context.Context, newPDSCount *int64, totalProcessed *int64) error {
+	const fetchLimit = 1000 // PLC directory limit
+
+	for {
+		countBefore, err := s.db.GetMempoolCount(ctx)
+		if err != nil {
+			return err
+		}
+
+		if countBefore >= BUNDLE_SIZE {
+			log.Info("✓ Mempool filled to %d operations (target: %d)", countBefore, BUNDLE_SIZE)
+			return nil
+		}
+
+		log.Info("→ Mempool has %d/%d operations, fetching more from PLC directory...", countBefore, BUNDLE_SIZE)
+
+		// ✅ Get just the last operation (much faster!)
+		lastOp, err := s.db.GetLastMempoolOperation(ctx)
+		if err != nil {
+			return err
+		}
+
+		var afterTimestamp string
+		if lastOp != nil {
+			afterTimestamp = lastOp.CreatedAt.Format(time.RFC3339Nano)
+			log.Verbose("  Using cursor: %s", afterTimestamp)
+		}
+
+		// ✅ Always fetch 1000 (PLC limit)
+		operations, err := s.client.Export(ctx, ExportOptions{
+			Count: fetchLimit,
+			After: afterTimestamp,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to fetch from PLC: %w", err)
+		}
+
+		fetchedCount := len(operations)
+		log.Verbose("  Fetched %d operations from PLC", fetchedCount)
+
+		// ✅ No data at all - we're done
+		if fetchedCount == 0 {
+			log.Info("→ No more data available from PLC directory (mempool has %d/%d)", countBefore, BUNDLE_SIZE)
+			return nil
+		}
+
+		// Add to mempool (with duplicate checking)
+		if err := s.addToMempool(ctx, operations); err != nil {
+			return err
+		}
+
+		*totalProcessed += int64(fetchedCount)
+
+		// Check if mempool actually grew
+		countAfter, err := s.db.GetMempoolCount(ctx)
+		if err != nil {
+			return err
+		}
+
+		newOpsAdded := countAfter - countBefore
+		duplicateCount := fetchedCount - newOpsAdded
+
+		log.Verbose("  Added %d new unique operations to mempool (%d were duplicates)",
+			newOpsAdded, duplicateCount)
+
+		// ✅ KEY LOGIC: Only repeat if we got a FULL batch (1000)
+		// If < 1000, it means we've caught up to the latest data
+		if fetchedCount < fetchLimit {
+			log.Info("→ Received incomplete batch (%d/%d), caught up to latest data",
+				fetchedCount, fetchLimit)
+			log.Info("→ Stopping fill, mempool has %d/%d operations", countAfter, BUNDLE_SIZE)
+			return nil
+		}
+
+		// Got full batch (1000), might be more data - continue loop
+		log.Verbose("  Received full batch (%d), checking for more data...", fetchLimit)
+	}
 }
 
 // addToMempool adds operations to mempool and processes them for PDS discovery
@@ -186,57 +295,46 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 		log.Verbose("Mempool contains %d operations", count)
 
 		if count < BUNDLE_SIZE {
-			log.Info("Mempool has < %d operations, waiting for more data", BUNDLE_SIZE)
+			log.Info("Mempool has %d/%d operations, cannot create bundle yet", count, BUNDLE_SIZE)
 			break
 		}
 
-		// ✅ Fetch MORE than needed to account for potential duplicates during dedup
-		// Fetch 1.2x to have buffer (20% extra)
-		fetchSize := int(float64(BUNDLE_SIZE) * 1.2)
-		if fetchSize > count {
-			fetchSize = count
-		}
+		log.Info("→ Creating bundle from mempool (%d operations available)...", count)
 
-		mempoolOps, err := s.db.GetMempoolOperations(ctx, fetchSize)
+		// Get first BUNDLE_SIZE operations ordered by timestamp
+		mempoolOps, err := s.db.GetMempoolOperations(ctx, BUNDLE_SIZE)
 		if err != nil {
 			return err
 		}
 
-		// ✅ Deduplicate by CID while preserving order
+		// Convert to PLCOperations and track IDs
+		operations := make([]PLCOperation, 0, BUNDLE_SIZE)
+		mempoolIDs := make([]int64, 0, BUNDLE_SIZE)
 		seenCIDs := make(map[string]bool)
-		var uniqueOps []PLCOperation
-		mempoolIDs := make([]int64, 0, len(mempoolOps))
 
 		for _, mop := range mempoolOps {
+			// ✅ Skip duplicates (shouldn't happen but safety check)
 			if seenCIDs[mop.CID] {
-				// Duplicate - still mark for deletion from mempool
-				mempoolIDs = append(mempoolIDs, mop.ID)
+				mempoolIDs = append(mempoolIDs, mop.ID) // Still delete it
 				continue
 			}
-
 			seenCIDs[mop.CID] = true
 
 			var op PLCOperation
 			json.Unmarshal([]byte(mop.Operation), &op)
-			uniqueOps = append(uniqueOps, op)
+			operations = append(operations, op)
 			mempoolIDs = append(mempoolIDs, mop.ID)
 
-			// Stop when we have enough unique operations
-			if len(uniqueOps) >= BUNDLE_SIZE {
+			if len(operations) >= BUNDLE_SIZE {
 				break
 			}
 		}
 
-		// ✅ Check if we have enough unique operations
-		if len(uniqueOps) < BUNDLE_SIZE {
-			log.Info("Mempool has only %d unique operations after dedup (need %d), waiting for more data",
-				len(uniqueOps), BUNDLE_SIZE)
+		// Final check
+		if len(operations) < BUNDLE_SIZE {
+			log.Error("⚠ Only got %d unique operations from mempool, need %d", len(operations), BUNDLE_SIZE)
 			break
 		}
-
-		// Trim to exact size
-		operations := uniqueOps[:BUNDLE_SIZE]
-		idsToDelete := mempoolIDs[:len(operations)]
 
 		// Create bundle from these operations
 		bundleNum, err := s.bundleManager.CreateBundleFromMempool(ctx, operations)
@@ -244,15 +342,14 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 			return err
 		}
 
-		// Remove from mempool (only the ones we used)
-		if err := s.db.DeleteFromMempool(ctx, idsToDelete); err != nil {
+		// Remove from mempool (only what we used)
+		if err := s.db.DeleteFromMempool(ctx, mempoolIDs[:len(operations)]); err != nil {
 			return err
 		}
 
-		// Process for PDS (already processed when added, but for consistency)
+		// Process for PDS
 		batchNewPDS, _ := s.processBatch(ctx, operations)
 		*newPDSCount += batchNewPDS
-		*totalProcessed += int64(len(operations))
 
 		*currentBundle = bundleNum
 

@@ -205,6 +205,7 @@ func (s *SQLiteDB) AddToMempool(ctx context.Context, ops []MempoolOperation) err
 	}
 	defer tx.Rollback()
 
+	// ✅ Use ON CONFLICT to skip duplicates
 	stmt, err := tx.PrepareContext(ctx, `
         INSERT INTO plc_mempool (did, operation, cid, created_at) 
         VALUES (?, ?, ?, ?)
@@ -279,6 +280,29 @@ func (s *SQLiteDB) DeleteFromMempool(ctx context.Context, ids []int64) error {
 
 	_, err := s.db.ExecContext(ctx, query, args...)
 	return err
+}
+
+// GetLastMempoolOperation retrieves the most recent operation from mempool
+func (s *SQLiteDB) GetLastMempoolOperation(ctx context.Context) (*MempoolOperation, error) {
+	query := `
+        SELECT id, did, operation, cid, created_at, added_at
+        FROM plc_mempool
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+    `
+
+	var op MempoolOperation
+	err := s.db.QueryRowContext(ctx, query).Scan(
+		&op.ID, &op.DID, &op.Operation, &op.CID, &op.CreatedAt, &op.AddedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil // No operations in mempool
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &op, nil
 }
 
 func (s *SQLiteDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
