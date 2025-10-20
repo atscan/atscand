@@ -264,10 +264,10 @@ func (s *Scanner) addToMempool(ctx context.Context, operations []PLCOperation) e
 	mempoolOps := make([]storage.MempoolOperation, len(operations))
 
 	for i, op := range operations {
-		opJSON, _ := json.Marshal(op)
+		// ✅ Store the original RawJSON directly
 		mempoolOps[i] = storage.MempoolOperation{
 			DID:       op.DID,
-			Operation: string(opJSON),
+			Operation: string(op.RawJSON), // ✅ Use RawJSON instead of Marshal
 			CID:       op.CID,
 			CreatedAt: op.CreatedAt,
 		}
@@ -322,6 +322,10 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 
 			var op PLCOperation
 			json.Unmarshal([]byte(mop.Operation), &op)
+
+			// ✅ Restore RawJSON from database
+			op.RawJSON = []byte(mop.Operation)
+
 			operations = append(operations, op)
 			mempoolIDs = append(mempoolIDs, mop.ID)
 
