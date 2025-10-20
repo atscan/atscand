@@ -101,17 +101,18 @@ func (s *SQLiteDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_plc_bundles_prev ON plc_bundles(prev_bundle_hash);
 
     -- NEW: Mempool for pending operations
-    CREATE TABLE IF NOT EXISTS plc_mempool (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        did TEXT NOT NULL,
-        operation TEXT NOT NULL,  -- Full operation as JSON
-        cid TEXT NOT NULL,
-        created_at TIMESTAMP NOT NULL,  -- Operation timestamp
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+	CREATE TABLE IF NOT EXISTS plc_mempool (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		did TEXT NOT NULL,
+		operation TEXT NOT NULL,
+		cid TEXT NOT NULL UNIQUE,  -- ✅ Add UNIQUE constraint
+		created_at TIMESTAMP NOT NULL,
+		added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
 
     CREATE INDEX IF NOT EXISTS idx_mempool_created_at ON plc_mempool(created_at);
     CREATE INDEX IF NOT EXISTS idx_mempool_did ON plc_mempool(did);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_mempool_cid ON plc_mempool(cid);
     `
 
 	_, err := s.db.Exec(schema)
@@ -207,6 +208,7 @@ func (s *SQLiteDB) AddToMempool(ctx context.Context, ops []MempoolOperation) err
 	stmt, err := tx.PrepareContext(ctx, `
         INSERT INTO plc_mempool (did, operation, cid, created_at) 
         VALUES (?, ?, ?, ?)
+        ON CONFLICT(cid) DO NOTHING
     `)
 	if err != nil {
 		return err

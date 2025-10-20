@@ -358,7 +358,7 @@ func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 			"plc_bundle_number": bundle.BundleNumber,
 			"start_time":        bundle.StartTime,
 			"end_time":          bundle.EndTime,
-			"operation_count":   1000,
+			"operation_count":   10000,
 			"did_count":         len(bundle.DIDs),
 			"hash":              bundle.Hash,
 			"compressed_hash":   bundle.CompressedHash,

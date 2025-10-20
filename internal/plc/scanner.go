@@ -185,27 +185,58 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 
 		log.Verbose("Mempool contains %d operations", count)
 
-		if count < BUNDLE_SIZE { // Changed from 1000
+		if count < BUNDLE_SIZE {
 			log.Info("Mempool has < %d operations, waiting for more data", BUNDLE_SIZE)
 			break
 		}
 
-		// Get first BUNDLE_SIZE operations ordered by timestamp
-		mempoolOps, err := s.db.GetMempoolOperations(ctx, BUNDLE_SIZE) // Changed from 1000
+		// ✅ Fetch MORE than needed to account for potential duplicates during dedup
+		// Fetch 1.2x to have buffer (20% extra)
+		fetchSize := int(float64(BUNDLE_SIZE) * 1.2)
+		if fetchSize > count {
+			fetchSize = count
+		}
+
+		mempoolOps, err := s.db.GetMempoolOperations(ctx, fetchSize)
 		if err != nil {
 			return err
 		}
 
-		// Convert to PLCOperations
-		operations := make([]PLCOperation, len(mempoolOps))
-		mempoolIDs := make([]int64, len(mempoolOps))
+		// ✅ Deduplicate by CID while preserving order
+		seenCIDs := make(map[string]bool)
+		var uniqueOps []PLCOperation
+		mempoolIDs := make([]int64, 0, len(mempoolOps))
 
-		for i, mop := range mempoolOps {
+		for _, mop := range mempoolOps {
+			if seenCIDs[mop.CID] {
+				// Duplicate - still mark for deletion from mempool
+				mempoolIDs = append(mempoolIDs, mop.ID)
+				continue
+			}
+
+			seenCIDs[mop.CID] = true
+
 			var op PLCOperation
 			json.Unmarshal([]byte(mop.Operation), &op)
-			operations[i] = op
-			mempoolIDs[i] = mop.ID
+			uniqueOps = append(uniqueOps, op)
+			mempoolIDs = append(mempoolIDs, mop.ID)
+
+			// Stop when we have enough unique operations
+			if len(uniqueOps) >= BUNDLE_SIZE {
+				break
+			}
 		}
+
+		// ✅ Check if we have enough unique operations
+		if len(uniqueOps) < BUNDLE_SIZE {
+			log.Info("Mempool has only %d unique operations after dedup (need %d), waiting for more data",
+				len(uniqueOps), BUNDLE_SIZE)
+			break
+		}
+
+		// Trim to exact size
+		operations := uniqueOps[:BUNDLE_SIZE]
+		idsToDelete := mempoolIDs[:len(operations)]
 
 		// Create bundle from these operations
 		bundleNum, err := s.bundleManager.CreateBundleFromMempool(ctx, operations)
@@ -213,8 +244,8 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 			return err
 		}
 
-		// Remove from mempool
-		if err := s.db.DeleteFromMempool(ctx, mempoolIDs); err != nil {
+		// Remove from mempool (only the ones we used)
+		if err := s.db.DeleteFromMempool(ctx, idsToDelete); err != nil {
 			return err
 		}
 
@@ -233,7 +264,7 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 			RecordsProcessed: *totalProcessed,
 		})
 
-		log.Verbose("✓ Created bundle %06x from mempool", bundleNum)
+		log.Info("✓ Created bundle %06d from mempool", bundleNum)
 	}
 
 	return nil

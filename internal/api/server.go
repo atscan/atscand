@@ -10,6 +10,7 @@ import (
 	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/plc"
 	"github.com/atscan/atscanner/internal/storage"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 )
 
@@ -31,9 +32,16 @@ func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCCo
 
 	s.setupRoutes()
 
+	// Add CORS middleware
+	corsHandler := handlers.CORS(
+		handlers.AllowedOrigins([]string{"*"}),
+		handlers.AllowedMethods([]string{"GET", "POST", "OPTIONS"}),
+		handlers.AllowedHeaders([]string{"Content-Type", "X-Requested-With"}),
+	)
+
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", apiCfg.Host, apiCfg.Port),
-		Handler:      s.router,
+		Handler:      corsHandler(s.router),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}

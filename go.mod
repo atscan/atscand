@@ -10,4 +10,9 @@ require (
 
 require github.com/klauspost/compress v1.18.0
 
-require github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d
+require (
+	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d
+	github.com/gorilla/handlers v1.5.2
+)
+
+require github.com/felixge/httpsnoop v1.0.3 // indirect

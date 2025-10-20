@@ -68,11 +68,12 @@ type PDSFilter struct {
 
 // PDSStats contains aggregate statistics about PDS servers
 type PDSStats struct {
-	TotalPDS        int64
-	OnlinePDS       int64
-	OfflinePDS      int64
-	AvgResponseTime float64
-	TotalDIDs       int64
+	TotalPDS        int64   `json:"total_pds"`
+	UniquePDS       int64   `json:"unique_pds"`
+	OnlinePDS       int64   `json:"online_pds"`
+	OfflinePDS      int64   `json:"offline_pds"`
+	AvgResponseTime float64 `json:"avg_response_time"`
+	TotalDIDs       int64   `json:"total_dids"`
 }
 
 // PLCMetrics contains metrics from PLC directory scans
