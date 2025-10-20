@@ -739,11 +739,8 @@ func computeRemoteOperationsHash(ops []plc.PLCOperation) (string, error) {
 		} else {
 			return "", fmt.Errorf("operation %d missing raw JSON data", i)
 		}
-
 		// Add newline ONLY between operations
-		if i < len(ops)-1 {
-			jsonlData = append(jsonlData, '\n')
-		}
+		jsonlData = append(jsonlData, '\n')
 	}
 
 	hash := sha256.Sum256(jsonlData)
