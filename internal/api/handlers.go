@@ -261,6 +261,12 @@ func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Check if client wants uncompressed data
+	compressed := true
+	if r.URL.Query().Get("compressed") == "false" {
+		compressed = false
+	}
+
 	// Verify bundle exists in database
 	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
 	if err != nil {
@@ -282,18 +288,7 @@ func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Open file
-	file, err := os.Open(filePath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("error opening bundle file: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-
-	// Set headers
-	w.Header().Set("Content-Type", "application/zstd")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl.zst", bundleNumber))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+	// Set common headers
 	w.Header().Set("X-Bundle-Number", fmt.Sprintf("%d", bundleNumber))
 	w.Header().Set("X-Bundle-Hash", bundle.Hash)
 	w.Header().Set("X-Bundle-Compressed-Hash", bundle.CompressedHash)
@@ -302,8 +297,55 @@ func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("X-Bundle-Operation-Count", fmt.Sprintf("%d", plc.BUNDLE_SIZE))
 	w.Header().Set("X-Bundle-DID-Count", fmt.Sprintf("%d", len(bundle.DIDs)))
 
-	// Stream the file
-	http.ServeContent(w, r, filepath.Base(filePath), bundle.CreatedAt, file)
+	if compressed {
+		// Serve compressed file
+		file, err := os.Open(filePath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("error opening bundle file: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		w.Header().Set("Content-Type", "application/zstd")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl.zst", bundleNumber))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+		w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", fileInfo.Size()))
+
+		http.ServeContent(w, r, filepath.Base(filePath), bundle.CreatedAt, file)
+	} else {
+		// Serve uncompressed data
+		compressedData, err := os.ReadFile(filePath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("error reading bundle file: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Decompress
+		decoder, err := zstd.NewReader(nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("error creating decompressor: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer decoder.Close()
+
+		decompressed, err := decoder.DecodeAll(compressedData, nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("error decompressing bundle: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Set headers for uncompressed data
+		w.Header().Set("Content-Type", "application/jsonl")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl", bundleNumber))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(decompressed)))
+		w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", fileInfo.Size()))
+		w.Header().Set("X-Uncompressed-Size", fmt.Sprintf("%d", len(decompressed)))
+		w.Header().Set("X-Compression-Ratio", fmt.Sprintf("%.2f", float64(len(decompressed))/float64(fileInfo.Size())))
+
+		// Write decompressed data
+		w.WriteHeader(http.StatusOK)
+		w.Write(decompressed)
+	}
 }
 
 func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
