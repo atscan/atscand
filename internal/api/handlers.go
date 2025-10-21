@@ -251,6 +251,61 @@ func (s *Server) handleGetPLCBundleDIDs(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+
+	bundleNumber, err := strconv.Atoi(vars["number"])
+	if err != nil {
+		http.Error(w, "invalid bundle number", http.StatusBadRequest)
+		return
+	}
+
+	// Verify bundle exists in database
+	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
+	if err != nil {
+		http.Error(w, "bundle not found", http.StatusNotFound)
+		return
+	}
+
+	// Build file path
+	filePath := filepath.Join(s.plcBundleDir, fmt.Sprintf("%06d.jsonl.zst", bundleNumber))
+
+	// Check if file exists
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "bundle file not found on disk", http.StatusNotFound)
+			return
+		}
+		http.Error(w, fmt.Sprintf("error accessing bundle file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Open file
+	file, err := os.Open(filePath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error opening bundle file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
+	// Set headers
+	w.Header().Set("Content-Type", "application/zstd")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl.zst", bundleNumber))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+	w.Header().Set("X-Bundle-Number", fmt.Sprintf("%d", bundleNumber))
+	w.Header().Set("X-Bundle-Hash", bundle.Hash)
+	w.Header().Set("X-Bundle-Compressed-Hash", bundle.CompressedHash)
+	w.Header().Set("X-Bundle-Start-Time", bundle.StartTime.Format(time.RFC3339Nano))
+	w.Header().Set("X-Bundle-End-Time", bundle.EndTime.Format(time.RFC3339Nano))
+	w.Header().Set("X-Bundle-Operation-Count", fmt.Sprintf("%d", plc.BUNDLE_SIZE))
+	w.Header().Set("X-Bundle-DID-Count", fmt.Sprintf("%d", len(bundle.DIDs)))
+
+	// Stream the file
+	http.ServeContent(w, r, filepath.Base(filePath), bundle.CreatedAt, file)
+}
+
 func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -260,10 +315,50 @@ func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, map[string]interface{}{
+	response := map[string]interface{}{
 		"operation_count":   count,
-		"can_create_bundle": count >= 1000,
-	})
+		"can_create_bundle": count >= plc.BUNDLE_SIZE,
+	}
+
+	// Get mempool start time (first item)
+	if count > 0 {
+		firstOp, err := s.db.GetFirstMempoolOperation(ctx)
+		if err == nil && firstOp != nil {
+			response["mempool_start_time"] = firstOp.CreatedAt
+
+			// Calculate estimated next bundle time
+			if count < plc.BUNDLE_SIZE {
+				lastOp, err := s.db.GetLastMempoolOperation(ctx)
+				if err == nil && lastOp != nil {
+					// Calculate rate of operations per second
+					timeSpan := lastOp.CreatedAt.Sub(firstOp.CreatedAt).Seconds()
+
+					if timeSpan > 0 {
+						opsPerSecond := float64(count) / timeSpan
+
+						if opsPerSecond > 0 {
+							remainingOps := plc.BUNDLE_SIZE - count
+							secondsNeeded := float64(remainingOps) / opsPerSecond
+							estimatedTime := time.Now().Add(time.Duration(secondsNeeded) * time.Second)
+
+							response["estimated_next_bundle_time"] = estimatedTime
+							response["operations_needed"] = remainingOps
+							response["current_rate_per_second"] = opsPerSecond
+						}
+					}
+				}
+			} else {
+				// Bundle can be created now
+				response["estimated_next_bundle_time"] = time.Now()
+				response["operations_needed"] = 0
+			}
+		}
+	} else {
+		response["mempool_start_time"] = nil
+		response["estimated_next_bundle_time"] = nil
+	}
+
+	respondJSON(w, response)
 }
 
 // Helper to load bundle operations - UPDATED FOR JSONL FORMAT

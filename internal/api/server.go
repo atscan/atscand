@@ -66,6 +66,7 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/plc/bundles/chain", s.handleGetChainInfo).Methods("GET")
 	api.HandleFunc("/plc/bundles/verify-chain", s.handleVerifyChain).Methods("POST")
 	api.HandleFunc("/plc/bundles/{number}/dids", s.handleGetPLCBundleDIDs).Methods("GET")
+	api.HandleFunc("/plc/bundles/{number}/download", s.handleDownloadPLCBundle).Methods("GET")
 	api.HandleFunc("/plc/bundles/{bundleNumber}/verify", s.handleVerifyPLCBundle).Methods("POST")
 	api.HandleFunc("/plc/bundles/{number}", s.handleGetPLCBundle).Methods("GET")
 	api.HandleFunc("/plc/export", s.handlePLCExport).Methods("GET")

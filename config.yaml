@@ -4,7 +4,7 @@ database:
 
 plc:
   directory_url: "https://plc.directory"
-  scan_interval: "10s"
+  scan_interval: "5s"
   bundle_dir: "./plc_bundles"
   use_cache: true
 

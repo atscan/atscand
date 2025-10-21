@@ -282,6 +282,29 @@ func (s *SQLiteDB) DeleteFromMempool(ctx context.Context, ids []int64) error {
 	return err
 }
 
+// GetFirstMempoolOperation retrieves the oldest operation from mempool
+func (s *SQLiteDB) GetFirstMempoolOperation(ctx context.Context) (*MempoolOperation, error) {
+	query := `
+        SELECT id, did, operation, cid, created_at, added_at
+        FROM plc_mempool
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+    `
+
+	var op MempoolOperation
+	err := s.db.QueryRowContext(ctx, query).Scan(
+		&op.ID, &op.DID, &op.Operation, &op.CID, &op.CreatedAt, &op.AddedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil // No operations in mempool
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &op, nil
+}
+
 // GetLastMempoolOperation retrieves the most recent operation from mempool
 func (s *SQLiteDB) GetLastMempoolOperation(ctx context.Context) (*MempoolOperation, error) {
 	query := `

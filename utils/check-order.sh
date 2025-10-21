@@ -1,4 +1,4 @@
-pv plc_cache/*.jsonl.zst | zstdcat | \
+pv plc_bundles/*.jsonl.zst | zstdcat | \
   jq -r '.createdAt' | \
   awk '
     NR > 1 && $0 < prev {

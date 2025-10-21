@@ -38,6 +38,7 @@ type Database interface {
 	GetMempoolCount(ctx context.Context) (int, error)
 	GetMempoolOperations(ctx context.Context, limit int) ([]MempoolOperation, error)
 	DeleteFromMempool(ctx context.Context, ids []int64) error
+	GetFirstMempoolOperation(ctx context.Context) (*MempoolOperation, error)
 	GetLastMempoolOperation(ctx context.Context) (*MempoolOperation, error)
 
 	// Metrics
