@@ -23,8 +23,9 @@ type PLCConfig struct {
 	DirectoryURL string        `yaml:"directory_url"`
 	ScanInterval time.Duration `yaml:"scan_interval"`
 	BatchSize    int           `yaml:"batch_size"`
-	BundleDir    string        `yaml:"bundles_dir"` // NEW: Cache directory
-	UseCache     bool          `yaml:"use_cache"`   // NEW: Enable/disable cache
+	BundleDir    string        `yaml:"bundles_dir"`
+	UseCache     bool          `yaml:"use_cache"`
+	IndexDIDs    bool          `yaml:"index_dids"`
 }
 
 type PDSConfig struct {

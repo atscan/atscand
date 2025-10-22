@@ -20,16 +20,17 @@ import (
 const BUNDLE_SIZE = 10000
 
 type BundleManager struct {
-	dir     string
-	enabled bool
-	encoder *zstd.Encoder
-	decoder *zstd.Decoder
-	db      storage.Database
+	dir       string
+	enabled   bool
+	encoder   *zstd.Encoder
+	decoder   *zstd.Decoder
+	db        storage.Database
+	indexDIDs bool
 }
 
 // ===== INITIALIZATION =====
 
-func NewBundleManager(dir string, enabled bool, db storage.Database) (*BundleManager, error) {
+func NewBundleManager(dir string, enabled bool, db storage.Database, indexDIDs bool) (*BundleManager, error) {
 	if !enabled {
 		return &BundleManager{enabled: false}, nil
 	}
@@ -49,11 +50,12 @@ func NewBundleManager(dir string, enabled bool, db storage.Database) (*BundleMan
 	}
 
 	return &BundleManager{
-		dir:     dir,
-		enabled: enabled,
-		encoder: encoder,
-		decoder: decoder,
-		db:      db,
+		dir:       dir,
+		enabled:   enabled,
+		encoder:   encoder,
+		decoder:   decoder,
+		db:        db,
+		indexDIDs: indexDIDs, // NEW
 	}, nil
 }
 
@@ -375,15 +377,18 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 		return err
 	}
 
-	start := time.Now()
-	// Index DIDs synchronously (will use bulk inserts for speed)
-	if err := bm.db.AddBundleDIDs(ctx, bundleNum, dids); err != nil {
-		log.Error("Failed to index DIDs for bundle %06d: %v", bundleNum, err)
-		// Don't return error - bundle is already created
-		// DID indexing can be retried later
+	// NEW: Only index DIDs if enabled
+	if bm.indexDIDs {
+		start := time.Now()
+		if err := bm.db.AddBundleDIDs(ctx, bundleNum, dids); err != nil {
+			log.Error("Failed to index DIDs for bundle %06d: %v", bundleNum, err)
+			// Don't return error - bundle is already created
+		} else {
+			elapsed := time.Since(start)
+			log.Verbose("✓ Indexed %d unique DIDs for bundle %06d in %v", len(dids), bundleNum, elapsed)
+		}
 	} else {
-		elapsed := time.Since(start)
-		log.Verbose("✓ Indexed %d unique DIDs for bundle %06d in %v", len(dids), bundleNum, elapsed)
+		log.Verbose("⊘ Skipped DID indexing for bundle %06d (disabled in config)", bundleNum)
 	}
 
 	return nil

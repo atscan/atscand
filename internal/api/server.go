@@ -24,7 +24,7 @@ type Server struct {
 }
 
 func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCConfig) *Server {
-	bundleManager, _ := plc.NewBundleManager(plcCfg.BundleDir, plcCfg.UseCache, db)
+	bundleManager, _ := plc.NewBundleManager(plcCfg.BundleDir, plcCfg.UseCache, db, plcCfg.IndexDIDs)
 
 	s := &Server{
 		router:        mux.NewRouter(),

@@ -21,7 +21,7 @@ type Scanner struct {
 }
 
 func NewScanner(db storage.Database, cfg config.PLCConfig) *Scanner {
-	bundleManager, err := NewBundleManager(cfg.BundleDir, cfg.UseCache, db)
+	bundleManager, err := NewBundleManager(cfg.BundleDir, cfg.UseCache, db, cfg.IndexDIDs) // NEW: pass IndexDIDs
 	if err != nil {
 		log.Error("Warning: failed to initialize bundle manager: %v", err)
 		bundleManager = &BundleManager{enabled: false}

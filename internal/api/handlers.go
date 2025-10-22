@@ -187,7 +187,8 @@ func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
 	didRecord, err := s.db.GetDIDRecord(r.Context(), did)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			resp.error("DID not found", http.StatusNotFound)
+			// NEW: Provide helpful message if indexing is disabled
+			resp.error("DID not found. Note: DID indexing may be disabled in configuration.", http.StatusNotFound)
 		} else {
 			resp.error(err.Error(), http.StatusInternalServerError)
 		}

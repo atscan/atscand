@@ -8,6 +8,7 @@ plc:
   scan_interval: "5s"
   bundle_dir: "./plc_bundles"
   use_cache: true
+  index_dids: true
 
 pds:
   scan_interval: "15m"
