@@ -41,8 +41,29 @@ func (s *Scanner) Close() {
 	}
 }
 
+// ScanMetrics tracks scan progress
+type ScanMetrics struct {
+	totalProcessed int64
+	endpointCounts map[string]int64
+	currentBundle  int
+	startTime      time.Time
+}
+
+func newMetrics(startBundle int) *ScanMetrics {
+	return &ScanMetrics{
+		endpointCounts: make(map[string]int64),
+		currentBundle:  startBundle,
+		startTime:      time.Now(),
+	}
+}
+
+func (m *ScanMetrics) logSummary() {
+	summary := formatEndpointCounts(m.endpointCounts)
+	log.Info("PLC scan completed: %d operations, %s in %v",
+		m.totalProcessed, summary, time.Since(m.startTime))
+}
+
 func (s *Scanner) Scan(ctx context.Context) error {
-	startTime := time.Now()
 	log.Info("Starting PLC directory scan...")
 	log.Info("⚠ Note: PLC directory has rate limit of 500 requests per 5 minutes")
 
@@ -51,254 +72,261 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		return fmt.Errorf("failed to get scan cursor: %w", err)
 	}
 
-	currentBundle := cursor.LastBundleNumber
-	if currentBundle == 0 {
-		currentBundle = 1
-	} else {
-		currentBundle++
-	}
+	startBundle := s.calculateStartBundle(cursor.LastBundleNumber)
+	metrics := newMetrics(startBundle)
 
-	log.Info("Starting from bundle %06d", currentBundle)
-
-	// Ensure bundle continuity (all previous bundles exist)
-	if currentBundle > 1 {
-		log.Info("Checking bundle continuity...")
-		if err := s.bundleManager.EnsureBundleContinuity(ctx, currentBundle); err != nil {
-			return fmt.Errorf("bundle continuity check failed: %w", err)
+	if startBundle > 1 {
+		if err := s.ensureContinuity(ctx, startBundle); err != nil {
+			return err
 		}
 	}
 
-	totalProcessed := int64(0)
-	newEndpointCounts := make(map[string]int64) // ✅ Changed from newPDSCount
-
-	// ✅ CHECK MEMPOOL FIRST - if it has data, continue filling it instead of fetching new bundle
-	mempoolCount, err := s.db.GetMempoolCount(ctx)
-	if err != nil {
-		return err
+	// Handle existing mempool first
+	if hasMempool, _ := s.hasSufficientMempool(ctx); hasMempool {
+		return s.handleMempoolOnly(ctx, metrics, cursor)
 	}
 
-	if mempoolCount > 0 {
-		log.Info("→ Mempool has %d operations, continuing to fill it before fetching new bundles", mempoolCount)
-
-		// Fill mempool until we have 10,000
-		if err := s.fillMempoolToSize(ctx, newEndpointCounts, &totalProcessed); err != nil {
-			log.Error("Error filling mempool: %v", err)
+	// Process bundles until incomplete or error
+	for {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		// Try to create bundles from mempool
-		if err := s.processMempoolRecursive(ctx, newEndpointCounts, &currentBundle, &totalProcessed); err != nil {
-			log.Error("Error processing mempool: %v", err)
-		}
-
-		endpointSummary := formatEndpointCounts(newEndpointCounts)
-		log.Info("PLC scan completed: %d operations, %s in %v",
-			totalProcessed, endpointSummary, time.Since(startTime))
-		return nil
-	}
-
-	// Process bundles sequentially (normal flow when mempool is empty)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		log.Verbose("→ Processing bundle %06d...", currentBundle)
-
-		// Load bundle (returns operations, isComplete flag, and error)
-		operations, isComplete, err := s.bundleManager.LoadBundle(ctx, currentBundle, s.client)
-		if err != nil {
-			log.Error("Failed to load bundle %06d: %v", currentBundle, err)
-
-			// If rate limited, wait and retry
-			if contains(err.Error(), "rate limited") {
-				log.Info("⚠ Rate limit hit, pausing for 5 minutes...")
-				time.Sleep(5 * time.Minute)
+		if err := s.processSingleBundle(ctx, metrics); err != nil {
+			if s.shouldRetry(err) {
 				continue
-			}
-
-			// Check if this is just end of data
-			if currentBundle > 1 {
-				log.Info("→ Reached end of available data")
-				// Try mempool processing
-				if err := s.processMempoolRecursive(ctx, newEndpointCounts, &currentBundle, &totalProcessed); err != nil {
-					log.Error("Error processing mempool: %v", err)
-				}
 			}
 			break
 		}
 
-		if isComplete {
-			// Complete bundle
-			batchCounts, err := s.processBatch(ctx, operations)
-			if err != nil {
-				log.Error("Error processing bundle: %v", err)
-			}
-			for typ, count := range batchCounts {
-				newEndpointCounts[typ] += count
-			}
-			totalProcessed += int64(len(operations))
-
-			// Calculate total for this batch for logging
-			batchTotal := int64(0)
-			for _, count := range batchCounts {
-				batchTotal += count
-			}
-			log.Verbose("✓ Processed bundle %06d: %d operations (after dedup), %d new endpoints",
-				currentBundle, len(operations), batchTotal)
-
-			// Update cursor
-			if err := s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
-				Source:           "plc_directory",
-				LastBundleNumber: currentBundle,
-				LastScanTime:     time.Now(),
-				RecordsProcessed: cursor.RecordsProcessed + totalProcessed,
-			}); err != nil {
-				log.Error("Warning: failed to update cursor: %v", err)
-			}
-
-			currentBundle++
-		} else {
-			// Incomplete bundle - we've reached the end of available data
-			log.Info("→ Bundle %06d incomplete (%d ops), adding to mempool", currentBundle, len(operations))
-
-			if err := s.addToMempool(ctx, operations, newEndpointCounts); err != nil {
-				log.Error("Error adding to mempool: %v", err)
-			}
-
-			// ✅ Now fill mempool to 10,000
-			if err := s.fillMempoolToSize(ctx, newEndpointCounts, &totalProcessed); err != nil {
-				log.Error("Error filling mempool: %v", err)
-			}
-
-			// Process mempool
-			if err := s.processMempoolRecursive(ctx, newEndpointCounts, &currentBundle, &totalProcessed); err != nil {
-				log.Error("Error processing mempool: %v", err)
-			}
-
-			break // End of scan
+		if err := s.updateCursor(ctx, cursor, metrics); err != nil {
+			log.Error("Warning: failed to update cursor: %v", err)
 		}
 	}
 
-	endpointSummary := formatEndpointCounts(newEndpointCounts)
-	log.Info("PLC scan completed: %d operations, %s in %v",
-		totalProcessed, endpointSummary, time.Since(startTime))
+	// Try to finalize mempool
+	s.finalizeMempool(ctx, metrics)
 
+	metrics.logSummary()
 	return nil
 }
 
-func (s *Scanner) fillMempoolToSize(ctx context.Context, newEndpointCounts map[string]int64, totalProcessed *int64) error {
-	const fetchLimit = 1000 // PLC directory limit
+func (s *Scanner) calculateStartBundle(lastBundle int) int {
+	if lastBundle == 0 {
+		return 1
+	}
+	return lastBundle + 1
+}
 
-	for {
-		countBefore, err := s.db.GetMempoolCount(ctx)
-		if err != nil {
-			return err
-		}
+func (s *Scanner) ensureContinuity(ctx context.Context, bundle int) error {
+	log.Info("Checking bundle continuity...")
+	if err := s.bundleManager.EnsureBundleContinuity(ctx, bundle); err != nil {
+		return fmt.Errorf("bundle continuity check failed: %w", err)
+	}
+	return nil
+}
 
-		if countBefore >= BUNDLE_SIZE {
-			log.Info("✓ Mempool filled to %d operations (target: %d)", countBefore, BUNDLE_SIZE)
-			return nil
-		}
+func (s *Scanner) hasSufficientMempool(ctx context.Context) (bool, error) {
+	count, err := s.db.GetMempoolCount(ctx)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
 
-		log.Info("→ Mempool has %d/%d operations, fetching more from PLC directory...", countBefore, BUNDLE_SIZE)
+func (s *Scanner) handleMempoolOnly(ctx context.Context, m *ScanMetrics, cursor *storage.ScanCursor) error {
+	count, _ := s.db.GetMempoolCount(ctx)
+	log.Info("→ Mempool has %d operations, continuing to fill it before fetching new bundles", count)
 
-		// ✅ Get just the last operation (much faster!)
-		lastOp, err := s.db.GetLastMempoolOperation(ctx)
-		if err != nil {
-			return err
-		}
+	if err := s.fillMempool(ctx, m); err != nil {
+		return err
+	}
 
-		var afterTimestamp string
-		if lastOp != nil {
-			afterTimestamp = lastOp.CreatedAt.Format(time.RFC3339Nano)
-			log.Verbose("  Using cursor: %s", afterTimestamp)
-		}
+	if err := s.processMempool(ctx, m); err != nil {
+		log.Error("Error processing mempool: %v", err)
+	}
 
-		// ✅ Always fetch 1000 (PLC limit)
-		operations, err := s.client.Export(ctx, ExportOptions{
-			Count: fetchLimit,
-			After: afterTimestamp,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to fetch from PLC: %w", err)
-		}
+	m.logSummary()
+	return nil
+}
 
-		fetchedCount := len(operations)
-		log.Verbose("  Fetched %d operations from PLC", fetchedCount)
+func (s *Scanner) processSingleBundle(ctx context.Context, m *ScanMetrics) error {
+	log.Verbose("→ Processing bundle %06d...", m.currentBundle)
 
-		// ✅ No data at all - we're done
-		if fetchedCount == 0 {
-			log.Info("→ No more data available from PLC directory (mempool has %d/%d)", countBefore, BUNDLE_SIZE)
-			return nil
-		}
+	ops, isComplete, err := s.bundleManager.LoadBundle(ctx, m.currentBundle, s.client)
+	if err != nil {
+		return s.handleBundleError(err, m)
+	}
 
-		// Add to mempool (with duplicate checking)
-		if err := s.addToMempool(ctx, operations, newEndpointCounts); err != nil {
-			return err
-		}
+	if isComplete {
+		return s.handleCompleteBundle(ctx, ops, m)
+	}
+	return s.handleIncompleteBundle(ctx, ops, m)
+}
 
-		*totalProcessed += int64(fetchedCount)
+func (s *Scanner) handleBundleError(err error, m *ScanMetrics) error {
+	log.Error("Failed to load bundle %06d: %v", m.currentBundle, err)
 
-		// Check if mempool actually grew
-		countAfter, err := s.db.GetMempoolCount(ctx)
-		if err != nil {
-			return err
-		}
+	if strings.Contains(err.Error(), "rate limited") {
+		log.Info("⚠ Rate limit hit, pausing for 5 minutes...")
+		time.Sleep(5 * time.Minute)
+		return fmt.Errorf("retry")
+	}
 
-		newOpsAdded := countAfter - countBefore
-		duplicateCount := fetchedCount - newOpsAdded
+	if m.currentBundle > 1 {
+		log.Info("→ Reached end of available data")
+	}
+	return err
+}
 
-		log.Verbose("  Added %d new unique operations to mempool (%d were duplicates)",
-			newOpsAdded, duplicateCount)
+func (s *Scanner) shouldRetry(err error) bool {
+	return err != nil && err.Error() == "retry"
+}
 
-		// ✅ KEY LOGIC: Only repeat if we got a FULL batch (1000)
-		// If < 1000, it means we've caught up to the latest data
-		if fetchedCount < fetchLimit {
-			log.Info("→ Received incomplete batch (%d/%d), caught up to latest data",
-				fetchedCount, fetchLimit)
-			log.Info("→ Stopping fill, mempool has %d/%d operations", countAfter, BUNDLE_SIZE)
-			return nil
-		}
+func (s *Scanner) handleCompleteBundle(ctx context.Context, ops []PLCOperation, m *ScanMetrics) error {
+	counts, err := s.processBatch(ctx, ops)
+	if err != nil {
+		return err
+	}
 
-		// Got full batch (1000), might be more data - continue loop
-		log.Verbose("  Received full batch (%d), checking for more data...", fetchLimit)
+	s.mergeCounts(m.endpointCounts, counts)
+	m.totalProcessed += int64(len(ops))
+
+	batchTotal := sumCounts(counts)
+	log.Verbose("✓ Processed bundle %06d: %d operations (after dedup), %d new endpoints",
+		m.currentBundle, len(ops), batchTotal)
+
+	m.currentBundle++
+	return nil
+}
+
+func (s *Scanner) handleIncompleteBundle(ctx context.Context, ops []PLCOperation, m *ScanMetrics) error {
+	log.Info("→ Bundle %06d incomplete (%d ops), adding to mempool", m.currentBundle, len(ops))
+
+	if err := s.addToMempool(ctx, ops, m.endpointCounts); err != nil {
+		return err
+	}
+
+	s.finalizeMempool(ctx, m)
+	return fmt.Errorf("incomplete") // Signal end of processing
+}
+
+func (s *Scanner) finalizeMempool(ctx context.Context, m *ScanMetrics) {
+	if err := s.fillMempool(ctx, m); err != nil {
+		log.Error("Error filling mempool: %v", err)
+	}
+	if err := s.processMempool(ctx, m); err != nil {
+		log.Error("Error processing mempool: %v", err)
 	}
 }
 
-// addToMempool adds operations to mempool and processes them for endpoint discovery
-func (s *Scanner) addToMempool(ctx context.Context, operations []PLCOperation, newEndpointCounts map[string]int64) error {
-	mempoolOps := make([]storage.MempoolOperation, len(operations))
+func (s *Scanner) fillMempool(ctx context.Context, m *ScanMetrics) error {
+	const fetchLimit = 1000
 
-	for i, op := range operations {
-		// ✅ Store the original RawJSON directly
+	for {
+		count, err := s.db.GetMempoolCount(ctx)
+		if err != nil {
+			return err
+		}
+
+		if count >= BUNDLE_SIZE {
+			log.Info("✓ Mempool filled to %d operations (target: %d)", count, BUNDLE_SIZE)
+			return nil
+		}
+
+		log.Info("→ Mempool has %d/%d operations, fetching more from PLC directory...", count, BUNDLE_SIZE)
+
+		// ✅ Fix: Don't capture unused 'ops' variable
+		shouldContinue, err := s.fetchNextBatch(ctx, fetchLimit, m)
+		if err != nil {
+			return err
+		}
+
+		if !shouldContinue {
+			finalCount, _ := s.db.GetMempoolCount(ctx)
+			log.Info("→ Stopping fill, mempool has %d/%d operations", finalCount, BUNDLE_SIZE)
+			return nil
+		}
+	}
+}
+
+func (s *Scanner) fetchNextBatch(ctx context.Context, limit int, m *ScanMetrics) (bool, error) {
+	lastOp, err := s.db.GetLastMempoolOperation(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	var after string
+	if lastOp != nil {
+		after = lastOp.CreatedAt.Format(time.RFC3339Nano)
+		log.Verbose("  Using cursor: %s", after)
+	}
+
+	ops, err := s.client.Export(ctx, ExportOptions{Count: limit, After: after})
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch from PLC: %w", err)
+	}
+
+	fetchedCount := len(ops)
+	log.Verbose("  Fetched %d operations from PLC", fetchedCount)
+
+	if fetchedCount == 0 {
+		count, _ := s.db.GetMempoolCount(ctx)
+		log.Info("→ No more data available from PLC directory (mempool has %d/%d)", count, BUNDLE_SIZE)
+		return false, nil
+	}
+
+	// ✅ Fix: Handle errors from GetMempoolCount
+	beforeCount, err := s.db.GetMempoolCount(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if err := s.addToMempool(ctx, ops, m.endpointCounts); err != nil {
+		return false, err
+	}
+
+	afterCount, err := s.db.GetMempoolCount(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	m.totalProcessed += int64(fetchedCount)
+	log.Verbose("  Added %d new unique operations to mempool (%d were duplicates)",
+		afterCount-beforeCount, fetchedCount-(afterCount-beforeCount))
+
+	// Continue only if got full batch
+	shouldContinue := fetchedCount >= limit
+	if !shouldContinue {
+		log.Info("→ Received incomplete batch (%d/%d), caught up to latest data", fetchedCount, limit)
+	}
+
+	return shouldContinue, nil
+}
+
+func (s *Scanner) addToMempool(ctx context.Context, ops []PLCOperation, counts map[string]int64) error {
+	mempoolOps := make([]storage.MempoolOperation, len(ops))
+	for i, op := range ops {
 		mempoolOps[i] = storage.MempoolOperation{
 			DID:       op.DID,
-			Operation: string(op.RawJSON), // ✅ Use RawJSON instead of Marshal
+			Operation: string(op.RawJSON),
 			CID:       op.CID,
 			CreatedAt: op.CreatedAt,
 		}
 	}
 
-	// Add to mempool
 	if err := s.db.AddToMempool(ctx, mempoolOps); err != nil {
 		return err
 	}
 
-	// Process for endpoint discovery immediately
-	batchCounts, err := s.processBatch(ctx, operations)
-	for typ, count := range batchCounts {
-		newEndpointCounts[typ] += count
-	}
+	// Process for endpoint discovery
+	batchCounts, err := s.processBatch(ctx, ops)
+	s.mergeCounts(counts, batchCounts)
 	return err
 }
 
-// processMempoolRecursive checks mempool and creates bundles when >= 1000 ops
-func (s *Scanner) processMempoolRecursive(ctx context.Context, newEndpointCounts map[string]int64, currentBundle *int, totalProcessed *int64) error {
+func (s *Scanner) processMempool(ctx context.Context, m *ScanMetrics) error {
 	for {
-		// Check mempool size
 		count, err := s.db.GetMempoolCount(ctx)
 		if err != nil {
 			return err
@@ -308,171 +336,199 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newEndpointCounts
 
 		if count < BUNDLE_SIZE {
 			log.Info("Mempool has %d/%d operations, cannot create bundle yet", count, BUNDLE_SIZE)
-			break
+			return nil
 		}
 
 		log.Info("→ Creating bundle from mempool (%d operations available)...", count)
 
-		// Get first BUNDLE_SIZE operations ordered by timestamp
-		mempoolOps, err := s.db.GetMempoolOperations(ctx, BUNDLE_SIZE)
+		bundleNum, ops, err := s.createBundleFromMempool(ctx)
 		if err != nil {
 			return err
 		}
 
-		// Convert to PLCOperations and track IDs
-		operations := make([]PLCOperation, 0, BUNDLE_SIZE)
-		mempoolIDs := make([]int64, 0, BUNDLE_SIZE)
-		seenCIDs := make(map[string]bool)
+		// Process and update metrics
+		counts, _ := s.processBatch(ctx, ops)
+		s.mergeCounts(m.endpointCounts, counts)
+		m.currentBundle = bundleNum
 
-		for _, mop := range mempoolOps {
-			// ✅ Skip duplicates (shouldn't happen but safety check)
-			if seenCIDs[mop.CID] {
-				mempoolIDs = append(mempoolIDs, mop.ID) // Still delete it
-				continue
-			}
-			seenCIDs[mop.CID] = true
-
-			var op PLCOperation
-			json.Unmarshal([]byte(mop.Operation), &op)
-
-			// ✅ Restore RawJSON from database
-			op.RawJSON = []byte(mop.Operation)
-
-			operations = append(operations, op)
-			mempoolIDs = append(mempoolIDs, mop.ID)
-
-			if len(operations) >= BUNDLE_SIZE {
-				break
-			}
+		if err := s.updateCursorForBundle(ctx, bundleNum, m.totalProcessed); err != nil {
+			log.Error("Warning: failed to update cursor: %v", err)
 		}
-
-		// Final check
-		if len(operations) < BUNDLE_SIZE {
-			log.Error("⚠ Only got %d unique operations from mempool, need %d", len(operations), BUNDLE_SIZE)
-			break
-		}
-
-		// Create bundle from these operations
-		bundleNum, err := s.bundleManager.CreateBundleFromMempool(ctx, operations)
-		if err != nil {
-			return err
-		}
-
-		// Remove from mempool (only what we used)
-		if err := s.db.DeleteFromMempool(ctx, mempoolIDs[:len(operations)]); err != nil {
-			return err
-		}
-
-		// Process for PDS
-		batchCounts, _ := s.processBatch(ctx, operations)
-		for typ, count := range batchCounts {
-			newEndpointCounts[typ] += count
-		}
-
-		*currentBundle = bundleNum
-
-		// Update cursor
-		s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
-			Source:           "plc_directory",
-			LastBundleNumber: bundleNum,
-			LastScanTime:     time.Now(),
-			RecordsProcessed: *totalProcessed,
-		})
 
 		log.Info("✓ Created bundle %06d from mempool", bundleNum)
 	}
-
-	return nil
 }
 
-// processBatch processes operations for PDS discovery
-func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (map[string]int64, error) {
-	endpointCounts := make(map[string]int64)      // Track by type
-	seenInBatch := make(map[string]*PLCOperation) // key: "type:endpoint"
+func (s *Scanner) createBundleFromMempool(ctx context.Context) (int, []PLCOperation, error) {
+	mempoolOps, err := s.db.GetMempoolOperations(ctx, BUNDLE_SIZE)
+	if err != nil {
+		return 0, nil, err
+	}
 
-	for _, op := range operations {
+	ops, ids := s.deduplicateMempool(mempoolOps)
+	if len(ops) < BUNDLE_SIZE {
+		return 0, nil, fmt.Errorf("only got %d unique operations from mempool, need %d", len(ops), BUNDLE_SIZE)
+	}
+
+	bundleNum, err := s.bundleManager.CreateBundleFromMempool(ctx, ops)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	if err := s.db.DeleteFromMempool(ctx, ids[:len(ops)]); err != nil {
+		return 0, nil, err
+	}
+
+	return bundleNum, ops, nil
+}
+
+func (s *Scanner) deduplicateMempool(mempoolOps []storage.MempoolOperation) ([]PLCOperation, []int64) {
+	ops := make([]PLCOperation, 0, BUNDLE_SIZE)
+	ids := make([]int64, 0, BUNDLE_SIZE)
+	seenCIDs := make(map[string]bool)
+
+	for _, mop := range mempoolOps {
+		if seenCIDs[mop.CID] {
+			ids = append(ids, mop.ID)
+			continue
+		}
+		seenCIDs[mop.CID] = true
+
+		var op PLCOperation
+		json.Unmarshal([]byte(mop.Operation), &op)
+		op.RawJSON = []byte(mop.Operation)
+
+		ops = append(ops, op)
+		ids = append(ids, mop.ID)
+
+		if len(ops) >= BUNDLE_SIZE {
+			break
+		}
+	}
+
+	return ops, ids
+}
+
+func (s *Scanner) processBatch(ctx context.Context, ops []PLCOperation) (map[string]int64, error) {
+	counts := make(map[string]int64)
+	seen := make(map[string]*PLCOperation)
+
+	// Collect unique endpoints
+	for _, op := range ops {
 		if op.IsNullified() {
 			continue
 		}
-
-		endpoints := s.extractEndpointsFromOperation(op)
-		for _, ep := range endpoints {
+		for _, ep := range s.extractEndpointsFromOperation(op) {
 			key := fmt.Sprintf("%s:%s", ep.Type, ep.Endpoint)
-			if _, seen := seenInBatch[key]; !seen {
-				seenInBatch[key] = &op
+			if _, exists := seen[key]; !exists {
+				seen[key] = &op
 			}
 		}
 	}
 
-	for key, firstOp := range seenInBatch {
+	// Store new endpoints
+	for key, firstOp := range seen {
 		parts := strings.SplitN(key, ":", 2)
-		endpointType := parts[0]
-		endpoint := parts[1]
+		epType, endpoint := parts[0], parts[1]
 
-		exists, err := s.db.EndpointExists(ctx, endpoint, endpointType)
+		exists, err := s.db.EndpointExists(ctx, endpoint, epType)
 		if err != nil || exists {
 			continue
 		}
 
-		if err := s.db.UpsertEndpoint(ctx, &storage.Endpoint{
-			EndpointType: endpointType,
-			Endpoint:     endpoint,
-			DiscoveredAt: firstOp.CreatedAt,
-			LastChecked:  time.Time{},
-			Status:       storage.EndpointStatusUnknown,
-		}); err != nil {
-			log.Error("Error storing %s endpoint %s: %v", endpointType, stripansi.Strip(endpoint), err)
+		if err := s.storeEndpoint(ctx, epType, endpoint, firstOp.CreatedAt); err != nil {
+			log.Error("Error storing %s endpoint %s: %v", epType, stripansi.Strip(endpoint), err)
 			continue
 		}
 
-		log.Info("✓ Discovered new %s endpoint: %s", endpointType, stripansi.Strip(endpoint))
-		endpointCounts[endpointType]++
+		log.Info("✓ Discovered new %s endpoint: %s", epType, stripansi.Strip(endpoint))
+		counts[epType]++
 	}
 
-	return endpointCounts, nil
+	return counts, nil
 }
 
-// extractEndpointsFromOperation extracts ALL service endpoints
+func (s *Scanner) storeEndpoint(ctx context.Context, epType, endpoint string, discoveredAt time.Time) error {
+	return s.db.UpsertEndpoint(ctx, &storage.Endpoint{
+		EndpointType: epType,
+		Endpoint:     endpoint,
+		DiscoveredAt: discoveredAt,
+		LastChecked:  time.Time{},
+		Status:       storage.EndpointStatusUnknown,
+	})
+}
+
 func (s *Scanner) extractEndpointsFromOperation(op PLCOperation) []EndpointInfo {
 	var endpoints []EndpointInfo
 
-	if services, ok := op.Operation["services"].(map[string]interface{}); ok {
-		// Extract PDS
-		if atprotoPDS, ok := services["atproto_pds"].(map[string]interface{}); ok {
-			if endpoint, ok := atprotoPDS["endpoint"].(string); ok {
-				if svcType, ok := atprotoPDS["type"].(string); ok {
-					if svcType == "AtprotoPersonalDataServer" {
-						endpoints = append(endpoints, EndpointInfo{
-							Type:     "pds",
-							Endpoint: endpoint,
-						})
-					}
-				}
-			}
-		}
+	services, ok := op.Operation["services"].(map[string]interface{})
+	if !ok {
+		return endpoints
+	}
 
-		// Extract Labeler
-		if atprotoLabeler, ok := services["atproto_labeler"].(map[string]interface{}); ok {
-			if endpoint, ok := atprotoLabeler["endpoint"].(string); ok {
-				if svcType, ok := atprotoLabeler["type"].(string); ok {
-					if svcType == "AtprotoLabeler" {
-						endpoints = append(endpoints, EndpointInfo{
-							Type:     "labeler",
-							Endpoint: endpoint,
-						})
-					}
-				}
-			}
-		}
+	// Extract PDS
+	if ep := s.extractServiceEndpoint(services, "atproto_pds", "AtprotoPersonalDataServer", "pds"); ep != nil {
+		endpoints = append(endpoints, *ep)
+	}
 
-		// Add more service types as needed...
+	// Extract Labeler
+	if ep := s.extractServiceEndpoint(services, "atproto_labeler", "AtprotoLabeler", "labeler"); ep != nil {
+		endpoints = append(endpoints, *ep)
 	}
 
 	return endpoints
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && s[:len(substr)] == substr
+func (s *Scanner) extractServiceEndpoint(services map[string]interface{}, serviceKey, expectedType, resultType string) *EndpointInfo {
+	svc, ok := services[serviceKey].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	endpoint, hasEndpoint := svc["endpoint"].(string)
+	svcType, hasType := svc["type"].(string)
+
+	if hasEndpoint && hasType && svcType == expectedType {
+		return &EndpointInfo{
+			Type:     resultType,
+			Endpoint: endpoint,
+		}
+	}
+
+	return nil
+}
+
+func (s *Scanner) updateCursor(ctx context.Context, cursor *storage.ScanCursor, m *ScanMetrics) error {
+	return s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
+		Source:           "plc_directory",
+		LastBundleNumber: m.currentBundle - 1,
+		LastScanTime:     time.Now(),
+		RecordsProcessed: cursor.RecordsProcessed + m.totalProcessed,
+	})
+}
+
+func (s *Scanner) updateCursorForBundle(ctx context.Context, bundle int, totalProcessed int64) error {
+	return s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
+		Source:           "plc_directory",
+		LastBundleNumber: bundle,
+		LastScanTime:     time.Now(),
+		RecordsProcessed: totalProcessed,
+	})
+}
+
+// Helper functions
+func (s *Scanner) mergeCounts(dest, src map[string]int64) {
+	for k, v := range src {
+		dest[k] += v
+	}
+}
+
+func sumCounts(counts map[string]int64) int64 {
+	total := int64(0)
+	for _, v := range counts {
+		total += v
+	}
+	return total
 }
 
 func formatEndpointCounts(counts map[string]int64) string {
@@ -480,10 +536,7 @@ func formatEndpointCounts(counts map[string]int64) string {
 		return "0 new endpoints"
 	}
 
-	total := int64(0)
-	for _, count := range counts {
-		total += count
-	}
+	total := sumCounts(counts)
 
 	if len(counts) == 1 {
 		for typ, count := range counts {
@@ -491,7 +544,6 @@ func formatEndpointCounts(counts map[string]int64) string {
 		}
 	}
 
-	// Multiple types
 	parts := make([]string, 0, len(counts))
 	for typ, count := range counts {
 		parts = append(parts, fmt.Sprintf("%d %s", count, typ))
