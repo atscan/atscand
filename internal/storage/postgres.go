@@ -8,22 +8,26 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type PostgresDB struct {
-	db *sql.DB
+	db   *sql.DB
+	pool *pgxpool.Pool // Add this for COPY support
 }
 
 func NewPostgresDB(connString string) (*PostgresDB, error) {
-	db, err := sql.Open("postgres", connString)
+	// Open standard sql.DB (for compatibility)
+	db, err := sql.Open("pgx", connString)
 	if err != nil {
 		return nil, err
 	}
 
 	// Connection pool settings
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(10)
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	db.SetConnMaxIdleTime(2 * time.Minute)
 
@@ -32,10 +36,19 @@ func NewPostgresDB(connString string) (*PostgresDB, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	return &PostgresDB{db: db}, nil
+	// Also create pgx pool for COPY operations
+	pool, err := pgxpool.New(context.Background(), connString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pgx pool: %w", err)
+	}
+
+	return &PostgresDB{db: db, pool: pool}, nil
 }
 
 func (p *PostgresDB) Close() error {
+	if p.pool != nil {
+		p.pool.Close()
+	}
 	return p.db.Close()
 }
 
@@ -920,46 +933,43 @@ func (p *PostgresDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []st
 		return nil
 	}
 
-	tx, err := p.db.BeginTx(ctx, nil)
+	// Acquire a connection from the pool
+	conn, err := p.pool.Acquire(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer conn.Release()
+
+	// Start transaction
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
 
 	// Create temporary table
-	_, err = tx.ExecContext(ctx, `
+	_, err = tx.Exec(ctx, `
 		CREATE TEMP TABLE temp_dids (did TEXT PRIMARY KEY) ON COMMIT DROP
 	`)
 	if err != nil {
 		return err
 	}
 
-	// Bulk insert DIDs into temp table
-	batchSize := 5000
-	for i := 0; i < len(dids); i += batchSize {
-		end := i + batchSize
-		if end > len(dids) {
-			end = len(dids)
-		}
-		batch := dids[i:end]
-
-		placeholders := make([]string, len(batch))
-		args := make([]interface{}, len(batch))
-		for j, did := range batch {
-			placeholders[j] = fmt.Sprintf("($%d)", j+1)
-			args[j] = did
-		}
-
-		query := fmt.Sprintf(`INSERT INTO temp_dids VALUES %s ON CONFLICT DO NOTHING`,
-			strings.Join(placeholders, ","))
-
-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-			return err
-		}
+	// Use COPY for blazing fast bulk insert
+	_, err = tx.Conn().CopyFrom(
+		ctx,
+		pgx.Identifier{"temp_dids"},
+		[]string{"did"},
+		pgx.CopyFromSlice(len(dids), func(i int) ([]interface{}, error) {
+			return []interface{}{dids[i]}, nil
+		}),
+	)
+	if err != nil {
+		return err
 	}
 
 	// Step 1: Insert new DIDs
-	_, err = tx.ExecContext(ctx, `
+	_, err = tx.Exec(ctx, `
 		INSERT INTO dids (did, bundle_numbers, created_at)
 		SELECT td.did, $1::jsonb, CURRENT_TIMESTAMP
 		FROM temp_dids td
@@ -970,8 +980,8 @@ func (p *PostgresDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []st
 		return err
 	}
 
-	// Step 2: Update existing DIDs (only if bundle not already present)
-	_, err = tx.ExecContext(ctx, `
+	// Step 2: Update existing DIDs
+	_, err = tx.Exec(ctx, `
 		UPDATE dids
 		SET bundle_numbers = bundle_numbers || $1::jsonb
 		FROM temp_dids
@@ -983,7 +993,7 @@ func (p *PostgresDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []st
 		return err
 	}
 
-	return tx.Commit()
+	return tx.Commit(ctx)
 }
 
 func (p *PostgresDB) GetTotalDIDCount(ctx context.Context) (int64, error) {
