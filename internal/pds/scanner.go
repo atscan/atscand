@@ -158,10 +158,3 @@ func (s *Scanner) scanPDS(ctx context.Context, pdsID int64, endpoint string) *PD
 
 	return status
 }
-
-func (s *Scanner) statusString(available bool) string {
-	if available {
-		return "online"
-	}
-	return "offline"
-}
