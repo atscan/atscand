@@ -106,17 +106,19 @@ type PLCMetrics struct {
 
 // PLCBundle represents a cached bundle of PLC operations
 type PLCBundle struct {
-	BundleNumber   int
-	StartTime      time.Time
-	EndTime        time.Time
-	BoundaryCIDs   []string
-	DIDs           []string
-	Hash           string
-	CompressedHash string
-	CompressedSize int64
-	PrevBundleHash string
-	Compressed     bool
-	CreatedAt      time.Time
+	BundleNumber     int
+	StartTime        time.Time
+	EndTime          time.Time
+	BoundaryCIDs     []string
+	DIDs             []string
+	Hash             string
+	CompressedHash   string
+	CompressedSize   int64
+	UncompressedSize int64  // NEW: uncompressed size
+	Cursor           string // NEW: PLC cursor used to create this bundle
+	PrevBundleHash   string
+	Compressed       bool
+	CreatedAt        time.Time
 }
 
 // GetFilePath returns the computed file path for this bundle

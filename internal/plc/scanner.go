@@ -90,7 +90,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 
 	// Handle existing mempool first
 	if hasMempool, _ := s.hasSufficientMempool(ctx); hasMempool {
-		return s.handleMempoolOnly(ctx, metrics, cursor)
+		return s.handleMempoolOnly(ctx, metrics)
 	}
 
 	// Process bundles until incomplete or error
@@ -141,7 +141,7 @@ func (s *Scanner) hasSufficientMempool(ctx context.Context) (bool, error) {
 	return count > 0, nil
 }
 
-func (s *Scanner) handleMempoolOnly(ctx context.Context, m *ScanMetrics, cursor *storage.ScanCursor) error {
+func (s *Scanner) handleMempoolOnly(ctx context.Context, m *ScanMetrics) error {
 	count, _ := s.db.GetMempoolCount(ctx)
 	log.Info("→ Mempool has %d operations, continuing to fill it before fetching new bundles", count)
 
@@ -354,7 +354,8 @@ func (s *Scanner) processMempool(ctx context.Context, m *ScanMetrics) error {
 
 		log.Info("→ Creating bundle from mempool (%d operations available)...", count)
 
-		bundleNum, ops, err := s.createBundleFromMempool(ctx)
+		// Updated to receive 4 values instead of 3
+		bundleNum, ops, cursor, err := s.createBundleFromMempool(ctx)
 		if err != nil {
 			return err
 		}
@@ -366,38 +367,47 @@ func (s *Scanner) processMempool(ctx context.Context, m *ScanMetrics) error {
 		newEndpointsFound := sumCounts(m.endpointCounts) - countsBefore
 
 		m.totalProcessed += int64(len(ops))
-		m.newEndpoints += newEndpointsFound // NEW: Track new endpoints
+		m.newEndpoints += newEndpointsFound
 		m.currentBundle = bundleNum
 
 		if err := s.updateCursorForBundle(ctx, bundleNum, m.totalProcessed); err != nil {
 			log.Error("Warning: failed to update cursor: %v", err)
 		}
 
-		log.Info("✓ Created bundle %06d from mempool", bundleNum)
+		log.Info("✓ Created bundle %06d from mempool (cursor: %s)", bundleNum, cursor)
 	}
 }
 
-func (s *Scanner) createBundleFromMempool(ctx context.Context) (int, []PLCOperation, error) {
+func (s *Scanner) createBundleFromMempool(ctx context.Context) (int, []PLCOperation, string, error) {
 	mempoolOps, err := s.db.GetMempoolOperations(ctx, BUNDLE_SIZE)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 
 	ops, ids := s.deduplicateMempool(mempoolOps)
 	if len(ops) < BUNDLE_SIZE {
-		return 0, nil, fmt.Errorf("only got %d unique operations from mempool, need %d", len(ops), BUNDLE_SIZE)
+		return 0, nil, "", fmt.Errorf("only got %d unique operations from mempool, need %d", len(ops), BUNDLE_SIZE)
 	}
 
-	bundleNum, err := s.bundleManager.CreateBundleFromMempool(ctx, ops)
+	// Determine cursor from last bundle
+	cursor := ""
+	lastBundle, err := s.db.GetLastBundleNumber(ctx)
+	if err == nil && lastBundle > 0 {
+		if bundle, err := s.db.GetBundleByNumber(ctx, lastBundle); err == nil {
+			cursor = bundle.EndTime.Format(time.RFC3339Nano)
+		}
+	}
+
+	bundleNum, err := s.bundleManager.CreateBundleFromMempool(ctx, ops, cursor)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 
 	if err := s.db.DeleteFromMempool(ctx, ids[:len(ops)]); err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 
-	return bundleNum, ops, nil
+	return bundleNum, ops, cursor, nil
 }
 
 func (s *Scanner) deduplicateMempool(mempoolOps []storage.MempoolOperation) ([]PLCOperation, []int64) {

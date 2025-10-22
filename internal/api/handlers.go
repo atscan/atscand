@@ -84,6 +84,9 @@ func formatBundleResponse(bundle *storage.PLCBundle) map[string]interface{} {
 		"hash":              bundle.Hash,
 		"compressed_hash":   bundle.CompressedHash,
 		"compressed_size":   bundle.CompressedSize,
+		"uncompressed_size": bundle.UncompressedSize,
+		"compression_ratio": float64(bundle.UncompressedSize) / float64(bundle.CompressedSize),
+		"cursor":            bundle.Cursor,
 		"prev_bundle_hash":  bundle.PrevBundleHash,
 		"created_at":        bundle.CreatedAt,
 	}
@@ -423,9 +426,24 @@ func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	uniqueDIDCount, err := s.db.GetMempoolUniqueDIDCount(ctx)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	uncompressedSize, err := s.db.GetMempoolUncompressedSize(ctx)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	result := map[string]interface{}{
-		"operation_count":   count,
-		"can_create_bundle": count >= plc.BUNDLE_SIZE,
+		"operation_count":      count,
+		"unique_did_count":     uniqueDIDCount,
+		"uncompressed_size":    uncompressedSize,
+		"uncompressed_size_mb": float64(uncompressedSize) / 1024 / 1024,
+		"can_create_bundle":    count >= plc.BUNDLE_SIZE,
 	}
 
 	if count > 0 {

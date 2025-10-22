@@ -262,7 +262,8 @@ func (bm *BundleManager) loadFromFile(ctx context.Context, bundleNum int, bf *bu
 	if _, err := bm.db.GetBundleByNumber(ctx, bundleNum); err != nil {
 		bf.compressedHash = bm.hashFile(bf.path)
 		bf.uncompressedHash = bm.hash(bm.serializeJSONL(bf.operations))
-		bm.indexBundle(ctx, bundleNum, bf)
+		cursor := "" // Unknown for existing files
+		bm.indexBundle(ctx, bundleNum, bf, cursor)
 	}
 
 	return bf.operations, true, nil
@@ -276,15 +277,13 @@ func (bm *BundleManager) fetchFromPLC(ctx context.Context, bundleNum int, bf *bu
 
 	ops, isComplete := fetcher.fetchUntilComplete(ctx, BUNDLE_SIZE)
 
-	log.Info("  Collected %d unique operations after %d fetches (complete=%v)",
-		len(ops), fetcher.fetchCount, isComplete)
-
 	if isComplete {
 		bf.operations = ops
 		if err := bm.save(bf); err != nil {
 			log.Error("Warning: failed to save bundle: %v", err)
 		} else {
-			bm.indexBundle(ctx, bundleNum, bf)
+			cursor := afterTime // Store the cursor used
+			bm.indexBundle(ctx, bundleNum, bf, cursor)
 			log.Info("✓ Bundle %06d saved [%d ops, hash: %s...]",
 				bundleNum, len(ops), bf.uncompressedHash[:16])
 		}
@@ -328,7 +327,7 @@ func (bm *BundleManager) getBoundaryInfo(ctx context.Context, bundleNum int) (st
 
 // ===== BUNDLE INDEXING =====
 
-func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bundleFile) error {
+func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bundleFile, cursor string) error {
 	prevHash := ""
 	if bundleNum > 1 {
 		if prev, err := bm.db.GetBundleByNumber(ctx, bundleNum-1); err == nil {
@@ -337,19 +336,27 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 	}
 
 	dids := bm.extractUniqueDIDs(bf.operations)
-	fileSize := bm.getFileSize(bf.path)
+	compressedFileSize := bm.getFileSize(bf.path)
+
+	// Calculate uncompressed size
+	uncompressedSize := int64(0)
+	for _, op := range bf.operations {
+		uncompressedSize += int64(len(op.RawJSON)) + 1 // +1 for newline
+	}
 
 	bundle := &storage.PLCBundle{
-		BundleNumber:   bundleNum,
-		StartTime:      bf.operations[0].CreatedAt,
-		EndTime:        bf.operations[len(bf.operations)-1].CreatedAt,
-		DIDs:           dids,
-		Hash:           bf.uncompressedHash,
-		CompressedHash: bf.compressedHash,
-		CompressedSize: fileSize,
-		PrevBundleHash: prevHash,
-		Compressed:     true,
-		CreatedAt:      time.Now(),
+		BundleNumber:     bundleNum,
+		StartTime:        bf.operations[0].CreatedAt,
+		EndTime:          bf.operations[len(bf.operations)-1].CreatedAt,
+		DIDs:             dids,
+		Hash:             bf.uncompressedHash,
+		CompressedHash:   bf.compressedHash,
+		CompressedSize:   compressedFileSize,
+		UncompressedSize: uncompressedSize,
+		Cursor:           cursor,
+		PrevBundleHash:   prevHash,
+		Compressed:       true,
+		CreatedAt:        time.Now(),
 	}
 
 	return bm.db.CreateBundle(ctx, bundle)
@@ -370,7 +377,7 @@ func (bm *BundleManager) extractUniqueDIDs(ops []PLCOperation) []string {
 
 // ===== MEMPOOL BUNDLE CREATION =====
 
-func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations []PLCOperation) (int, error) {
+func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations []PLCOperation, cursor string) (int, error) {
 	if !bm.enabled {
 		return 0, fmt.Errorf("bundle manager disabled")
 	}
@@ -392,7 +399,7 @@ func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations
 		return 0, err
 	}
 
-	if err := bm.indexBundle(ctx, bundleNum, bf); err != nil {
+	if err := bm.indexBundle(ctx, bundleNum, bf, cursor); err != nil {
 		return 0, err
 	}
 
