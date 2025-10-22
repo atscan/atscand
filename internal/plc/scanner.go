@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/acarl005/stripansi"
 	"github.com/atscan/atscanner/internal/config"
 	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/storage"
@@ -407,11 +408,11 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 			LastChecked:  time.Time{},
 			Status:       storage.EndpointStatusUnknown,
 		}); err != nil {
-			log.Error("Error storing %s endpoint %s: %v", endpointType, endpoint, err)
+			log.Error("Error storing %s endpoint %s: %v", endpointType, stripansi.Strip(endpoint), err)
 			continue
 		}
 
-		log.Info("✓ Discovered new %s endpoint: %s", endpointType, endpoint)
+		log.Info("✓ Discovered new %s endpoint: %s", endpointType, stripansi.Strip(endpoint))
 		newEndpointCount++
 	}
 
