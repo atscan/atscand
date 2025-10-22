@@ -36,8 +36,8 @@ func main() {
 	// Initialize logger
 	log.Init(cfg.API.Verbose)
 
-	// Initialize database
-	db, err := storage.NewSQLiteDB(cfg.Database.Path)
+	// Initialize database using factory pattern
+	db, err := storage.NewDatabase(cfg.Database.Type, cfg.Database.Path)
 	if err != nil {
 		log.Fatal("Failed to initialize database: %v", err)
 	}
@@ -53,7 +53,7 @@ func main() {
 
 	// Initialize workers
 	plcScanner := plc.NewScanner(db, cfg.PLC)
-	defer plcScanner.Close() // Close scanner to cleanup cache
+	defer plcScanner.Close()
 
 	pdsScanner := pds.NewScanner(db, cfg.PDS)
 

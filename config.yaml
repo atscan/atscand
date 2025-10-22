@@ -1,6 +1,7 @@
 database:
-  path: "atscan.db"
-  type: "sqlite"
+  type: "postgres"  # or "sqlite"
+  path: "postgres://atscanner:Noor1kooz5eeFai9leZagh5ua5eihai4@localhost:5432/atscanner?sslmode=disable"
+  # For SQLite: path: "atscan.db"
 
 plc:
   directory_url: "https://plc.directory"

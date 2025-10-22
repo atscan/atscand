@@ -2,14 +2,27 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
+
+// NewDatabase creates a database connection based on type
+func NewDatabase(dbType, connectionString string) (Database, error) {
+	switch dbType {
+	case "sqlite":
+		return NewSQLiteDB(connectionString)
+	case "postgres", "postgresql":
+		return NewPostgresDB(connectionString)
+	default:
+		return nil, fmt.Errorf("unsupported database type: %s (supported: sqlite, postgres)", dbType)
+	}
+}
 
 type Database interface {
 	Close() error
 	Migrate() error
 
-	// Endpoint operations (renamed from PDS)
+	// Endpoint operations
 	UpsertEndpoint(ctx context.Context, endpoint *Endpoint) error
 	GetEndpoint(ctx context.Context, endpoint string, endpointType string) (*Endpoint, error)
 	GetEndpointByID(ctx context.Context, id int64) (*Endpoint, error)
