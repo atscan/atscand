@@ -28,7 +28,7 @@ type Database interface {
 	GetBundleByNumber(ctx context.Context, bundleNumber int) (*PLCBundle, error)
 	GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error)
 	GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error)
-	GetBundleStats(ctx context.Context) (int64, int64, error)
+	GetBundleStats(ctx context.Context) (count, compressedSize, uncompressedSize, lastBundle int64, err error)
 	GetLastBundleNumber(ctx context.Context) (int, error)
 	GetBundleForTimestamp(ctx context.Context, afterTime time.Time) (int, error)
 

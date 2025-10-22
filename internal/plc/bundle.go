@@ -506,9 +506,9 @@ func (bm *BundleManager) getFileSize(path string) int64 {
 	return 0
 }
 
-func (bm *BundleManager) GetStats(ctx context.Context) (int64, int64, error) {
+func (bm *BundleManager) GetStats(ctx context.Context) (int64, int64, int64, int64, error) {
 	if !bm.enabled {
-		return 0, 0, nil
+		return 0, 0, 0, 0, nil
 	}
 	return bm.db.GetBundleStats(ctx)
 }

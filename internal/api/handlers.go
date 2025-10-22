@@ -401,16 +401,22 @@ func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request) {
 	resp := newResponse(w)
 
-	count, size, err := s.db.GetBundleStats(r.Context())
+	count, compressedSize, uncompressedSize, lastBundle, err := s.db.GetBundleStats(r.Context())
 	if err != nil {
 		resp.error(err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	resp.json(map[string]interface{}{
-		"plc_bundle_count": count,
-		"total_size":       size,
-		"total_size_mb":    float64(size) / 1024 / 1024,
+		"plc_bundle_count":           count,
+		"last_bundle_number":         lastBundle,
+		"total_compressed_size":      compressedSize,
+		"total_compressed_size_mb":   float64(compressedSize) / 1024 / 1024,
+		"total_compressed_size_gb":   float64(compressedSize) / 1024 / 1024 / 1024,
+		"total_uncompressed_size":    uncompressedSize,
+		"total_uncompressed_size_mb": float64(uncompressedSize) / 1024 / 1024,
+		"total_uncompressed_size_gb": float64(uncompressedSize) / 1024 / 1024 / 1024,
+		"compression_ratio":          float64(uncompressedSize) / float64(compressedSize),
 	})
 }
 
@@ -679,17 +685,27 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 
 	firstBundle, _ := s.db.GetBundleByNumber(ctx, 1)
 	lastBundleData, _ := s.db.GetBundleByNumber(ctx, lastBundle)
-	count, size, _ := s.db.GetBundleStats(ctx)
+
+	// Updated to receive 5 values instead of 3
+	count, compressedSize, uncompressedSize, _, err := s.db.GetBundleStats(ctx)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	resp.json(map[string]interface{}{
-		"chain_length":     lastBundle,
-		"total_bundles":    count,
-		"total_size_mb":    float64(size) / 1024 / 1024,
-		"chain_start_time": firstBundle.StartTime,
-		"chain_end_time":   lastBundleData.EndTime,
-		"chain_head_hash":  lastBundleData.Hash,
-		"first_prev_hash":  firstBundle.PrevBundleHash,
-		"last_prev_hash":   lastBundleData.PrevBundleHash,
+		"chain_length":               lastBundle,
+		"total_bundles":              count,
+		"total_compressed_size":      compressedSize,
+		"total_compressed_size_mb":   float64(compressedSize) / 1024 / 1024,
+		"total_uncompressed_size":    uncompressedSize,
+		"total_uncompressed_size_mb": float64(uncompressedSize) / 1024 / 1024,
+		"compression_ratio":          float64(uncompressedSize) / float64(compressedSize),
+		"chain_start_time":           firstBundle.StartTime,
+		"chain_end_time":             lastBundleData.EndTime,
+		"chain_head_hash":            lastBundleData.Hash,
+		"first_prev_hash":            firstBundle.PrevBundleHash,
+		"last_prev_hash":             lastBundleData.PrevBundleHash,
 	})
 }
 
