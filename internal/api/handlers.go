@@ -194,8 +194,15 @@ func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get the last bundle number where this DID appeared
+	if len(didRecord.BundleNumbers) == 0 {
+		resp.error("DID has no bundle history", http.StatusInternalServerError)
+		return
+	}
+
+	lastBundleNum := didRecord.BundleNumbers[len(didRecord.BundleNumbers)-1]
+
 	// Load last bundle to get latest operation
-	lastBundleNum := didRecord.LastSeenBundle
 	ops, err := s.bundleManager.LoadBundleOperations(r.Context(), lastBundleNum)
 	if err != nil {
 		resp.error(fmt.Sprintf("failed to load bundle: %v", err), http.StatusInternalServerError)

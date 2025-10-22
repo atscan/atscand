@@ -9,8 +9,6 @@ import (
 // NewDatabase creates a database connection based on type
 func NewDatabase(dbType, connectionString string) (Database, error) {
 	switch dbType {
-	case "sqlite":
-		return NewSQLiteDB(connectionString)
 	case "postgres", "postgresql":
 		return NewPostgresDB(connectionString)
 	default:
@@ -61,8 +59,8 @@ type Database interface {
 	GetEndpointStats(ctx context.Context) (*EndpointStats, error)
 
 	// DID operations
-	UpsertDID(ctx context.Context, did *DIDRecord) error
+	UpsertDID(ctx context.Context, did string, bundleNum int) error
 	GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error)
-	AddBundleDIDs(ctx context.Context, bundleNum int, dids []string, firstSeenAt, lastSeenAt time.Time) error
+	AddBundleDIDs(ctx context.Context, bundleNum int, dids []string) error
 	GetTotalDIDCount(ctx context.Context) (int64, error)
 }

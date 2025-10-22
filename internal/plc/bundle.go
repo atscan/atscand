@@ -375,13 +375,15 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 		return err
 	}
 
+	start := time.Now()
 	// Index DIDs synchronously (will use bulk inserts for speed)
-	if err := bm.db.AddBundleDIDs(ctx, bundleNum, dids, firstSeenAt, lastSeenAt); err != nil {
+	if err := bm.db.AddBundleDIDs(ctx, bundleNum, dids); err != nil {
 		log.Error("Failed to index DIDs for bundle %06d: %v", bundleNum, err)
 		// Don't return error - bundle is already created
 		// DID indexing can be retried later
 	} else {
-		log.Verbose("✓ Indexed %d unique DIDs for bundle %06d", len(dids), bundleNum)
+		elapsed := time.Since(start)
+		log.Verbose("✓ Indexed %d unique DIDs for bundle %06d in %v", len(dids), bundleNum, elapsed)
 	}
 
 	return nil

@@ -126,21 +126,15 @@ func (p *PostgresDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_mempool_did ON plc_mempool(did);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_mempool_cid ON plc_mempool(cid);
 
-    CREATE TABLE IF NOT EXISTS dids (
-        did TEXT PRIMARY KEY,
-        first_seen_bundle INTEGER NOT NULL,
-        last_seen_bundle INTEGER NOT NULL,
-        bundle_numbers JSONB NOT NULL,
-        operation_count INTEGER DEFAULT 1,
-        first_seen_at TIMESTAMP NOT NULL,
-        last_seen_at TIMESTAMP NOT NULL
-    );
+	-- Minimal dids table
+	CREATE TABLE IF NOT EXISTS dids (
+		did TEXT PRIMARY KEY,
+		bundle_numbers JSONB NOT NULL DEFAULT '[]'::jsonb,
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
 
-    CREATE INDEX IF NOT EXISTS idx_dids_did ON dids(did);
-    CREATE INDEX IF NOT EXISTS idx_dids_last_bundle ON dids(last_seen_bundle);
-    CREATE INDEX IF NOT EXISTS idx_dids_first_seen ON dids(first_seen_at);
-    CREATE INDEX IF NOT EXISTS idx_dids_last_seen ON dids(last_seen_at);
-    CREATE INDEX IF NOT EXISTS idx_dids_bundle_numbers ON dids USING gin(bundle_numbers);
+	CREATE INDEX IF NOT EXISTS idx_dids_bundle_numbers ON dids USING gin(bundle_numbers);
+	CREATE INDEX IF NOT EXISTS idx_dids_created_at ON dids(created_at);
     `
 
 	_, err := p.db.Exec(schema)
@@ -881,42 +875,34 @@ func (p *PostgresDB) GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetric
 
 // ===== DID OPERATIONS =====
 
-func (p *PostgresDB) UpsertDID(ctx context.Context, did *DIDRecord) error {
-	bundleNumbersJSON, err := json.Marshal(did.BundleNumbers)
-	if err != nil {
-		return err
-	}
-
+func (p *PostgresDB) UpsertDID(ctx context.Context, did string, bundleNum int) error {
 	query := `
-        INSERT INTO dids (did, first_seen_bundle, last_seen_bundle, bundle_numbers, operation_count, first_seen_at, last_seen_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT(did) DO UPDATE SET
-            last_seen_bundle = EXCLUDED.last_seen_bundle,
-            bundle_numbers = EXCLUDED.bundle_numbers,
-            operation_count = EXCLUDED.operation_count,
-            last_seen_at = EXCLUDED.last_seen_at
-    `
-	_, err = p.db.ExecContext(ctx, query,
-		did.DID, did.FirstSeenBundle, did.LastSeenBundle,
-		bundleNumbersJSON, did.OperationCount,
-		did.FirstSeenAt, did.LastSeenAt)
+		INSERT INTO dids (did, bundle_numbers, created_at)
+		VALUES ($1, jsonb_build_array($2), CURRENT_TIMESTAMP)
+		ON CONFLICT(did) DO UPDATE SET
+			bundle_numbers = CASE 
+				WHEN dids.bundle_numbers ? $2::text THEN dids.bundle_numbers
+				ELSE dids.bundle_numbers || jsonb_build_array($2)
+			END
+	`
+	_, err := p.db.ExecContext(ctx, query, did, bundleNum)
 	return err
 }
 
 func (p *PostgresDB) GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error) {
 	query := `
-        SELECT did, first_seen_bundle, last_seen_bundle, bundle_numbers, operation_count, first_seen_at, last_seen_at
-        FROM dids
-        WHERE did = $1
-    `
+		SELECT did, bundle_numbers, created_at
+		FROM dids
+		WHERE did = $1
+	`
 
 	var record DIDRecord
 	var bundleNumbersJSON []byte
 
 	err := p.db.QueryRowContext(ctx, query, did).Scan(
-		&record.DID, &record.FirstSeenBundle, &record.LastSeenBundle,
-		&bundleNumbersJSON, &record.OperationCount,
-		&record.FirstSeenAt, &record.LastSeenAt,
+		&record.DID,
+		&bundleNumbersJSON,
+		&record.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -929,7 +915,7 @@ func (p *PostgresDB) GetDIDRecord(ctx context.Context, did string) (*DIDRecord, 
 	return &record, nil
 }
 
-func (p *PostgresDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []string, firstSeenAt, lastSeenAt time.Time) error {
+func (p *PostgresDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []string) error {
 	if len(dids) == 0 {
 		return nil
 	}
@@ -940,52 +926,16 @@ func (p *PostgresDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []st
 	}
 	defer tx.Rollback()
 
-	// Get existing DIDs
-	existingDIDs := make(map[string][]int)
-	if len(dids) > 0 {
-		placeholders := make([]string, len(dids))
-		args := make([]interface{}, len(dids))
-		for i, did := range dids {
-			placeholders[i] = fmt.Sprintf("$%d", i+1)
-			args[i] = did
-		}
-
-		query := fmt.Sprintf(`
-			SELECT did, bundle_numbers
-			FROM dids
-			WHERE did IN (%s)
-		`, strings.Join(placeholders, ","))
-
-		rows, err := tx.QueryContext(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-
-		for rows.Next() {
-			var did string
-			var bundleNumbersJSON []byte
-			if err := rows.Scan(&did, &bundleNumbersJSON); err != nil {
-				rows.Close()
-				return err
-			}
-
-			var bundles []int
-			if err := json.Unmarshal(bundleNumbersJSON, &bundles); err != nil {
-				rows.Close()
-				return err
-			}
-
-			existingDIDs[did] = bundles
-		}
-		rows.Close()
-
-		if err := rows.Err(); err != nil {
-			return err
-		}
+	// Create temporary table
+	_, err = tx.ExecContext(ctx, `
+		CREATE TEMP TABLE temp_dids (did TEXT PRIMARY KEY) ON COMMIT DROP
+	`)
+	if err != nil {
+		return err
 	}
 
-	// Batch upsert
-	batchSize := 500
+	// Bulk insert DIDs into temp table
+	batchSize := 5000
 	for i := 0; i < len(dids); i += batchSize {
 		end := i + batchSize
 		if end > len(dids) {
@@ -993,65 +943,47 @@ func (p *PostgresDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []st
 		}
 		batch := dids[i:end]
 
-		if err := p.bulkUpsertDIDsSimplified(ctx, tx, bundleNum, batch, existingDIDs, firstSeenAt, lastSeenAt); err != nil {
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, len(batch))
+		for j, did := range batch {
+			placeholders[j] = fmt.Sprintf("($%d)", j+1)
+			args[j] = did
+		}
+
+		query := fmt.Sprintf(`INSERT INTO temp_dids VALUES %s ON CONFLICT DO NOTHING`,
+			strings.Join(placeholders, ","))
+
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return err
 		}
 	}
 
+	// Step 1: Insert new DIDs
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO dids (did, bundle_numbers, created_at)
+		SELECT td.did, $1::jsonb, CURRENT_TIMESTAMP
+		FROM temp_dids td
+		WHERE NOT EXISTS (SELECT 1 FROM dids WHERE dids.did = td.did)
+	`, fmt.Sprintf("[%d]", bundleNum))
+
+	if err != nil {
+		return err
+	}
+
+	// Step 2: Update existing DIDs (only if bundle not already present)
+	_, err = tx.ExecContext(ctx, `
+		UPDATE dids
+		SET bundle_numbers = bundle_numbers || $1::jsonb
+		FROM temp_dids
+		WHERE dids.did = temp_dids.did
+		AND NOT (bundle_numbers @> $1::jsonb)
+	`, fmt.Sprintf("[%d]", bundleNum))
+
+	if err != nil {
+		return err
+	}
+
 	return tx.Commit()
-}
-
-func (p *PostgresDB) bulkUpsertDIDsSimplified(ctx context.Context, tx *sql.Tx, bundleNum int, dids []string, existingDIDs map[string][]int, firstSeenAt, lastSeenAt time.Time) error {
-	if len(dids) == 0 {
-		return nil
-	}
-
-	var values []string
-	var args []interface{}
-	argIdx := 1
-
-	for _, did := range dids {
-		bundles := existingDIDs[did]
-
-		alreadyHas := false
-		for _, b := range bundles {
-			if b == bundleNum {
-				alreadyHas = true
-				break
-			}
-		}
-
-		if !alreadyHas {
-			bundles = append(bundles, bundleNum)
-		}
-
-		bundleNumbersJSON, _ := json.Marshal(bundles)
-
-		if len(existingDIDs[did]) > 0 {
-			values = append(values, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d)",
-				argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6))
-			args = append(args, did, bundleNum, bundleNum, bundleNumbersJSON, len(bundles), firstSeenAt, lastSeenAt)
-			argIdx += 7
-		} else {
-			values = append(values, fmt.Sprintf("($%d, $%d, $%d, $%d, 1, $%d, $%d)",
-				argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5))
-			args = append(args, did, bundleNum, bundleNum, bundleNumbersJSON, firstSeenAt, lastSeenAt)
-			argIdx += 6
-		}
-	}
-
-	query := fmt.Sprintf(`
-		INSERT INTO dids (did, first_seen_bundle, last_seen_bundle, bundle_numbers, operation_count, first_seen_at, last_seen_at)
-		VALUES %s
-		ON CONFLICT(did) DO UPDATE SET
-			last_seen_bundle = EXCLUDED.last_seen_bundle,
-			bundle_numbers = EXCLUDED.bundle_numbers,
-			operation_count = EXCLUDED.operation_count,
-			last_seen_at = EXCLUDED.last_seen_at
-	`, strings.Join(values, ","))
-
-	_, err := tx.ExecContext(ctx, query, args...)
-	return err
 }
 
 func (p *PostgresDB) GetTotalDIDCount(ctx context.Context) (int64, error) {

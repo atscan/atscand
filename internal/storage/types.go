@@ -153,11 +153,7 @@ type ScanCursor struct {
 
 // DIDRecord represents a DID entry in the database
 type DIDRecord struct {
-	DID             string
-	FirstSeenBundle int
-	LastSeenBundle  int
-	BundleNumbers   []int // Bundle numbers where this DID appears
-	OperationCount  int
-	FirstSeenAt     time.Time
-	LastSeenAt      time.Time
+	DID           string    `json:"did"`
+	BundleNumbers []int     `json:"bundle_numbers"`
+	CreatedAt     time.Time `json:"created_at"`
 }
