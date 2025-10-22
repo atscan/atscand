@@ -21,9 +21,21 @@ func NewSQLiteDB(path string) (*SQLiteDB, error) {
 		return nil, err
 	}
 
-	// Enable WAL mode for better concurrency
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		return nil, err
+	// Performance optimizations
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",  // Faster than FULL, still safe with WAL
+		"PRAGMA cache_size=-64000",   // 64MB cache (negative = KB)
+		"PRAGMA temp_store=MEMORY",   // Store temp tables in memory
+		"PRAGMA mmap_size=268435456", // 256MB memory-mapped I/O
+		"PRAGMA page_size=4096",      // Optimal page size
+		"PRAGMA busy_timeout=5000",   // Wait up to 5s for locks
+	}
+
+	for _, pragma := range pragmas {
+		if _, err := db.Exec(pragma); err != nil {
+			return nil, fmt.Errorf("failed to set pragma %s: %w", pragma, err)
+		}
 	}
 
 	return &SQLiteDB{db: db}, nil
