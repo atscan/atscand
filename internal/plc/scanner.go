@@ -69,7 +69,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 	}
 
 	totalProcessed := int64(0)
-	newPDSCount := int64(0)
+	newEndpointCounts := make(map[string]int64) // ✅ Changed from newPDSCount
 
 	// ✅ CHECK MEMPOOL FIRST - if it has data, continue filling it instead of fetching new bundle
 	mempoolCount, err := s.db.GetMempoolCount(ctx)
@@ -81,18 +81,19 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		log.Info("→ Mempool has %d operations, continuing to fill it before fetching new bundles", mempoolCount)
 
 		// Fill mempool until we have 10,000
-		if err := s.fillMempoolToSize(ctx, &newPDSCount, &totalProcessed); err != nil {
+		if err := s.fillMempoolToSize(ctx, newEndpointCounts, &totalProcessed); err != nil {
 			log.Error("Error filling mempool: %v", err)
 			return err
 		}
 
 		// Try to create bundles from mempool
-		if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
+		if err := s.processMempoolRecursive(ctx, newEndpointCounts, &currentBundle, &totalProcessed); err != nil {
 			log.Error("Error processing mempool: %v", err)
 		}
 
-		log.Info("PLC scan completed: %d operations, %d new PDS servers in %v",
-			totalProcessed, newPDSCount, time.Since(startTime))
+		endpointSummary := formatEndpointCounts(newEndpointCounts)
+		log.Info("PLC scan completed: %d operations, %s in %v",
+			totalProcessed, endpointSummary, time.Since(startTime))
 		return nil
 	}
 
@@ -122,7 +123,7 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			if currentBundle > 1 {
 				log.Info("→ Reached end of available data")
 				// Try mempool processing
-				if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
+				if err := s.processMempoolRecursive(ctx, newEndpointCounts, &currentBundle, &totalProcessed); err != nil {
 					log.Error("Error processing mempool: %v", err)
 				}
 			}
@@ -131,16 +132,22 @@ func (s *Scanner) Scan(ctx context.Context) error {
 
 		if isComplete {
 			// Complete bundle
-			batchNewPDS, err := s.processBatch(ctx, operations)
+			batchCounts, err := s.processBatch(ctx, operations)
 			if err != nil {
 				log.Error("Error processing bundle: %v", err)
 			}
-
-			newPDSCount += batchNewPDS
+			for typ, count := range batchCounts {
+				newEndpointCounts[typ] += count
+			}
 			totalProcessed += int64(len(operations))
 
-			log.Verbose("✓ Processed bundle %06d: %d operations (after dedup), %d new PDS",
-				currentBundle, len(operations), batchNewPDS)
+			// Calculate total for this batch for logging
+			batchTotal := int64(0)
+			for _, count := range batchCounts {
+				batchTotal += count
+			}
+			log.Verbose("✓ Processed bundle %06d: %d operations (after dedup), %d new endpoints",
+				currentBundle, len(operations), batchTotal)
 
 			// Update cursor
 			if err := s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
@@ -157,17 +164,17 @@ func (s *Scanner) Scan(ctx context.Context) error {
 			// Incomplete bundle - we've reached the end of available data
 			log.Info("→ Bundle %06d incomplete (%d ops), adding to mempool", currentBundle, len(operations))
 
-			if err := s.addToMempool(ctx, operations); err != nil {
+			if err := s.addToMempool(ctx, operations, newEndpointCounts); err != nil {
 				log.Error("Error adding to mempool: %v", err)
 			}
 
 			// ✅ Now fill mempool to 10,000
-			if err := s.fillMempoolToSize(ctx, &newPDSCount, &totalProcessed); err != nil {
+			if err := s.fillMempoolToSize(ctx, newEndpointCounts, &totalProcessed); err != nil {
 				log.Error("Error filling mempool: %v", err)
 			}
 
 			// Process mempool
-			if err := s.processMempoolRecursive(ctx, &newPDSCount, &currentBundle, &totalProcessed); err != nil {
+			if err := s.processMempoolRecursive(ctx, newEndpointCounts, &currentBundle, &totalProcessed); err != nil {
 				log.Error("Error processing mempool: %v", err)
 			}
 
@@ -175,13 +182,14 @@ func (s *Scanner) Scan(ctx context.Context) error {
 		}
 	}
 
-	log.Info("PLC scan completed: %d operations, %d new PDS servers in %v",
-		totalProcessed, newPDSCount, time.Since(startTime))
+	endpointSummary := formatEndpointCounts(newEndpointCounts)
+	log.Info("PLC scan completed: %d operations, %s in %v",
+		totalProcessed, endpointSummary, time.Since(startTime))
 
 	return nil
 }
 
-func (s *Scanner) fillMempoolToSize(ctx context.Context, newPDSCount *int64, totalProcessed *int64) error {
+func (s *Scanner) fillMempoolToSize(ctx context.Context, newEndpointCounts map[string]int64, totalProcessed *int64) error {
 	const fetchLimit = 1000 // PLC directory limit
 
 	for {
@@ -228,7 +236,7 @@ func (s *Scanner) fillMempoolToSize(ctx context.Context, newPDSCount *int64, tot
 		}
 
 		// Add to mempool (with duplicate checking)
-		if err := s.addToMempool(ctx, operations); err != nil {
+		if err := s.addToMempool(ctx, operations, newEndpointCounts); err != nil {
 			return err
 		}
 
@@ -260,8 +268,8 @@ func (s *Scanner) fillMempoolToSize(ctx context.Context, newPDSCount *int64, tot
 	}
 }
 
-// addToMempool adds operations to mempool and processes them for PDS discovery
-func (s *Scanner) addToMempool(ctx context.Context, operations []PLCOperation) error {
+// addToMempool adds operations to mempool and processes them for endpoint discovery
+func (s *Scanner) addToMempool(ctx context.Context, operations []PLCOperation, newEndpointCounts map[string]int64) error {
 	mempoolOps := make([]storage.MempoolOperation, len(operations))
 
 	for i, op := range operations {
@@ -279,13 +287,16 @@ func (s *Scanner) addToMempool(ctx context.Context, operations []PLCOperation) e
 		return err
 	}
 
-	// Process for PDS discovery immediately
-	_, err := s.processBatch(ctx, operations)
+	// Process for endpoint discovery immediately
+	batchCounts, err := s.processBatch(ctx, operations)
+	for typ, count := range batchCounts {
+		newEndpointCounts[typ] += count
+	}
 	return err
 }
 
 // processMempoolRecursive checks mempool and creates bundles when >= 1000 ops
-func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int64, currentBundle *int, totalProcessed *int64) error {
+func (s *Scanner) processMempoolRecursive(ctx context.Context, newEndpointCounts map[string]int64, currentBundle *int, totalProcessed *int64) error {
 	for {
 		// Check mempool size
 		count, err := s.db.GetMempoolCount(ctx)
@@ -353,8 +364,10 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 		}
 
 		// Process for PDS
-		batchNewPDS, _ := s.processBatch(ctx, operations)
-		*newPDSCount += batchNewPDS
+		batchCounts, _ := s.processBatch(ctx, operations)
+		for typ, count := range batchCounts {
+			newEndpointCounts[typ] += count
+		}
 
 		*currentBundle = bundleNum
 
@@ -373,8 +386,8 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 }
 
 // processBatch processes operations for PDS discovery
-func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (int64, error) {
-	newEndpointCount := int64(0)
+func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (map[string]int64, error) {
+	endpointCounts := make(map[string]int64)      // Track by type
 	seenInBatch := make(map[string]*PLCOperation) // key: "type:endpoint"
 
 	for _, op := range operations {
@@ -413,10 +426,10 @@ func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (
 		}
 
 		log.Info("✓ Discovered new %s endpoint: %s", endpointType, stripansi.Strip(endpoint))
-		newEndpointCount++
+		endpointCounts[endpointType]++
 	}
 
-	return newEndpointCount, nil
+	return endpointCounts, nil
 }
 
 // extractEndpointsFromOperation extracts ALL service endpoints
@@ -460,4 +473,28 @@ func (s *Scanner) extractEndpointsFromOperation(op PLCOperation) []EndpointInfo 
 
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && s[:len(substr)] == substr
+}
+
+func formatEndpointCounts(counts map[string]int64) string {
+	if len(counts) == 0 {
+		return "0 new endpoints"
+	}
+
+	total := int64(0)
+	for _, count := range counts {
+		total += count
+	}
+
+	if len(counts) == 1 {
+		for typ, count := range counts {
+			return fmt.Sprintf("%d new %s endpoint(s)", count, typ)
+		}
+	}
+
+	// Multiple types
+	parts := make([]string, 0, len(counts))
+	for typ, count := range counts {
+		parts = append(parts, fmt.Sprintf("%d %s", count, typ))
+	}
+	return fmt.Sprintf("%d new endpoints (%s)", total, strings.Join(parts, ", "))
 }
