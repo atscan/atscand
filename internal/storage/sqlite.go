@@ -421,7 +421,8 @@ func (s *SQLiteDB) GetMempoolUncompressedSize(ctx context.Context) (int64, error
 func (s *SQLiteDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error) {
 	query := `
         SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, 
-               compressed_size, uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
+               compressed_size, uncompressed_size, cumulative_compressed_size, 
+               cumulative_uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
         FROM plc_bundles
         ORDER BY bundle_number DESC
         LIMIT ?
@@ -440,7 +441,8 @@ func (s *SQLiteDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, err
 func (s *SQLiteDB) GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error) {
 	query := `
         SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, 
-               compressed_size, uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
+               compressed_size, uncompressed_size, cumulative_compressed_size, 
+               cumulative_uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
         FROM plc_bundles
         WHERE EXISTS (
             SELECT 1 FROM json_each(dids) 
@@ -466,7 +468,8 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 	if afterTime.IsZero() {
 		query = `
             SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, 
-                   compressed_size, uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
+                   compressed_size, uncompressed_size, cumulative_compressed_size, 
+                   cumulative_uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
             FROM plc_bundles
             ORDER BY start_time ASC
             LIMIT 1
@@ -475,7 +478,8 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 	} else {
 		query = `
             SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, 
-                   compressed_size, uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
+                   compressed_size, uncompressed_size, cumulative_compressed_size, 
+                   cumulative_uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
             FROM plc_bundles
             WHERE start_time >= ?
             ORDER BY start_time ASC
@@ -498,6 +502,8 @@ func (s *SQLiteDB) GetBundle(ctx context.Context, afterTime time.Time) (*PLCBund
 		&bundle.CompressedHash,
 		&bundle.CompressedSize,
 		&bundle.UncompressedSize,
+		&bundle.CumulativeCompressedSize,
+		&bundle.CumulativeUncompressedSize,
 		&cursor,
 		&prevHash,
 		&bundle.Compressed,
