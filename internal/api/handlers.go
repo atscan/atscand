@@ -1,8 +1,7 @@
 package api
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,232 +16,66 @@ import (
 	"github.com/atscan/atscanner/internal/plc"
 	"github.com/atscan/atscanner/internal/storage"
 	"github.com/gorilla/mux"
-	"github.com/klauspost/compress/zstd"
 )
 
-// ====================
-// Endpoint Handlers (new)
-// ====================
+// ===== RESPONSE HELPERS =====
 
-func (s *Server) handleGetEndpoints(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	filter := &storage.EndpointFilter{}
-
-	if typ := r.URL.Query().Get("type"); typ != "" {
-		filter.Type = typ
-	}
-
-	if status := r.URL.Query().Get("status"); status != "" {
-		filter.Status = status
-	}
-
-	if minUserCount := r.URL.Query().Get("min_user_count"); minUserCount != "" {
-		if count, err := strconv.ParseInt(minUserCount, 10, 64); err == nil {
-			filter.MinUserCount = count
-		}
-	}
-
-	if limit := r.URL.Query().Get("limit"); limit != "" {
-		if l, err := strconv.Atoi(limit); err == nil {
-			filter.Limit = l
-		}
-	}
-
-	if offset := r.URL.Query().Get("offset"); offset != "" {
-		if o, err := strconv.Atoi(offset); err == nil {
-			filter.Offset = o
-		}
-	}
-
-	endpoints, err := s.db.GetEndpoints(ctx, filter)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Convert status codes to strings for API
-	response := make([]map[string]interface{}, len(endpoints))
-	for i, ep := range endpoints {
-		response[i] = map[string]interface{}{
-			"id":            ep.ID,
-			"endpoint_type": ep.EndpointType,
-			"endpoint":      ep.Endpoint,
-			"discovered_at": ep.DiscoveredAt,
-			"last_checked":  ep.LastChecked,
-			"status":        statusToString(ep.Status),
-			"user_count":    ep.UserCount,
-		}
-	}
-
-	respondJSON(w, response)
+type response struct {
+	w http.ResponseWriter
 }
 
-func (s *Server) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+func newResponse(w http.ResponseWriter) *response {
+	return &response{w: w}
+}
+
+func (r *response) json(data interface{}) {
+	r.w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(r.w).Encode(data)
+}
+
+func (r *response) error(msg string, code int) {
+	http.Error(r.w, msg, code)
+}
+
+func (r *response) bundleHeaders(bundle *storage.PLCBundle) {
+	r.w.Header().Set("X-Bundle-Number", fmt.Sprintf("%d", bundle.BundleNumber))
+	r.w.Header().Set("X-Bundle-Hash", bundle.Hash)
+	r.w.Header().Set("X-Bundle-Compressed-Hash", bundle.CompressedHash)
+	r.w.Header().Set("X-Bundle-Start-Time", bundle.StartTime.Format(time.RFC3339Nano))
+	r.w.Header().Set("X-Bundle-End-Time", bundle.EndTime.Format(time.RFC3339Nano))
+	r.w.Header().Set("X-Bundle-Operation-Count", fmt.Sprintf("%d", plc.BUNDLE_SIZE))
+	r.w.Header().Set("X-Bundle-DID-Count", fmt.Sprintf("%d", len(bundle.DIDs)))
+}
+
+// ===== REQUEST HELPERS =====
+
+func getBundleNumber(r *http.Request) (int, error) {
 	vars := mux.Vars(r)
-	endpoint := vars["endpoint"]
-
-	// Get type from query param, default to "pds" for backward compatibility
-	endpointType := r.URL.Query().Get("type")
-	if endpointType == "" {
-		endpointType = "pds"
-	}
-
-	ep, err := s.db.GetEndpoint(ctx, endpoint, endpointType)
-	if err != nil {
-		http.Error(w, "Endpoint not found", http.StatusNotFound)
-		return
-	}
-
-	// Get recent scans
-	scans, _ := s.db.GetEndpointScans(ctx, ep.ID, 10)
-
-	response := map[string]interface{}{
-		"id":            ep.ID,
-		"endpoint_type": ep.EndpointType,
-		"endpoint":      ep.Endpoint,
-		"discovered_at": ep.DiscoveredAt,
-		"last_checked":  ep.LastChecked,
-		"status":        statusToString(ep.Status),
-		"user_count":    ep.UserCount,
-		"recent_scans":  scans,
-	}
-
-	respondJSON(w, response)
+	return strconv.Atoi(vars["number"])
 }
 
-func (s *Server) handleGetEndpointStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	stats, err := s.db.GetEndpointStats(ctx)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	respondJSON(w, stats)
-}
-
-// ====================
-// DID Handlers
-// ====================
-
-func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	vars := mux.Vars(r)
-	did := vars["did"]
-
-	bundles, err := s.db.GetBundlesForDID(ctx, did)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if len(bundles) == 0 {
-		http.Error(w, "DID not found in bundles", http.StatusNotFound)
-		return
-	}
-
-	lastBundle := bundles[len(bundles)-1]
-
-	// Compute file path
-	filePath := filepath.Join(s.plcBundleDir, fmt.Sprintf("%06d.jsonl.zst", lastBundle.BundleNumber))
-
-	operations, err := s.loadBundleOperations(filePath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to load bundle: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Find latest operation for this DID
-	var latestOp *plc.PLCOperation
-	for i := len(operations) - 1; i >= 0; i-- {
-		if operations[i].DID == did {
-			latestOp = &operations[i]
-			break
+func getQueryInt(r *http.Request, key string, defaultVal int) int {
+	if val := r.URL.Query().Get(key); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			return parsed
 		}
 	}
-
-	if latestOp == nil {
-		http.Error(w, "DID operation not found", http.StatusNotFound)
-		return
-	}
-
-	respondJSON(w, latestOp)
+	return defaultVal
 }
 
-func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	vars := mux.Vars(r)
-	did := vars["did"]
-
-	bundles, err := s.db.GetBundlesForDID(ctx, did)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if len(bundles) == 0 {
-		http.Error(w, "DID not found in bundles", http.StatusNotFound)
-		return
-	}
-
-	var allOperations []plc.DIDHistoryEntry
-	var currentOp *plc.PLCOperation
-
-	for _, bundle := range bundles {
-		// Compute file path
-		filePath := filepath.Join(s.plcBundleDir, fmt.Sprintf("%06d.jsonl.zst", bundle.BundleNumber))
-
-		operations, err := s.loadBundleOperations(filePath)
-		if err != nil {
-			log.Error("Warning: failed to load bundle: %v", err)
-			continue
-		}
-
-		for _, op := range operations {
-			if op.DID == did {
-				entry := plc.DIDHistoryEntry{
-					Operation: op,
-					PLCBundle: fmt.Sprintf("%06d", bundle.BundleNumber),
-				}
-				allOperations = append(allOperations, entry)
-				currentOp = &op
-			}
+func getQueryInt64(r *http.Request, key string, defaultVal int64) int64 {
+	if val := r.URL.Query().Get(key); val != "" {
+		if parsed, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return parsed
 		}
 	}
-
-	history := plc.DIDHistory{
-		DID:        did,
-		Current:    currentOp,
-		Operations: allOperations,
-	}
-
-	respondJSON(w, history)
+	return defaultVal
 }
 
-// ====================
-// PLC Bundle Handlers
-// ====================
+// ===== FORMATTING HELPERS =====
 
-func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	vars := mux.Vars(r)
-
-	bundleNumber, err := strconv.Atoi(vars["number"])
-	if err != nil {
-		http.Error(w, "invalid bundle number", http.StatusBadRequest)
-		return
-	}
-
-	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
-	if err != nil {
-		http.Error(w, "bundle not found", http.StatusNotFound)
-		return
-	}
-
-	response := map[string]interface{}{
+func formatBundleResponse(bundle *storage.PLCBundle) map[string]interface{} {
+	return map[string]interface{}{
 		"plc_bundle_number": bundle.BundleNumber,
 		"start_time":        bundle.StartTime,
 		"end_time":          bundle.EndTime,
@@ -254,27 +87,208 @@ func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 		"prev_bundle_hash":  bundle.PrevBundleHash,
 		"created_at":        bundle.CreatedAt,
 	}
+}
 
-	respondJSON(w, response)
+func formatEndpointResponse(ep *storage.Endpoint) map[string]interface{} {
+	return map[string]interface{}{
+		"id":            ep.ID,
+		"endpoint_type": ep.EndpointType,
+		"endpoint":      ep.Endpoint,
+		"discovered_at": ep.DiscoveredAt,
+		"last_checked":  ep.LastChecked,
+		"status":        statusToString(ep.Status),
+		"user_count":    ep.UserCount,
+	}
+}
+
+func statusToString(status int) string {
+	switch status {
+	case storage.EndpointStatusOnline:
+		return "online"
+	case storage.EndpointStatusOffline:
+		return "offline"
+	default:
+		return "unknown"
+	}
+}
+
+// ===== ENDPOINT HANDLERS =====
+
+func (s *Server) handleGetEndpoints(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	filter := &storage.EndpointFilter{
+		Type:         r.URL.Query().Get("type"),
+		Status:       r.URL.Query().Get("status"),
+		MinUserCount: getQueryInt64(r, "min_user_count", 0),
+		Limit:        getQueryInt(r, "limit", 0),
+		Offset:       getQueryInt(r, "offset", 0),
+	}
+
+	endpoints, err := s.db.GetEndpoints(r.Context(), filter)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := make([]map[string]interface{}, len(endpoints))
+	for i, ep := range endpoints {
+		response[i] = formatEndpointResponse(ep)
+	}
+
+	resp.json(response)
+}
+
+func (s *Server) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	endpoint := vars["endpoint"]
+	endpointType := r.URL.Query().Get("type")
+	if endpointType == "" {
+		endpointType = "pds"
+	}
+
+	ep, err := s.db.GetEndpoint(r.Context(), endpoint, endpointType)
+	if err != nil {
+		resp.error("Endpoint not found", http.StatusNotFound)
+		return
+	}
+
+	scans, _ := s.db.GetEndpointScans(r.Context(), ep.ID, 10)
+
+	result := formatEndpointResponse(ep)
+	result["recent_scans"] = scans
+
+	resp.json(result)
+}
+
+func (s *Server) handleGetEndpointStats(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	stats, err := s.db.GetEndpointStats(r.Context())
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp.json(stats)
+}
+
+// ===== DID HANDLERS =====
+
+func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	did := vars["did"]
+
+	bundles, err := s.db.GetBundlesForDID(r.Context(), did)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if len(bundles) == 0 {
+		resp.error("DID not found in bundles", http.StatusNotFound)
+		return
+	}
+
+	lastBundle := bundles[len(bundles)-1]
+	ops, err := s.bundleManager.LoadBundleOperations(r.Context(), lastBundle.BundleNumber)
+	if err != nil {
+		resp.error(fmt.Sprintf("failed to load bundle: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Find latest operation for this DID
+	for i := len(ops) - 1; i >= 0; i-- {
+		if ops[i].DID == did {
+			resp.json(ops[i])
+			return
+		}
+	}
+
+	resp.error("DID operation not found", http.StatusNotFound)
+}
+
+func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	did := vars["did"]
+
+	bundles, err := s.db.GetBundlesForDID(r.Context(), did)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if len(bundles) == 0 {
+		resp.error("DID not found in bundles", http.StatusNotFound)
+		return
+	}
+
+	var allOperations []plc.DIDHistoryEntry
+	var currentOp *plc.PLCOperation
+
+	for _, bundle := range bundles {
+		ops, err := s.bundleManager.LoadBundleOperations(r.Context(), bundle.BundleNumber)
+		if err != nil {
+			log.Error("Warning: failed to load bundle: %v", err)
+			continue
+		}
+
+		for _, op := range ops {
+			if op.DID == did {
+				entry := plc.DIDHistoryEntry{
+					Operation: op,
+					PLCBundle: fmt.Sprintf("%06d", bundle.BundleNumber),
+				}
+				allOperations = append(allOperations, entry)
+				currentOp = &op
+			}
+		}
+	}
+
+	resp.json(plc.DIDHistory{
+		DID:        did,
+		Current:    currentOp,
+		Operations: allOperations,
+	})
+}
+
+// ===== PLC BUNDLE HANDLERS =====
+
+func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	bundleNum, err := getBundleNumber(r)
+	if err != nil {
+		resp.error("invalid bundle number", http.StatusBadRequest)
+		return
+	}
+
+	bundle, err := s.db.GetBundleByNumber(r.Context(), bundleNum)
+	if err != nil {
+		resp.error("bundle not found", http.StatusNotFound)
+		return
+	}
+
+	resp.json(formatBundleResponse(bundle))
 }
 
 func (s *Server) handleGetPLCBundleDIDs(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	vars := mux.Vars(r)
+	resp := newResponse(w)
 
-	bundleNumber, err := strconv.Atoi(vars["number"])
+	bundleNum, err := getBundleNumber(r)
 	if err != nil {
-		http.Error(w, "invalid bundle number", http.StatusBadRequest)
+		resp.error("invalid bundle number", http.StatusBadRequest)
 		return
 	}
 
-	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
+	bundle, err := s.db.GetBundleByNumber(r.Context(), bundleNum)
 	if err != nil {
-		http.Error(w, "bundle not found", http.StatusNotFound)
+		resp.error("bundle not found", http.StatusNotFound)
 		return
 	}
 
-	respondJSON(w, map[string]interface{}{
+	resp.json(map[string]interface{}{
 		"plc_bundle_number": bundle.BundleNumber,
 		"did_count":         len(bundle.DIDs),
 		"dids":              bundle.DIDs,
@@ -282,270 +296,235 @@ func (s *Server) handleGetPLCBundleDIDs(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	vars := mux.Vars(r)
+	resp := newResponse(w)
 
-	bundleNumber, err := strconv.Atoi(vars["number"])
+	bundleNum, err := getBundleNumber(r)
 	if err != nil {
-		http.Error(w, "invalid bundle number", http.StatusBadRequest)
+		resp.error("invalid bundle number", http.StatusBadRequest)
 		return
 	}
 
-	// Check if client wants uncompressed data
-	compressed := true
-	if r.URL.Query().Get("compressed") == "false" {
-		compressed = false
-	}
+	compressed := r.URL.Query().Get("compressed") != "false"
 
-	// Verify bundle exists in database
-	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
+	bundle, err := s.db.GetBundleByNumber(r.Context(), bundleNum)
 	if err != nil {
-		http.Error(w, "bundle not found", http.StatusNotFound)
+		resp.error("bundle not found", http.StatusNotFound)
 		return
 	}
 
-	// Build file path
-	filePath := filepath.Join(s.plcBundleDir, fmt.Sprintf("%06d.jsonl.zst", bundleNumber))
-
-	// Check if file exists
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			http.Error(w, "bundle file not found on disk", http.StatusNotFound)
-			return
-		}
-		http.Error(w, fmt.Sprintf("error accessing bundle file: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Set common headers
-	w.Header().Set("X-Bundle-Number", fmt.Sprintf("%d", bundleNumber))
-	w.Header().Set("X-Bundle-Hash", bundle.Hash)
-	w.Header().Set("X-Bundle-Compressed-Hash", bundle.CompressedHash)
-	w.Header().Set("X-Bundle-Start-Time", bundle.StartTime.Format(time.RFC3339Nano))
-	w.Header().Set("X-Bundle-End-Time", bundle.EndTime.Format(time.RFC3339Nano))
-	w.Header().Set("X-Bundle-Operation-Count", fmt.Sprintf("%d", plc.BUNDLE_SIZE))
-	w.Header().Set("X-Bundle-DID-Count", fmt.Sprintf("%d", len(bundle.DIDs)))
+	resp.bundleHeaders(bundle)
 
 	if compressed {
-		// Serve compressed file
-		file, err := os.Open(filePath)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("error opening bundle file: %v", err), http.StatusInternalServerError)
-			return
-		}
-		defer file.Close()
-
-		w.Header().Set("Content-Type", "application/zstd")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl.zst", bundleNumber))
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
-		w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", fileInfo.Size()))
-
-		http.ServeContent(w, r, filepath.Base(filePath), bundle.CreatedAt, file)
+		s.serveCompressedBundle(w, r, bundle)
 	} else {
-		// Serve uncompressed data
-		compressedData, err := os.ReadFile(filePath)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("error reading bundle file: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		// Decompress
-		decoder, err := zstd.NewReader(nil)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("error creating decompressor: %v", err), http.StatusInternalServerError)
-			return
-		}
-		defer decoder.Close()
-
-		decompressed, err := decoder.DecodeAll(compressedData, nil)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("error decompressing bundle: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		// Set headers for uncompressed data
-		w.Header().Set("Content-Type", "application/jsonl")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl", bundleNumber))
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(decompressed)))
-		w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", fileInfo.Size()))
-		w.Header().Set("X-Uncompressed-Size", fmt.Sprintf("%d", len(decompressed)))
-		w.Header().Set("X-Compression-Ratio", fmt.Sprintf("%.2f", float64(len(decompressed))/float64(fileInfo.Size())))
-
-		// Write decompressed data
-		w.WriteHeader(http.StatusOK)
-		w.Write(decompressed)
+		s.serveUncompressedBundle(w, r, bundle)
 	}
 }
 
-func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+func (s *Server) serveCompressedBundle(w http.ResponseWriter, r *http.Request, bundle *storage.PLCBundle) {
+	resp := newResponse(w)
+	path := bundle.GetFilePath(s.plcBundleDir)
 
-	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil {
-			limit = parsed
-		}
+	file, err := os.Open(path)
+	if err != nil {
+		resp.error("bundle file not found on disk", http.StatusNotFound)
+		return
+	}
+	defer file.Close()
+
+	fileInfo, _ := file.Stat()
+
+	w.Header().Set("Content-Type", "application/zstd")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl.zst", bundle.BundleNumber))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+	w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", fileInfo.Size()))
+
+	http.ServeContent(w, r, filepath.Base(path), bundle.CreatedAt, file)
+}
+
+func (s *Server) serveUncompressedBundle(w http.ResponseWriter, r *http.Request, bundle *storage.PLCBundle) {
+	resp := newResponse(w)
+
+	ops, err := s.bundleManager.LoadBundleOperations(r.Context(), bundle.BundleNumber)
+	if err != nil {
+		resp.error(fmt.Sprintf("error loading bundle: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	bundles, err := s.db.GetBundles(ctx, limit)
+	// Serialize to JSONL
+	var buf []byte
+	for _, op := range ops {
+		buf = append(buf, op.RawJSON...)
+		buf = append(buf, '\n')
+	}
+
+	fileInfo, _ := os.Stat(bundle.GetFilePath(s.plcBundleDir))
+	compressedSize := int64(0)
+	if fileInfo != nil {
+		compressedSize = fileInfo.Size()
+	}
+
+	w.Header().Set("Content-Type", "application/jsonl")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl", bundle.BundleNumber))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(buf)))
+	w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", compressedSize))
+	w.Header().Set("X-Uncompressed-Size", fmt.Sprintf("%d", len(buf)))
+	if compressedSize > 0 {
+		w.Header().Set("X-Compression-Ratio", fmt.Sprintf("%.2f", float64(len(buf))/float64(compressedSize)))
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write(buf)
+}
+
+func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	limit := getQueryInt(r, "limit", 50)
+
+	bundles, err := s.db.GetBundles(r.Context(), limit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		resp.error(err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	response := make([]map[string]interface{}, len(bundles))
 	for i, bundle := range bundles {
-		response[i] = map[string]interface{}{
-			"plc_bundle_number": bundle.BundleNumber,
-			"start_time":        bundle.StartTime,
-			"end_time":          bundle.EndTime,
-			"operation_count":   plc.BUNDLE_SIZE,
-			"did_count":         len(bundle.DIDs),
-			"hash":              bundle.Hash,
-			"compressed_hash":   bundle.CompressedHash,
-			"compressed_size":   bundle.CompressedSize,
-			"prev_bundle_hash":  bundle.PrevBundleHash,
-		}
+		response[i] = formatBundleResponse(bundle)
 	}
 
-	respondJSON(w, response)
+	resp.json(response)
 }
 
 func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	resp := newResponse(w)
 
-	count, size, err := s.db.GetBundleStats(ctx)
+	count, size, err := s.db.GetBundleStats(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		resp.error(err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	respondJSON(w, map[string]interface{}{
+	resp.json(map[string]interface{}{
 		"plc_bundle_count": count,
 		"total_size":       size,
 		"total_size_mb":    float64(size) / 1024 / 1024,
 	})
 }
 
-// ====================
-// Mempool Handlers
-// ====================
+// ===== MEMPOOL HANDLERS =====
 
 func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
 	ctx := r.Context()
 
 	count, err := s.db.GetMempoolCount(ctx)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		resp.error(err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	response := map[string]interface{}{
+	result := map[string]interface{}{
 		"operation_count":   count,
 		"can_create_bundle": count >= plc.BUNDLE_SIZE,
 	}
 
-	// Get mempool start time (first item)
 	if count > 0 {
-		firstOp, err := s.db.GetFirstMempoolOperation(ctx)
-		if err == nil && firstOp != nil {
-			response["mempool_start_time"] = firstOp.CreatedAt
+		if firstOp, err := s.db.GetFirstMempoolOperation(ctx); err == nil && firstOp != nil {
+			result["mempool_start_time"] = firstOp.CreatedAt
 
-			// Calculate estimated next bundle time
 			if count < plc.BUNDLE_SIZE {
-				lastOp, err := s.db.GetLastMempoolOperation(ctx)
-				if err == nil && lastOp != nil {
-					// Calculate rate of operations per second
+				if lastOp, err := s.db.GetLastMempoolOperation(ctx); err == nil && lastOp != nil {
 					timeSpan := lastOp.CreatedAt.Sub(firstOp.CreatedAt).Seconds()
-
 					if timeSpan > 0 {
 						opsPerSecond := float64(count) / timeSpan
-
 						if opsPerSecond > 0 {
 							remainingOps := plc.BUNDLE_SIZE - count
 							secondsNeeded := float64(remainingOps) / opsPerSecond
-							estimatedTime := time.Now().Add(time.Duration(secondsNeeded) * time.Second)
-
-							response["estimated_next_bundle_time"] = estimatedTime
-							response["operations_needed"] = remainingOps
-							response["current_rate_per_second"] = opsPerSecond
+							result["estimated_next_bundle_time"] = time.Now().Add(time.Duration(secondsNeeded) * time.Second)
+							result["operations_needed"] = remainingOps
+							result["current_rate_per_second"] = opsPerSecond
 						}
 					}
 				}
 			} else {
-				// Bundle can be created now
-				response["estimated_next_bundle_time"] = time.Now()
-				response["operations_needed"] = 0
+				result["estimated_next_bundle_time"] = time.Now()
+				result["operations_needed"] = 0
 			}
 		}
 	} else {
-		response["mempool_start_time"] = nil
-		response["estimated_next_bundle_time"] = nil
+		result["mempool_start_time"] = nil
+		result["estimated_next_bundle_time"] = nil
 	}
 
-	respondJSON(w, response)
+	resp.json(result)
 }
 
-// ====================
-// PLC Metrics Handlers
-// ====================
+// ===== PLC METRICS HANDLERS =====
 
 func (s *Server) handleGetPLCMetrics(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	resp := newResponse(w)
+	limit := getQueryInt(r, "limit", 10)
 
-	limit := 10
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil {
-			limit = parsed
-		}
-	}
-
-	metrics, err := s.db.GetPLCMetrics(ctx, limit)
+	metrics, err := s.db.GetPLCMetrics(r.Context(), limit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		resp.error(err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	respondJSON(w, metrics)
+	resp.json(metrics)
 }
 
-// ====================
-// Verification Handlers
-// ====================
+// ===== VERIFICATION HANDLERS =====
 
 func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	resp := newResponse(w)
 	vars := mux.Vars(r)
-	bundleNumberStr := vars["bundleNumber"]
 
-	bundleNumber, err := strconv.Atoi(bundleNumberStr)
+	bundleNumber, err := strconv.Atoi(vars["bundleNumber"])
 	if err != nil {
-		http.Error(w, "Invalid bundle number", http.StatusBadRequest)
+		resp.error("Invalid bundle number", http.StatusBadRequest)
 		return
 	}
 
-	// Get bundle from DB
-	bundle, err := s.db.GetBundleByNumber(ctx, bundleNumber)
+	bundle, err := s.db.GetBundleByNumber(r.Context(), bundleNumber)
 	if err != nil {
-		http.Error(w, "Bundle not found", http.StatusNotFound)
+		resp.error("Bundle not found", http.StatusNotFound)
 		return
 	}
 
-	// Get previous bundle for boundary state
+	// Fetch from PLC and verify
+	remoteOps, prevCIDs, err := s.fetchRemoteBundleOps(r.Context(), bundleNumber)
+	if err != nil {
+		resp.error(fmt.Sprintf("Failed to fetch from PLC directory: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	remoteHash := computeOperationsHash(remoteOps)
+	verified := bundle.Hash == remoteHash
+
+	resp.json(map[string]interface{}{
+		"bundle_number":      bundleNumber,
+		"verified":           verified,
+		"local_hash":         bundle.Hash,
+		"remote_hash":        remoteHash,
+		"local_op_count":     plc.BUNDLE_SIZE,
+		"remote_op_count":    len(remoteOps),
+		"boundary_cids_used": len(prevCIDs),
+	})
+}
+
+func (s *Server) fetchRemoteBundleOps(ctx context.Context, bundleNum int) ([]plc.PLCOperation, map[string]bool, error) {
 	var after string
 	var prevBoundaryCIDs map[string]bool
 
-	if bundleNumber > 1 {
-		prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNumber-1)
+	if bundleNum > 1 {
+		prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNum-1)
 		if err != nil {
-			http.Error(w, "Failed to get previous bundle", http.StatusInternalServerError)
-			return
+			return nil, nil, fmt.Errorf("failed to get previous bundle: %w", err)
 		}
 
 		after = prevBundle.EndTime.Format("2006-01-02T15:04:05.000Z")
 
-		// Convert stored boundary CIDs to map
 		if len(prevBundle.BoundaryCIDs) > 0 {
 			prevBoundaryCIDs = make(map[string]bool)
 			for _, cid := range prevBundle.BoundaryCIDs {
@@ -554,34 +533,25 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Collect remote operations (may need multiple fetches for large bundles)
 	var allRemoteOps []plc.PLCOperation
 	seenCIDs := make(map[string]bool)
 
-	// Track boundary CIDs
 	for cid := range prevBoundaryCIDs {
 		seenCIDs[cid] = true
 	}
 
 	currentAfter := after
-	maxFetches := 20 // Enough for up to 20k operations
+	maxFetches := 20
 
 	for fetchNum := 0; fetchNum < maxFetches && len(allRemoteOps) < plc.BUNDLE_SIZE; fetchNum++ {
-		// Fetch from PLC directory
 		batch, err := s.plcClient.Export(ctx, plc.ExportOptions{
 			Count: 1000,
 			After: currentAfter,
 		})
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to fetch from PLC directory: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		if len(batch) == 0 {
+		if err != nil || len(batch) == 0 {
 			break
 		}
 
-		// Deduplicate and add unique operations
 		for _, op := range batch {
 			if !seenCIDs[op.CID] {
 				seenCIDs[op.CID] = true
@@ -592,63 +562,41 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Update cursor for next fetch
 		if len(batch) > 0 {
 			lastOp := batch[len(batch)-1]
 			currentAfter = lastOp.CreatedAt.Format("2006-01-02T15:04:05.000Z")
 		}
 
-		// If we got less than 1000, we've reached the end
 		if len(batch) < 1000 {
 			break
 		}
 	}
 
-	// Trim to exact bundle size
 	if len(allRemoteOps) > plc.BUNDLE_SIZE {
 		allRemoteOps = allRemoteOps[:plc.BUNDLE_SIZE]
 	}
 
-	// Compute remote hash (uncompressed JSONL)
-	remoteHash, err := computeRemoteOperationsHash(allRemoteOps)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to compute remote hash: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Compare hashes (use uncompressed hash)
-	verified := bundle.Hash == remoteHash
-
-	respondJSON(w, map[string]interface{}{
-		"bundle_number":      bundleNumber,
-		"verified":           verified,
-		"local_hash":         bundle.Hash,
-		"remote_hash":        remoteHash,
-		"local_op_count":     plc.BUNDLE_SIZE,
-		"remote_op_count":    len(allRemoteOps),
-		"boundary_cids_used": len(prevBoundaryCIDs),
-	})
+	return allRemoteOps, prevBoundaryCIDs, nil
 }
 
 func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
 	ctx := r.Context()
 
-	// Get last bundle number
 	lastBundle, err := s.db.GetLastBundleNumber(ctx)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		resp.error(err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	if lastBundle == 0 {
-		respondJSON(w, map[string]interface{}{
+		resp.json(map[string]interface{}{
 			"status":  "empty",
 			"message": "No bundles to verify",
 		})
 		return
 	}
 
-	// Verify chain
 	valid := true
 	var brokenAt int
 	var errorMsg string
@@ -662,7 +610,6 @@ func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		// Verify chain link
 		if i > 1 {
 			prevBundle, err := s.db.GetBundleByNumber(ctx, i-1)
 			if err != nil {
@@ -681,30 +628,31 @@ func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response := map[string]interface{}{
+	result := map[string]interface{}{
 		"chain_length": lastBundle,
 		"valid":        valid,
 	}
 
 	if !valid {
-		response["broken_at"] = brokenAt
-		response["error"] = errorMsg
+		result["broken_at"] = brokenAt
+		result["error"] = errorMsg
 	}
 
-	respondJSON(w, response)
+	resp.json(result)
 }
 
 func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
 	ctx := r.Context()
 
 	lastBundle, err := s.db.GetLastBundleNumber(ctx)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		resp.error(err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	if lastBundle == 0 {
-		respondJSON(w, map[string]interface{}{
+		resp.json(map[string]interface{}{
 			"chain_length": 0,
 			"status":       "empty",
 		})
@@ -713,10 +661,9 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 
 	firstBundle, _ := s.db.GetBundleByNumber(ctx, 1)
 	lastBundleData, _ := s.db.GetBundleByNumber(ctx, lastBundle)
-
 	count, size, _ := s.db.GetBundleStats(ctx)
 
-	respondJSON(w, map[string]interface{}{
+	resp.json(map[string]interface{}{
 		"chain_length":     lastBundle,
 		"total_bundles":    count,
 		"total_size_mb":    float64(size) / 1024 / 1024,
@@ -728,98 +675,97 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ====================
-// PLC Export Handler
-// ====================
+// ===== PLC EXPORT HANDLER =====
 
 func (s *Server) handlePLCExport(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
 	ctx := r.Context()
 
-	// Parse query parameters
-	countStr := r.URL.Query().Get("count")
-	afterStr := r.URL.Query().Get("after")
-
-	count := 1000 // Default
-	if countStr != "" {
-		if c, err := strconv.Atoi(countStr); err == nil && c > 0 {
-			count = c
-			if count > 10000 {
-				count = 10000 // Max limit
-			}
-		}
+	count := getQueryInt(r, "count", 1000)
+	if count > 10000 {
+		count = 10000
 	}
 
-	var afterTime time.Time
-	if afterStr != "" {
-		// Try multiple timestamp formats (from most specific to least)
-		formats := []string{
-			time.RFC3339Nano,
-			time.RFC3339,
-			"2006-01-02T15:04:05.000Z",
-			"2006-01-02T15:04:05",
-			"2006-01-02T15:04",
-			"2006-01-02",
-		}
-
-		var parsed time.Time
-		var parseErr error
-		parsed = time.Time{}
-
-		for _, format := range formats {
-			parsed, parseErr = time.Parse(format, afterStr)
-			if parseErr == nil {
-				afterTime = parsed
-				break
-			}
-		}
-
-		if parseErr != nil {
-			http.Error(w, fmt.Sprintf("Invalid after parameter: %v", parseErr), http.StatusBadRequest)
-			return
-		}
+	afterTime, err := parseAfterParam(r.URL.Query().Get("after"))
+	if err != nil {
+		resp.error(fmt.Sprintf("Invalid after parameter: %v", err), http.StatusBadRequest)
+		return
 	}
 
-	// Find starting bundle (FAST - single query)
-	startBundle := 1
-	if !afterTime.IsZero() {
-		foundBundle, err := s.db.GetBundleForTimestamp(ctx, afterTime)
-		if err != nil {
-			log.Error("Failed to find bundle for timestamp: %v", err)
-			// Fallback to bundle 1
+	startBundle := s.findStartBundle(ctx, afterTime)
+	ops := s.collectOperations(ctx, startBundle, afterTime, count)
+
+	w.Header().Set("Content-Type", "application/jsonl")
+	w.Header().Set("X-Operation-Count", strconv.Itoa(len(ops)))
+
+	for _, op := range ops {
+		if len(op.RawJSON) > 0 {
+			w.Write(op.RawJSON)
 		} else {
-			startBundle = foundBundle
-			// Go back one bundle to catch boundary timestamps
-			if startBundle > 1 {
-				startBundle--
-			}
+			jsonData, _ := json.Marshal(op)
+			w.Write(jsonData)
+		}
+		w.Write([]byte("\n"))
+	}
+}
+
+func parseAfterParam(afterStr string) (time.Time, error) {
+	if afterStr == "" {
+		return time.Time{}, nil
+	}
+
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.000Z",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+		"2006-01-02",
+	}
+
+	for _, format := range formats {
+		if parsed, err := time.Parse(format, afterStr); err == nil {
+			return parsed, nil
 		}
 	}
 
-	// Collect operations from bundles
+	return time.Time{}, fmt.Errorf("invalid timestamp format")
+}
+
+func (s *Server) findStartBundle(ctx context.Context, afterTime time.Time) int {
+	if afterTime.IsZero() {
+		return 1
+	}
+
+	foundBundle, err := s.db.GetBundleForTimestamp(ctx, afterTime)
+	if err != nil {
+		return 1
+	}
+
+	if foundBundle > 1 {
+		return foundBundle - 1
+	}
+	return foundBundle
+}
+
+func (s *Server) collectOperations(ctx context.Context, startBundle int, afterTime time.Time, count int) []plc.PLCOperation {
 	var allOps []plc.PLCOperation
 	seenCIDs := make(map[string]bool)
 
-	// Load bundles sequentially until we have enough operations
 	lastBundle, _ := s.db.GetLastBundleNumber(ctx)
 
 	for bundleNum := startBundle; bundleNum <= lastBundle && len(allOps) < count; bundleNum++ {
-		bundlePath := filepath.Join(s.plcBundleDir, fmt.Sprintf("%06d.jsonl.zst", bundleNum))
-
-		ops, err := s.loadBundleOperations(bundlePath)
+		ops, err := s.bundleManager.LoadBundleOperations(ctx, bundleNum)
 		if err != nil {
 			log.Error("Warning: failed to load bundle %d: %v", bundleNum, err)
 			continue
 		}
 
-		// Filter operations
 		for _, op := range ops {
-			// Skip if STRICTLY BEFORE "after" timestamp
-			// Include operations AT or AFTER the timestamp
 			if !afterTime.IsZero() && op.CreatedAt.Before(afterTime) {
 				continue
 			}
 
-			// Skip duplicates (by CID)
 			if seenCIDs[op.CID] {
 				continue
 			}
@@ -833,124 +779,23 @@ func (s *Server) handlePLCExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Set headers for JSONL response
-	w.Header().Set("Content-Type", "application/jsonl")
-	w.Header().Set("X-Operation-Count", strconv.Itoa(len(allOps)))
-
-	// Write JSONL response (newline-delimited JSON with trailing newline)
-	for _, op := range allOps {
-		// Use raw JSON if available
-		if len(op.RawJSON) > 0 {
-			w.Write(op.RawJSON)
-		} else {
-			// Fallback: marshal the operation
-			jsonData, err := json.Marshal(op)
-			if err != nil {
-				log.Error("Failed to marshal operation: %v", err)
-				continue
-			}
-			w.Write(jsonData)
-		}
-
-		// Always add newline after each operation (including the last)
-		w.Write([]byte("\n"))
-	}
+	return allOps
 }
 
-// ====================
-// Health Handler
-// ====================
+// ===== HEALTH HANDLER =====
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, map[string]string{"status": "ok"})
+	newResponse(w).json(map[string]string{"status": "ok"})
 }
 
-// ====================
-// Helper Functions
-// ====================
+// ===== UTILITY FUNCTIONS =====
 
-// loadBundleOperations loads operations from a bundle file
-func (s *Server) loadBundleOperations(path string) ([]plc.PLCOperation, error) {
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, err
-	}
-	defer decoder.Close()
-
-	compressedData, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	decompressed, err := decoder.DecodeAll(compressedData, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse JSONL (newline-delimited JSON)
-	var operations []plc.PLCOperation
-	scanner := bufio.NewScanner(bytes.NewReader(decompressed))
-
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Bytes()
-
-		// Skip empty lines
-		if len(line) == 0 {
-			continue
-		}
-
-		var op plc.PLCOperation
-		if err := json.Unmarshal(line, &op); err != nil {
-			return nil, fmt.Errorf("failed to parse operation on line %d: %w", lineNum, err)
-		}
-
-		// CRITICAL: Store the original raw JSON bytes
-		op.RawJSON = make([]byte, len(line))
-		copy(op.RawJSON, line)
-
-		operations = append(operations, op)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading JSONL: %w", err)
-	}
-
-	return operations, nil
-}
-
-// computeRemoteOperationsHash computes hash for remote operations
-func computeRemoteOperationsHash(ops []plc.PLCOperation) (string, error) {
+func computeOperationsHash(ops []plc.PLCOperation) string {
 	var jsonlData []byte
-	for i, op := range ops {
-		if len(op.RawJSON) > 0 {
-			jsonlData = append(jsonlData, op.RawJSON...)
-		} else {
-			return "", fmt.Errorf("operation %d missing raw JSON data", i)
-		}
-		// Add newline ONLY between operations
+	for _, op := range ops {
+		jsonlData = append(jsonlData, op.RawJSON...)
 		jsonlData = append(jsonlData, '\n')
 	}
-
 	hash := sha256.Sum256(jsonlData)
-	return hex.EncodeToString(hash[:]), nil
-}
-
-// statusToString converts status int to string
-func statusToString(status int) string {
-	switch status {
-	case storage.PDSStatusOnline: // Use PDSStatusOnline (alias)
-		return "online"
-	case storage.PDSStatusOffline: // Use PDSStatusOffline (alias)
-		return "offline"
-	default:
-		return "unknown"
-	}
-}
-
-// respondJSON writes JSON response
-func respondJSON(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	return hex.EncodeToString(hash[:])
 }

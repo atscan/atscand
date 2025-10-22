@@ -576,3 +576,22 @@ func StripBoundaryDuplicates(operations []PLCOperation, boundaryTimestamp string
 
 	return operations[startIdx:]
 }
+
+// LoadBundleOperations is a public method for external access (e.g., API handlers)
+func (bm *BundleManager) LoadBundleOperations(ctx context.Context, bundleNum int) ([]PLCOperation, error) {
+	if !bm.enabled {
+		return nil, fmt.Errorf("bundle manager disabled")
+	}
+
+	bf := bm.newBundleFile(bundleNum)
+
+	if !bf.exists() {
+		return nil, fmt.Errorf("bundle %06d not found", bundleNum)
+	}
+
+	if err := bm.load(bf); err != nil {
+		return nil, err
+	}
+
+	return bf.operations, nil
+}
