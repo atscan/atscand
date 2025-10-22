@@ -262,7 +262,10 @@ func (bm *BundleManager) loadFromFile(ctx context.Context, bundleNum int, bf *bu
 	if _, err := bm.db.GetBundleByNumber(ctx, bundleNum); err != nil {
 		bf.compressedHash = bm.hashFile(bf.path)
 		bf.uncompressedHash = bm.hash(bm.serializeJSONL(bf.operations))
-		cursor := "" // Unknown for existing files
+
+		// Calculate cursor from previous bundle
+		cursor := bm.calculateCursor(ctx, bundleNum)
+
 		bm.indexBundle(ctx, bundleNum, bf, cursor)
 	}
 
@@ -277,15 +280,19 @@ func (bm *BundleManager) fetchFromPLC(ctx context.Context, bundleNum int, bf *bu
 
 	ops, isComplete := fetcher.fetchUntilComplete(ctx, BUNDLE_SIZE)
 
+	log.Info("  Collected %d unique operations after %d fetches (complete=%v)",
+		len(ops), fetcher.fetchCount, isComplete)
+
 	if isComplete {
 		bf.operations = ops
 		if err := bm.save(bf); err != nil {
 			log.Error("Warning: failed to save bundle: %v", err)
 		} else {
-			cursor := afterTime // Store the cursor used
+			// The cursor is the afterTime that was used to fetch this bundle
+			cursor := afterTime
 			bm.indexBundle(ctx, bundleNum, bf, cursor)
-			log.Info("✓ Bundle %06d saved [%d ops, hash: %s...]",
-				bundleNum, len(ops), bf.uncompressedHash[:16])
+			log.Info("✓ Bundle %06d saved [%d ops, hash: %s..., cursor: %s]",
+				bundleNum, len(ops), bf.uncompressedHash[:16], cursor)
 		}
 	}
 
@@ -601,4 +608,30 @@ func (bm *BundleManager) LoadBundleOperations(ctx context.Context, bundleNum int
 	}
 
 	return bf.operations, nil
+}
+
+// calculateCursor determines the cursor value for a given bundle
+// For bundle 1: returns empty string
+// For bundle N: returns the end_time of bundle N-1 in RFC3339Nano format
+func (bm *BundleManager) calculateCursor(ctx context.Context, bundleNum int) string {
+	if bundleNum == 1 {
+		return ""
+	}
+
+	// Try to get cursor from previous bundle in DB
+	if prevBundle, err := bm.db.GetBundleByNumber(ctx, bundleNum-1); err == nil {
+		return prevBundle.EndTime.Format(time.RFC3339Nano)
+	}
+
+	// If previous bundle not in DB, try to load it from file
+	prevBf := bm.newBundleFile(bundleNum - 1)
+	if prevBf.exists() {
+		if err := bm.load(prevBf); err == nil && len(prevBf.operations) > 0 {
+			// Return the createdAt of the last operation in previous bundle
+			lastOp := prevBf.operations[len(prevBf.operations)-1]
+			return lastOp.CreatedAt.Format(time.RFC3339Nano)
+		}
+	}
+
+	return ""
 }
