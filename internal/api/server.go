@@ -77,6 +77,7 @@ func (s *Server) setupRoutes() {
 	// DID routes
 	api.HandleFunc("/plc/did/{did}", s.handleGetDID).Methods("GET")
 	api.HandleFunc("/plc/did/{did}/history", s.handleGetDIDHistory).Methods("GET")
+	api.HandleFunc("/plc/dids/stats", s.handleGetDIDStats).Methods("GET") // NEW
 
 	// Mempool routes
 	api.HandleFunc("/mempool/stats", s.handleGetMempoolStats).Methods("GET")

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -182,19 +183,20 @@ func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	did := vars["did"]
 
-	bundles, err := s.db.GetBundlesForDID(r.Context(), did)
+	// Fast lookup using dids table
+	didRecord, err := s.db.GetDIDRecord(r.Context(), did)
 	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
+		if err == sql.ErrNoRows {
+			resp.error("DID not found", http.StatusNotFound)
+		} else {
+			resp.error(err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 
-	if len(bundles) == 0 {
-		resp.error("DID not found in bundles", http.StatusNotFound)
-		return
-	}
-
-	lastBundle := bundles[len(bundles)-1]
-	ops, err := s.bundleManager.LoadBundleOperations(r.Context(), lastBundle.BundleNumber)
+	// Load last bundle to get latest operation
+	lastBundleNum := didRecord.LastSeenBundle
+	ops, err := s.bundleManager.LoadBundleOperations(r.Context(), lastBundleNum)
 	if err != nil {
 		resp.error(fmt.Sprintf("failed to load bundle: %v", err), http.StatusInternalServerError)
 		return
@@ -216,24 +218,25 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	did := vars["did"]
 
-	bundles, err := s.db.GetBundlesForDID(r.Context(), did)
+	// Fast lookup using dids table
+	didRecord, err := s.db.GetDIDRecord(r.Context(), did)
 	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if len(bundles) == 0 {
-		resp.error("DID not found in bundles", http.StatusNotFound)
+		if err == sql.ErrNoRows {
+			resp.error("DID not found", http.StatusNotFound)
+		} else {
+			resp.error(err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 
 	var allOperations []plc.DIDHistoryEntry
 	var currentOp *plc.PLCOperation
 
-	for _, bundle := range bundles {
-		ops, err := s.bundleManager.LoadBundleOperations(r.Context(), bundle.BundleNumber)
+	// Load operations from each bundle
+	for _, bundleNum := range didRecord.BundleNumbers {
+		ops, err := s.bundleManager.LoadBundleOperations(r.Context(), bundleNum)
 		if err != nil {
-			log.Error("Warning: failed to load bundle: %v", err)
+			log.Error("Warning: failed to load bundle %d: %v", bundleNum, err)
 			continue
 		}
 
@@ -241,7 +244,7 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 			if op.DID == did {
 				entry := plc.DIDHistoryEntry{
 					Operation: op,
-					PLCBundle: fmt.Sprintf("%06d", bundle.BundleNumber),
+					PLCBundle: fmt.Sprintf("%06d", bundleNum),
 				}
 				allOperations = append(allOperations, entry)
 				currentOp = &op
@@ -253,6 +256,28 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 		DID:        did,
 		Current:    currentOp,
 		Operations: allOperations,
+	})
+}
+
+func (s *Server) handleGetDIDStats(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	ctx := r.Context()
+
+	totalDIDs, err := s.db.GetTotalDIDCount(ctx)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	lastBundle, err := s.db.GetLastBundleNumber(ctx)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp.json(map[string]interface{}{
+		"total_unique_dids": totalDIDs,
+		"last_bundle":       lastBundle,
 	})
 }
 

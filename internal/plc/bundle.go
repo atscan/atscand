@@ -351,10 +351,14 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 		uncompressedSize += int64(len(op.RawJSON)) + 1 // +1 for newline
 	}
 
+	// Get time range from operations
+	firstSeenAt := bf.operations[0].CreatedAt
+	lastSeenAt := bf.operations[len(bf.operations)-1].CreatedAt
+
 	bundle := &storage.PLCBundle{
 		BundleNumber:     bundleNum,
-		StartTime:        bf.operations[0].CreatedAt,
-		EndTime:          bf.operations[len(bf.operations)-1].CreatedAt,
+		StartTime:        firstSeenAt,
+		EndTime:          lastSeenAt,
 		DIDs:             dids,
 		Hash:             bf.uncompressedHash,
 		CompressedHash:   bf.compressedHash,
@@ -366,7 +370,21 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 		CreatedAt:        time.Now(),
 	}
 
-	return bm.db.CreateBundle(ctx, bundle)
+	// Create bundle first
+	if err := bm.db.CreateBundle(ctx, bundle); err != nil {
+		return err
+	}
+
+	// Index DIDs synchronously (will use bulk inserts for speed)
+	if err := bm.db.AddBundleDIDs(ctx, bundleNum, dids, firstSeenAt, lastSeenAt); err != nil {
+		log.Error("Failed to index DIDs for bundle %06d: %v", bundleNum, err)
+		// Don't return error - bundle is already created
+		// DID indexing can be retried later
+	} else {
+		log.Verbose("✓ Indexed %d unique DIDs for bundle %06d", len(dids), bundleNum)
+	}
+
+	return nil
 }
 
 func (bm *BundleManager) extractUniqueDIDs(ops []PLCOperation) []string {

@@ -150,3 +150,14 @@ type ScanCursor struct {
 	LastScanTime     time.Time
 	RecordsProcessed int64
 }
+
+// DIDRecord represents a DID entry in the database
+type DIDRecord struct {
+	DID             string
+	FirstSeenBundle int
+	LastSeenBundle  int
+	BundleNumbers   []int // Bundle numbers where this DID appears
+	OperationCount  int
+	FirstSeenAt     time.Time
+	LastSeenAt      time.Time
+}

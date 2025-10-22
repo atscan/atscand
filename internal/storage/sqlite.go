@@ -65,7 +65,6 @@ func (s *SQLiteDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
     CREATE INDEX IF NOT EXISTS idx_endpoints_user_count ON endpoints(user_count);
 
-    -- Keep pds_scans table (or rename to endpoint_scans later)
     CREATE TABLE IF NOT EXISTS pds_scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pds_id INTEGER NOT NULL,
@@ -79,7 +78,6 @@ func (s *SQLiteDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_pds_scans_pds_id ON pds_scans(pds_id);
     CREATE INDEX IF NOT EXISTS idx_pds_scans_scanned_at ON pds_scans(scanned_at);
 
-    -- Metrics
     CREATE TABLE IF NOT EXISTS plc_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         total_dids INTEGER,
@@ -90,7 +88,6 @@ func (s *SQLiteDB) Migrate() error {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- Scan cursors with bundle number
     CREATE TABLE IF NOT EXISTS scan_cursors (
         source TEXT PRIMARY KEY,
         last_bundle_number INTEGER DEFAULT 0,
@@ -98,7 +95,6 @@ func (s *SQLiteDB) Migrate() error {
         records_processed INTEGER DEFAULT 0
     );
 
-    -- Bundles with dual hashing
     CREATE TABLE IF NOT EXISTS plc_bundles (
         bundle_number INTEGER PRIMARY KEY,
         start_time TIMESTAMP NOT NULL,
@@ -108,8 +104,8 @@ func (s *SQLiteDB) Migrate() error {
         compressed_hash TEXT NOT NULL,
         compressed_size INTEGER NOT NULL,
         uncompressed_size INTEGER NOT NULL,
-        cumulative_compressed_size INTEGER NOT NULL,      -- NEW
-        cumulative_uncompressed_size INTEGER NOT NULL,    -- NEW
+        cumulative_compressed_size INTEGER NOT NULL,
+        cumulative_uncompressed_size INTEGER NOT NULL,
         cursor TEXT,
         prev_bundle_hash TEXT,
         compressed BOOLEAN DEFAULT 1,
@@ -121,19 +117,34 @@ func (s *SQLiteDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_plc_bundles_prev ON plc_bundles(prev_bundle_hash);
     CREATE INDEX IF NOT EXISTS idx_plc_bundles_number_desc ON plc_bundles(bundle_number DESC);
 
-    -- NEW: Mempool for pending operations
-	CREATE TABLE IF NOT EXISTS plc_mempool (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		did TEXT NOT NULL,
-		operation TEXT NOT NULL,
-		cid TEXT NOT NULL UNIQUE,  -- ✅ Add UNIQUE constraint
-		created_at TIMESTAMP NOT NULL,
-		added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
+    CREATE TABLE IF NOT EXISTS plc_mempool (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        did TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        cid TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMP NOT NULL,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
     CREATE INDEX IF NOT EXISTS idx_mempool_created_at ON plc_mempool(created_at);
     CREATE INDEX IF NOT EXISTS idx_mempool_did ON plc_mempool(did);
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_mempool_cid ON plc_mempool(cid);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_mempool_cid ON plc_mempool(cid);
+
+    -- NEW: DIDs table
+    CREATE TABLE IF NOT EXISTS dids (
+        did TEXT PRIMARY KEY,
+        first_seen_bundle INTEGER NOT NULL,
+        last_seen_bundle INTEGER NOT NULL,
+        bundle_numbers TEXT NOT NULL,  -- JSON array of bundle numbers
+        operation_count INTEGER DEFAULT 1,
+        first_seen_at TIMESTAMP NOT NULL,
+        last_seen_at TIMESTAMP NOT NULL
+    );
+
+	CREATE INDEX IF NOT EXISTS idx_dids_last_bundle ON dids(did);
+    CREATE INDEX IF NOT EXISTS idx_dids_last_bundle ON dids(last_seen_bundle);
+    CREATE INDEX IF NOT EXISTS idx_dids_first_seen ON dids(first_seen_at);
+    CREATE INDEX IF NOT EXISTS idx_dids_last_seen ON dids(last_seen_at);
     `
 
 	_, err := s.db.Exec(schema)
@@ -962,4 +973,188 @@ func (s *SQLiteDB) GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetrics,
 	}
 
 	return metrics, rows.Err()
+}
+
+// UpsertDID inserts or updates a DID record
+func (s *SQLiteDB) UpsertDID(ctx context.Context, did *DIDRecord) error {
+	bundleNumbersJSON, err := json.Marshal(did.BundleNumbers)
+	if err != nil {
+		return err
+	}
+
+	query := `
+        INSERT INTO dids (did, first_seen_bundle, last_seen_bundle, bundle_numbers, operation_count, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(did) DO UPDATE SET
+            last_seen_bundle = excluded.last_seen_bundle,
+            bundle_numbers = excluded.bundle_numbers,
+            operation_count = excluded.operation_count,
+            last_seen_at = excluded.last_seen_at
+    `
+	_, err = s.db.ExecContext(ctx, query,
+		did.DID, did.FirstSeenBundle, did.LastSeenBundle,
+		string(bundleNumbersJSON), did.OperationCount,
+		did.FirstSeenAt, did.LastSeenAt)
+	return err
+}
+
+// GetDIDRecord retrieves a DID record
+func (s *SQLiteDB) GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error) {
+	query := `
+        SELECT did, first_seen_bundle, last_seen_bundle, bundle_numbers, operation_count, first_seen_at, last_seen_at
+        FROM dids
+        WHERE did = ?
+    `
+
+	var record DIDRecord
+	var bundleNumbersJSON string
+
+	err := s.db.QueryRowContext(ctx, query, did).Scan(
+		&record.DID, &record.FirstSeenBundle, &record.LastSeenBundle,
+		&bundleNumbersJSON, &record.OperationCount,
+		&record.FirstSeenAt, &record.LastSeenAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse bundle numbers
+	if err := json.Unmarshal([]byte(bundleNumbersJSON), &record.BundleNumbers); err != nil {
+		return nil, err
+	}
+
+	return &record, nil
+}
+
+// AddBundleDIDs adds DIDs for a bundle (optimized bulk operation)
+func (s *SQLiteDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []string, firstSeenAt, lastSeenAt time.Time) error {
+	if len(dids) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Get existing DIDs to update their bundle_numbers arrays
+	existingDIDs := make(map[string][]int)
+	if len(dids) > 0 {
+		// Build query to fetch existing DIDs
+		placeholders := make([]string, len(dids))
+		args := make([]interface{}, len(dids))
+		for i, did := range dids {
+			placeholders[i] = "?"
+			args[i] = did
+		}
+
+		query := fmt.Sprintf(`
+			SELECT did, bundle_numbers
+			FROM dids
+			WHERE did IN (%s)
+		`, strings.Join(placeholders, ","))
+
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+
+		for rows.Next() {
+			var did, bundleNumbersJSON string
+			if err := rows.Scan(&did, &bundleNumbersJSON); err != nil {
+				rows.Close()
+				return err
+			}
+
+			var bundles []int
+			if err := json.Unmarshal([]byte(bundleNumbersJSON), &bundles); err != nil {
+				rows.Close()
+				return err
+			}
+
+			existingDIDs[did] = bundles
+		}
+		rows.Close()
+
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+
+	// Batch upsert
+	batchSize := 500
+	for i := 0; i < len(dids); i += batchSize {
+		end := i + batchSize
+		if end > len(dids) {
+			end = len(dids)
+		}
+		batch := dids[i:end]
+
+		if err := s.bulkUpsertDIDsSimplified(ctx, tx, bundleNum, batch, existingDIDs, firstSeenAt, lastSeenAt); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (s *SQLiteDB) bulkUpsertDIDsSimplified(ctx context.Context, tx *sql.Tx, bundleNum int, dids []string, existingDIDs map[string][]int, firstSeenAt, lastSeenAt time.Time) error {
+	if len(dids) == 0 {
+		return nil
+	}
+
+	var values []string
+	var args []interface{}
+
+	for _, did := range dids {
+		// Check if DID exists and append bundle number
+		bundles := existingDIDs[did]
+
+		// Avoid duplicates
+		alreadyHas := false
+		for _, b := range bundles {
+			if b == bundleNum {
+				alreadyHas = true
+				break
+			}
+		}
+
+		if !alreadyHas {
+			bundles = append(bundles, bundleNum)
+		}
+
+		bundleNumbersJSON, _ := json.Marshal(bundles)
+
+		if len(existingDIDs[did]) > 0 {
+			// Update existing
+			values = append(values, "(?, ?, ?, ?, ?, ?, ?)")
+			args = append(args, did, bundleNum, bundleNum, string(bundleNumbersJSON), len(bundles), firstSeenAt, lastSeenAt)
+		} else {
+			// New DID
+			values = append(values, "(?, ?, ?, ?, 1, ?, ?)")
+			args = append(args, did, bundleNum, bundleNum, string(bundleNumbersJSON), firstSeenAt, lastSeenAt)
+		}
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO dids (did, first_seen_bundle, last_seen_bundle, bundle_numbers, operation_count, first_seen_at, last_seen_at)
+		VALUES %s
+		ON CONFLICT(did) DO UPDATE SET
+			last_seen_bundle = excluded.last_seen_bundle,
+			bundle_numbers = excluded.bundle_numbers,
+			operation_count = excluded.operation_count,
+			last_seen_at = excluded.last_seen_at
+	`, strings.Join(values, ","))
+
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+// GetTotalDIDCount returns the total number of unique DIDs
+func (s *SQLiteDB) GetTotalDIDCount(ctx context.Context) (int64, error) {
+	query := "SELECT COUNT(*) FROM dids"
+	var count int64
+	err := s.db.QueryRowContext(ctx, query).Scan(&count)
+	return count, err
 }

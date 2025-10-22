@@ -46,4 +46,10 @@ type Database interface {
 	StorePLCMetrics(ctx context.Context, metrics *PLCMetrics) error
 	GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetrics, error)
 	GetEndpointStats(ctx context.Context) (*EndpointStats, error)
+
+	// DID operations
+	UpsertDID(ctx context.Context, did *DIDRecord) error
+	GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error)
+	AddBundleDIDs(ctx context.Context, bundleNum int, dids []string, firstSeenAt, lastSeenAt time.Time) error
+	GetTotalDIDCount(ctx context.Context) (int64, error)
 }
