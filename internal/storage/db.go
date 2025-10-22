@@ -9,15 +9,15 @@ type Database interface {
 	Close() error
 	Migrate() error
 
-	// PDS operations
-	UpsertPDS(ctx context.Context, pds *PDS) error
-	GetPDS(ctx context.Context, endpoint string) (*PDS, error)
-	GetPDSByID(ctx context.Context, id int64) (*PDS, error)
-	GetPDSServers(ctx context.Context, filter *PDSFilter) ([]*PDS, error)
-	UpdatePDSStatus(ctx context.Context, pdsID int64, update *PDSUpdate) error
-	PDSExists(ctx context.Context, endpoint string) (bool, error)
-	GetPDSIDByEndpoint(ctx context.Context, endpoint string) (int64, error)
-	GetPDSScans(ctx context.Context, pdsID int64, limit int) ([]*PDSScan, error)
+	// Endpoint operations (renamed from PDS)
+	UpsertEndpoint(ctx context.Context, endpoint *Endpoint) error
+	GetEndpoint(ctx context.Context, endpoint string, endpointType string) (*Endpoint, error)
+	GetEndpointByID(ctx context.Context, id int64) (*Endpoint, error)
+	GetEndpoints(ctx context.Context, filter *EndpointFilter) ([]*Endpoint, error)
+	UpdateEndpointStatus(ctx context.Context, endpointID int64, update *EndpointUpdate) error
+	EndpointExists(ctx context.Context, endpoint string, endpointType string) (bool, error)
+	GetEndpointIDByEndpoint(ctx context.Context, endpoint string, endpointType string) (int64, error)
+	GetEndpointScans(ctx context.Context, endpointID int64, limit int) ([]*EndpointScan, error)
 
 	// Cursor operations
 	GetScanCursor(ctx context.Context, source string) (*ScanCursor, error)
@@ -26,7 +26,6 @@ type Database interface {
 	// Bundle operations
 	CreateBundle(ctx context.Context, bundle *PLCBundle) error
 	GetBundleByNumber(ctx context.Context, bundleNumber int) (*PLCBundle, error)
-	// GetBundleByID removed - bundle_number IS the ID
 	GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error)
 	GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error)
 	GetBundleStats(ctx context.Context) (int64, int64, error)
@@ -44,5 +43,5 @@ type Database interface {
 	// Metrics
 	StorePLCMetrics(ctx context.Context, metrics *PLCMetrics) error
 	GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetrics, error)
-	GetPDSStats(ctx context.Context) (*PDSStats, error)
+	GetEndpointStats(ctx context.Context) (*EndpointStats, error)
 }

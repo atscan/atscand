@@ -20,13 +20,27 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-func (s *Server) handleGetPDSList(w http.ResponseWriter, r *http.Request) {
+// ====================
+// Endpoint Handlers (new)
+// ====================
+
+func (s *Server) handleGetEndpoints(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	filter := &storage.PDSFilter{}
+	filter := &storage.EndpointFilter{}
+
+	if typ := r.URL.Query().Get("type"); typ != "" {
+		filter.Type = typ
+	}
 
 	if status := r.URL.Query().Get("status"); status != "" {
 		filter.Status = status
+	}
+
+	if minUserCount := r.URL.Query().Get("min_user_count"); minUserCount != "" {
+		if count, err := strconv.ParseInt(minUserCount, 10, 64); err == nil {
+			filter.MinUserCount = count
+		}
 	}
 
 	if limit := r.URL.Query().Get("limit"); limit != "" {
@@ -41,59 +55,67 @@ func (s *Server) handleGetPDSList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	servers, err := s.db.GetPDSServers(ctx, filter)
+	endpoints, err := s.db.GetEndpoints(ctx, filter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// Convert status codes to strings for API
-	response := make([]map[string]interface{}, len(servers))
-	for i, srv := range servers {
+	response := make([]map[string]interface{}, len(endpoints))
+	for i, ep := range endpoints {
 		response[i] = map[string]interface{}{
-			"id":            srv.ID,
-			"endpoint":      srv.Endpoint,
-			"discovered_at": srv.DiscoveredAt,
-			"last_checked":  srv.LastChecked,
-			"status":        statusToString(srv.Status),
-			"user_count":    srv.UserCount,
+			"id":            ep.ID,
+			"endpoint_type": ep.EndpointType,
+			"endpoint":      ep.Endpoint,
+			"discovered_at": ep.DiscoveredAt,
+			"last_checked":  ep.LastChecked,
+			"status":        statusToString(ep.Status),
+			"user_count":    ep.UserCount,
 		}
 	}
 
 	respondJSON(w, response)
 }
 
-func (s *Server) handleGetPDS(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
 	endpoint := vars["endpoint"]
 
-	pds, err := s.db.GetPDS(ctx, endpoint)
+	// Get type from query param, default to "pds" for backward compatibility
+	endpointType := r.URL.Query().Get("type")
+	if endpointType == "" {
+		endpointType = "pds"
+	}
+
+	ep, err := s.db.GetEndpoint(ctx, endpoint, endpointType)
 	if err != nil {
-		http.Error(w, "PDS not found", http.StatusNotFound)
+		http.Error(w, "Endpoint not found", http.StatusNotFound)
 		return
 	}
 
 	// Get recent scans
-	scans, _ := s.db.GetPDSScans(ctx, pds.ID, 10)
+	scans, _ := s.db.GetEndpointScans(ctx, ep.ID, 10)
 
 	response := map[string]interface{}{
-		"id":            pds.ID,
-		"endpoint":      pds.Endpoint,
-		"discovered_at": pds.DiscoveredAt,
-		"last_checked":  pds.LastChecked,
-		"status":        statusToString(pds.Status),
-		"user_count":    pds.UserCount,
+		"id":            ep.ID,
+		"endpoint_type": ep.EndpointType,
+		"endpoint":      ep.Endpoint,
+		"discovered_at": ep.DiscoveredAt,
+		"last_checked":  ep.LastChecked,
+		"status":        statusToString(ep.Status),
+		"user_count":    ep.UserCount,
 		"recent_scans":  scans,
 	}
 
 	respondJSON(w, response)
 }
 
-func (s *Server) handleGetPDSStats(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetEndpointStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	stats, err := s.db.GetPDSStats(ctx)
+	stats, err := s.db.GetEndpointStats(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -101,6 +123,10 @@ func (s *Server) handleGetPDSStats(w http.ResponseWriter, r *http.Request) {
 
 	respondJSON(w, stats)
 }
+
+// ====================
+// DID Handlers
+// ====================
 
 func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -196,6 +222,10 @@ func (s *Server) handleGetDIDHistory(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, history)
 }
 
+// ====================
+// PLC Bundle Handlers
+// ====================
+
 func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
@@ -218,8 +248,8 @@ func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 		"end_time":          bundle.EndTime,
 		"operation_count":   plc.BUNDLE_SIZE,
 		"did_count":         len(bundle.DIDs),
-		"hash":              bundle.Hash,           // Uncompressed (verifiable)
-		"compressed_hash":   bundle.CompressedHash, // File integrity
+		"hash":              bundle.Hash,
+		"compressed_hash":   bundle.CompressedHash,
 		"compressed_size":   bundle.CompressedSize,
 		"prev_bundle_hash":  bundle.PrevBundleHash,
 		"created_at":        bundle.CreatedAt,
@@ -348,6 +378,60 @@ func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil {
+			limit = parsed
+		}
+	}
+
+	bundles, err := s.db.GetBundles(ctx, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := make([]map[string]interface{}, len(bundles))
+	for i, bundle := range bundles {
+		response[i] = map[string]interface{}{
+			"plc_bundle_number": bundle.BundleNumber,
+			"start_time":        bundle.StartTime,
+			"end_time":          bundle.EndTime,
+			"operation_count":   plc.BUNDLE_SIZE,
+			"did_count":         len(bundle.DIDs),
+			"hash":              bundle.Hash,
+			"compressed_hash":   bundle.CompressedHash,
+			"compressed_size":   bundle.CompressedSize,
+			"prev_bundle_hash":  bundle.PrevBundleHash,
+		}
+	}
+
+	respondJSON(w, response)
+}
+
+func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	count, size, err := s.db.GetBundleStats(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{
+		"plc_bundle_count": count,
+		"total_size":       size,
+		"total_size_mb":    float64(size) / 1024 / 1024,
+	})
+}
+
+// ====================
+// Mempool Handlers
+// ====================
+
 func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -403,56 +487,9 @@ func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, response)
 }
 
-// Helper to load bundle operations - UPDATED FOR JSONL FORMAT
-func (s *Server) loadBundleOperations(path string) ([]plc.PLCOperation, error) {
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, err
-	}
-	defer decoder.Close()
-
-	compressedData, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	decompressed, err := decoder.DecodeAll(compressedData, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse JSONL (newline-delimited JSON)
-	var operations []plc.PLCOperation
-	scanner := bufio.NewScanner(bytes.NewReader(decompressed))
-
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Bytes()
-
-		// Skip empty lines
-		if len(line) == 0 {
-			continue
-		}
-
-		var op plc.PLCOperation
-		if err := json.Unmarshal(line, &op); err != nil {
-			return nil, fmt.Errorf("failed to parse operation on line %d: %w", lineNum, err)
-		}
-
-		// CRITICAL: Store the original raw JSON bytes
-		op.RawJSON = make([]byte, len(line))
-		copy(op.RawJSON, line)
-
-		operations = append(operations, op)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading JSONL: %w", err)
-	}
-
-	return operations, nil
-}
+// ====================
+// PLC Metrics Handlers
+// ====================
 
 func (s *Server) handleGetPLCMetrics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -473,59 +510,9 @@ func (s *Server) handleGetPLCMetrics(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, metrics)
 }
 
-func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil {
-			limit = parsed
-		}
-	}
-
-	bundles, err := s.db.GetBundles(ctx, limit)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	response := make([]map[string]interface{}, len(bundles))
-	for i, bundle := range bundles {
-		response[i] = map[string]interface{}{
-			"plc_bundle_number": bundle.BundleNumber,
-			"start_time":        bundle.StartTime,
-			"end_time":          bundle.EndTime,
-			"operation_count":   10000,
-			"did_count":         len(bundle.DIDs),
-			"hash":              bundle.Hash,
-			"compressed_hash":   bundle.CompressedHash,
-			"compressed_size":   bundle.CompressedSize,
-			"prev_bundle_hash":  bundle.PrevBundleHash,
-		}
-	}
-
-	respondJSON(w, response)
-}
-
-func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	count, size, err := s.db.GetBundleStats(ctx)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	respondJSON(w, map[string]interface{}{
-		"plc_bundle_count": count,
-		"total_size":       size,
-		"total_size_mb":    float64(size) / 1024 / 1024,
-	})
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, map[string]string{"status": "ok"})
-}
+// ====================
+// Verification Handlers
+// ====================
 
 func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -637,7 +624,7 @@ func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
 		"verified":           verified,
 		"local_hash":         bundle.Hash,
 		"remote_hash":        remoteHash,
-		"local_op_count":     bundle.OperationCount,
+		"local_op_count":     plc.BUNDLE_SIZE,
 		"remote_op_count":    len(allRemoteOps),
 		"boundary_cids_used": len(prevBoundaryCIDs),
 	})
@@ -736,12 +723,15 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 		"chain_start_time": firstBundle.StartTime,
 		"chain_end_time":   lastBundleData.EndTime,
 		"chain_head_hash":  lastBundleData.Hash,
-		"first_prev_hash":  firstBundle.PrevBundleHash, // Should be empty
+		"first_prev_hash":  firstBundle.PrevBundleHash,
 		"last_prev_hash":   lastBundleData.PrevBundleHash,
 	})
 }
 
-// handlePLCExport simulates PLC directory /export endpoint using cached bundles
+// ====================
+// PLC Export Handler
+// ====================
+
 func (s *Server) handlePLCExport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -763,17 +753,17 @@ func (s *Server) handlePLCExport(w http.ResponseWriter, r *http.Request) {
 	if afterStr != "" {
 		// Try multiple timestamp formats (from most specific to least)
 		formats := []string{
-			time.RFC3339Nano,           // 2023-11-09T03:55:00.123456789Z
-			time.RFC3339,               // 2023-11-09T03:55:00Z
-			"2006-01-02T15:04:05.000Z", // 2023-11-09T03:55:00.000Z
-			"2006-01-02T15:04:05",      // 2023-11-09T03:55:00
-			"2006-01-02T15:04",         // 2023-11-09T03:55
-			"2006-01-02",               // 2023-11-09
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02T15:04:05.000Z",
+			"2006-01-02T15:04:05",
+			"2006-01-02T15:04",
+			"2006-01-02",
 		}
 
 		var parsed time.Time
 		var parseErr error
-		parsed = time.Time{} // zero value
+		parsed = time.Time{}
 
 		for _, format := range formats {
 			parsed, parseErr = time.Parse(format, afterStr)
@@ -867,7 +857,70 @@ func (s *Server) handlePLCExport(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// computeRemoteOperationsHash - matching format
+// ====================
+// Health Handler
+// ====================
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, map[string]string{"status": "ok"})
+}
+
+// ====================
+// Helper Functions
+// ====================
+
+// loadBundleOperations loads operations from a bundle file
+func (s *Server) loadBundleOperations(path string) ([]plc.PLCOperation, error) {
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		return nil, err
+	}
+	defer decoder.Close()
+
+	compressedData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	decompressed, err := decoder.DecodeAll(compressedData, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse JSONL (newline-delimited JSON)
+	var operations []plc.PLCOperation
+	scanner := bufio.NewScanner(bytes.NewReader(decompressed))
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Bytes()
+
+		// Skip empty lines
+		if len(line) == 0 {
+			continue
+		}
+
+		var op plc.PLCOperation
+		if err := json.Unmarshal(line, &op); err != nil {
+			return nil, fmt.Errorf("failed to parse operation on line %d: %w", lineNum, err)
+		}
+
+		// CRITICAL: Store the original raw JSON bytes
+		op.RawJSON = make([]byte, len(line))
+		copy(op.RawJSON, line)
+
+		operations = append(operations, op)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading JSONL: %w", err)
+	}
+
+	return operations, nil
+}
+
+// computeRemoteOperationsHash computes hash for remote operations
 func computeRemoteOperationsHash(ops []plc.PLCOperation) (string, error) {
 	var jsonlData []byte
 	for i, op := range ops {
@@ -884,19 +937,20 @@ func computeRemoteOperationsHash(ops []plc.PLCOperation) (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
-func respondJSON(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
-
-// Helper function
+// statusToString converts status int to string
 func statusToString(status int) string {
 	switch status {
-	case storage.PDSStatusOnline:
+	case storage.PDSStatusOnline: // Use PDSStatusOnline (alias)
 		return "online"
-	case storage.PDSStatusOffline:
+	case storage.PDSStatusOffline: // Use PDSStatusOffline (alias)
 		return "offline"
 	default:
 		return "unknown"
 	}
+}
+
+// respondJSON writes JSON response
+func respondJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
 }

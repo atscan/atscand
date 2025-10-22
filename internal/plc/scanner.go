@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/acarl005/stripansi"
 	"github.com/atscan/atscanner/internal/config"
 	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/storage"
@@ -373,60 +373,88 @@ func (s *Scanner) processMempoolRecursive(ctx context.Context, newPDSCount *int6
 
 // processBatch processes operations for PDS discovery
 func (s *Scanner) processBatch(ctx context.Context, operations []PLCOperation) (int64, error) {
-	newPDSCount := int64(0)
-	seenInBatch := make(map[string]*PLCOperation)
+	newEndpointCount := int64(0)
+	seenInBatch := make(map[string]*PLCOperation) // key: "type:endpoint"
 
 	for _, op := range operations {
 		if op.IsNullified() {
 			continue
 		}
 
-		pdsEndpoint := s.extractPDSFromOperation(op)
-		if pdsEndpoint == "" {
-			continue
-		}
-
-		if _, seen := seenInBatch[pdsEndpoint]; !seen {
-			seenInBatch[pdsEndpoint] = &op
+		endpoints := s.extractEndpointsFromOperation(op)
+		for _, ep := range endpoints {
+			key := fmt.Sprintf("%s:%s", ep.Type, ep.Endpoint)
+			if _, seen := seenInBatch[key]; !seen {
+				seenInBatch[key] = &op
+			}
 		}
 	}
 
-	for pdsEndpoint, firstOp := range seenInBatch {
-		exists, err := s.db.PDSExists(ctx, pdsEndpoint)
+	for key, firstOp := range seenInBatch {
+		parts := strings.SplitN(key, ":", 2)
+		endpointType := parts[0]
+		endpoint := parts[1]
+
+		exists, err := s.db.EndpointExists(ctx, endpoint, endpointType)
 		if err != nil || exists {
 			continue
 		}
 
-		if err := s.db.UpsertPDS(ctx, &storage.PDS{
-			Endpoint:     pdsEndpoint,
+		if err := s.db.UpsertEndpoint(ctx, &storage.Endpoint{
+			EndpointType: endpointType,
+			Endpoint:     endpoint,
 			DiscoveredAt: firstOp.CreatedAt,
 			LastChecked:  time.Time{},
-			Status:       storage.PDSStatusUnknown,
+			Status:       storage.EndpointStatusUnknown,
 		}); err != nil {
-			log.Error("Error storing PDS %s: %v", stripansi.Strip(pdsEndpoint), err)
+			log.Error("Error storing %s endpoint %s: %v", endpointType, endpoint, err)
 			continue
 		}
 
-		log.Info("✓ Discovered new PDS: %s", stripansi.Strip(pdsEndpoint))
-		newPDSCount++
+		log.Info("✓ Discovered new %s endpoint: %s", endpointType, endpoint)
+		newEndpointCount++
 	}
 
-	return newPDSCount, nil
+	return newEndpointCount, nil
 }
 
-func (s *Scanner) extractPDSFromOperation(op PLCOperation) string {
+// extractEndpointsFromOperation extracts ALL service endpoints
+func (s *Scanner) extractEndpointsFromOperation(op PLCOperation) []EndpointInfo {
+	var endpoints []EndpointInfo
+
 	if services, ok := op.Operation["services"].(map[string]interface{}); ok {
+		// Extract PDS
 		if atprotoPDS, ok := services["atproto_pds"].(map[string]interface{}); ok {
 			if endpoint, ok := atprotoPDS["endpoint"].(string); ok {
 				if svcType, ok := atprotoPDS["type"].(string); ok {
 					if svcType == "AtprotoPersonalDataServer" {
-						return endpoint
+						endpoints = append(endpoints, EndpointInfo{
+							Type:     "pds",
+							Endpoint: endpoint,
+						})
 					}
 				}
 			}
 		}
+
+		// Extract Labeler
+		if atprotoLabeler, ok := services["atproto_labeler"].(map[string]interface{}); ok {
+			if endpoint, ok := atprotoLabeler["endpoint"].(string); ok {
+				if svcType, ok := atprotoLabeler["type"].(string); ok {
+					if svcType == "AtprotoLabeler" {
+						endpoints = append(endpoints, EndpointInfo{
+							Type:     "labeler",
+							Endpoint: endpoint,
+						})
+					}
+				}
+			}
+		}
+
+		// Add more service types as needed...
 	}
-	return ""
+
+	return endpoints
 }
 
 func contains(s, substr string) bool {

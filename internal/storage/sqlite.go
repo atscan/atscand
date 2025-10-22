@@ -35,21 +35,25 @@ func (s *SQLiteDB) Close() error {
 
 func (s *SQLiteDB) Migrate() error {
 	schema := `
-    -- PDS tables (same as before)
-    CREATE TABLE IF NOT EXISTS pds_servers (
+    -- Endpoints table (replaces pds_servers)
+    CREATE TABLE IF NOT EXISTS endpoints (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        endpoint TEXT UNIQUE NOT NULL,
+        endpoint_type TEXT NOT NULL DEFAULT 'pds',
+        endpoint TEXT NOT NULL,
         discovered_at TIMESTAMP NOT NULL,
         last_checked TIMESTAMP,
         status INTEGER DEFAULT 0,
         user_count INTEGER DEFAULT 0,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(endpoint_type, endpoint)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_pds_endpoint ON pds_servers(endpoint);
-    CREATE INDEX IF NOT EXISTS idx_pds_status ON pds_servers(status);
-    CREATE INDEX IF NOT EXISTS idx_pds_user_count ON pds_servers(user_count);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_type_endpoint ON endpoints(endpoint_type, endpoint);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_status ON endpoints(status);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_user_count ON endpoints(user_count);
 
+    -- Keep pds_scans table (or rename to endpoint_scans later)
     CREATE TABLE IF NOT EXISTS pds_scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pds_id INTEGER NOT NULL,
@@ -57,7 +61,7 @@ func (s *SQLiteDB) Migrate() error {
         response_time REAL,
         scan_data TEXT,
         scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (pds_id) REFERENCES pds_servers(id) ON DELETE CASCADE
+        FOREIGN KEY (pds_id) REFERENCES endpoints(id) ON DELETE CASCADE
     );
 
     CREATE INDEX IF NOT EXISTS idx_pds_scans_pds_id ON pds_scans(pds_id);
@@ -501,106 +505,118 @@ func (s *SQLiteDB) GetBundleStats(ctx context.Context) (int64, int64, error) {
 	return count, totalSize, err
 }
 
-// UpsertPDS inserts or updates a PDS server
-func (s *SQLiteDB) UpsertPDS(ctx context.Context, pds *PDS) error {
+// UpsertEndpoint inserts or updates an endpoint
+func (s *SQLiteDB) UpsertEndpoint(ctx context.Context, endpoint *Endpoint) error {
 	query := `
-        INSERT INTO pds_servers (endpoint, discovered_at, last_checked, status)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(endpoint) DO UPDATE SET
+        INSERT INTO endpoints (endpoint_type, endpoint, discovered_at, last_checked, status)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(endpoint_type, endpoint) DO UPDATE SET
             last_checked = excluded.last_checked
         RETURNING id
     `
-	err := s.db.QueryRowContext(ctx, query, pds.Endpoint, pds.DiscoveredAt, pds.LastChecked, pds.Status).Scan(&pds.ID)
+	err := s.db.QueryRowContext(ctx, query,
+		endpoint.EndpointType, endpoint.Endpoint, endpoint.DiscoveredAt,
+		endpoint.LastChecked, endpoint.Status).Scan(&endpoint.ID)
 	return err
 }
 
-// PDSExists checks if a PDS endpoint already exists
-func (s *SQLiteDB) PDSExists(ctx context.Context, endpoint string) (bool, error) {
-	query := "SELECT EXISTS(SELECT 1 FROM pds_servers WHERE endpoint = ?)"
+// EndpointExists checks if an endpoint already exists
+func (s *SQLiteDB) EndpointExists(ctx context.Context, endpoint string, endpointType string) (bool, error) {
+	query := "SELECT EXISTS(SELECT 1 FROM endpoints WHERE endpoint = ? AND endpoint_type = ?)"
 	var exists bool
-	err := s.db.QueryRowContext(ctx, query, endpoint).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, query, endpoint, endpointType).Scan(&exists)
 	return exists, err
 }
 
-// GetPDSIDByEndpoint gets the ID for an endpoint
-func (s *SQLiteDB) GetPDSIDByEndpoint(ctx context.Context, endpoint string) (int64, error) {
-	query := "SELECT id FROM pds_servers WHERE endpoint = ?"
+// GetEndpointIDByEndpoint gets the ID for an endpoint
+func (s *SQLiteDB) GetEndpointIDByEndpoint(ctx context.Context, endpoint string, endpointType string) (int64, error) {
+	query := "SELECT id FROM endpoints WHERE endpoint = ? AND endpoint_type = ?"
 	var id int64
-	err := s.db.QueryRowContext(ctx, query, endpoint).Scan(&id)
+	err := s.db.QueryRowContext(ctx, query, endpoint, endpointType).Scan(&id)
 	return id, err
 }
 
-// GetPDS retrieves a PDS by endpoint
-func (s *SQLiteDB) GetPDS(ctx context.Context, endpoint string) (*PDS, error) {
+// GetEndpoint retrieves an endpoint by endpoint string and type
+func (s *SQLiteDB) GetEndpoint(ctx context.Context, endpoint string, endpointType string) (*Endpoint, error) {
 	query := `
-        SELECT id, endpoint, discovered_at, last_checked, status, user_count, updated_at
-        FROM pds_servers 
-        WHERE endpoint = ?
+        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, user_count, updated_at
+        FROM endpoints 
+        WHERE endpoint = ? AND endpoint_type = ?
     `
 
-	var pds PDS
+	var ep Endpoint
 	var lastChecked sql.NullTime
 
-	err := s.db.QueryRowContext(ctx, query, endpoint).Scan(
-		&pds.ID, &pds.Endpoint, &pds.DiscoveredAt, &lastChecked,
-		&pds.Status, &pds.UserCount, &pds.UpdatedAt,
+	err := s.db.QueryRowContext(ctx, query, endpoint, endpointType).Scan(
+		&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
+		&ep.Status, &ep.UserCount, &ep.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	if lastChecked.Valid {
-		pds.LastChecked = lastChecked.Time
+		ep.LastChecked = lastChecked.Time
 	}
 
-	return &pds, nil
+	return &ep, nil
 }
 
-// GetPDSByID retrieves a PDS by ID
-func (s *SQLiteDB) GetPDSByID(ctx context.Context, id int64) (*PDS, error) {
+// GetEndpointByID retrieves an endpoint by ID
+func (s *SQLiteDB) GetEndpointByID(ctx context.Context, id int64) (*Endpoint, error) {
 	query := `
-        SELECT id, endpoint, discovered_at, last_checked, status, user_count, updated_at
-        FROM pds_servers 
+        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, user_count, updated_at
+        FROM endpoints 
         WHERE id = ?
     `
 
-	var pds PDS
+	var ep Endpoint
 	var lastChecked sql.NullTime
 
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
-		&pds.ID, &pds.Endpoint, &pds.DiscoveredAt, &lastChecked,
-		&pds.Status, &pds.UserCount, &pds.UpdatedAt,
+		&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
+		&ep.Status, &ep.UserCount, &ep.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	if lastChecked.Valid {
-		pds.LastChecked = lastChecked.Time
+		ep.LastChecked = lastChecked.Time
 	}
 
-	return &pds, nil
+	return &ep, nil
 }
 
-// GetPDSServers retrieves multiple PDS servers
-func (s *SQLiteDB) GetPDSServers(ctx context.Context, filter *PDSFilter) ([]*PDS, error) {
+// GetEndpoints retrieves multiple endpoints
+func (s *SQLiteDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) ([]*Endpoint, error) {
 	query := `
-        SELECT id, endpoint, discovered_at, last_checked, status, user_count, updated_at
-        FROM pds_servers
+        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, user_count, updated_at
+        FROM endpoints
+        WHERE 1=1
     `
 	args := []interface{}{}
 
-	if filter != nil && filter.Status != "" {
-		// Map string status to int
-		statusInt := PDSStatusUnknown
-		switch filter.Status {
-		case "online":
-			statusInt = PDSStatusOnline
-		case "offline":
-			statusInt = PDSStatusOffline
+	if filter != nil {
+		if filter.Type != "" {
+			query += " AND endpoint_type = ?"
+			args = append(args, filter.Type)
 		}
-		query += " WHERE status = ?"
-		args = append(args, statusInt)
+		if filter.Status != "" {
+			statusInt := EndpointStatusUnknown
+			switch filter.Status {
+			case "online":
+				statusInt = EndpointStatusOnline
+			case "offline":
+				statusInt = EndpointStatusOffline
+			}
+			query += " AND status = ?"
+			args = append(args, statusInt)
+		}
+		if filter.MinUserCount > 0 {
+			query += " AND user_count >= ?"
+			args = append(args, filter.MinUserCount)
+		}
 	}
 
 	query += " ORDER BY user_count DESC"
@@ -615,31 +631,31 @@ func (s *SQLiteDB) GetPDSServers(ctx context.Context, filter *PDSFilter) ([]*PDS
 	}
 	defer rows.Close()
 
-	var servers []*PDS
+	var endpoints []*Endpoint
 	for rows.Next() {
-		var pds PDS
+		var ep Endpoint
 		var lastChecked sql.NullTime
 
 		err := rows.Scan(
-			&pds.ID, &pds.Endpoint, &pds.DiscoveredAt, &lastChecked,
-			&pds.Status, &pds.UserCount, &pds.UpdatedAt,
+			&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
+			&ep.Status, &ep.UserCount, &ep.UpdatedAt,
 		)
 		if err != nil {
 			return nil, err
 		}
 
 		if lastChecked.Valid {
-			pds.LastChecked = lastChecked.Time
+			ep.LastChecked = lastChecked.Time
 		}
 
-		servers = append(servers, &pds)
+		endpoints = append(endpoints, &ep)
 	}
 
-	return servers, rows.Err()
+	return endpoints, rows.Err()
 }
 
-// UpdatePDSStatus updates the status and creates a scan record
-func (s *SQLiteDB) UpdatePDSStatus(ctx context.Context, pdsID int64, update *PDSUpdate) error {
+// UpdateEndpointStatus updates the status and creates a scan record
+func (s *SQLiteDB) UpdateEndpointStatus(ctx context.Context, endpointID int64, update *EndpointUpdate) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -652,13 +668,13 @@ func (s *SQLiteDB) UpdatePDSStatus(ctx context.Context, pdsID int64, update *PDS
 		userCount = update.ScanData.DIDCount
 	}
 
-	// Update main pds_servers record
+	// Update main endpoints record
 	query := `
-        UPDATE pds_servers 
+        UPDATE endpoints 
         SET status = ?, last_checked = ?, user_count = ?, updated_at = ?
         WHERE id = ?
     `
-	_, err = tx.ExecContext(ctx, query, update.Status, update.LastChecked, userCount, time.Now(), pdsID)
+	_, err = tx.ExecContext(ctx, query, update.Status, update.LastChecked, userCount, time.Now(), endpointID)
 	if err != nil {
 		return err
 	}
@@ -669,12 +685,12 @@ func (s *SQLiteDB) UpdatePDSStatus(ctx context.Context, pdsID int64, update *PDS
 		scanDataJSON, _ = json.Marshal(update.ScanData)
 	}
 
-	// Insert scan history
+	// Insert scan history (reuse pds_scans table or rename it to endpoint_scans)
 	scanQuery := `
         INSERT INTO pds_scans (pds_id, status, response_time, scan_data)
         VALUES (?, ?, ?, ?)
     `
-	_, err = tx.ExecContext(ctx, scanQuery, pdsID, update.Status, update.ResponseTime, string(scanDataJSON))
+	_, err = tx.ExecContext(ctx, scanQuery, endpointID, update.Status, update.ResponseTime, string(scanDataJSON))
 	if err != nil {
 		return err
 	}
@@ -682,8 +698,8 @@ func (s *SQLiteDB) UpdatePDSStatus(ctx context.Context, pdsID int64, update *PDS
 	return tx.Commit()
 }
 
-// GetPDSScans retrieves scan history for a PDS
-func (s *SQLiteDB) GetPDSScans(ctx context.Context, pdsID int64, limit int) ([]*PDSScan, error) {
+// GetEndpointScans retrieves scan history for an endpoint
+func (s *SQLiteDB) GetEndpointScans(ctx context.Context, endpointID int64, limit int) ([]*EndpointScan, error) {
 	query := `
         SELECT id, pds_id, status, response_time, scan_data, scanned_at
         FROM pds_scans
@@ -692,19 +708,19 @@ func (s *SQLiteDB) GetPDSScans(ctx context.Context, pdsID int64, limit int) ([]*
         LIMIT ?
     `
 
-	rows, err := s.db.QueryContext(ctx, query, pdsID, limit)
+	rows, err := s.db.QueryContext(ctx, query, endpointID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var scans []*PDSScan
+	var scans []*EndpointScan
 	for rows.Next() {
-		var scan PDSScan
+		var scan EndpointScan
 		var responseTime sql.NullFloat64
 		var scanDataJSON sql.NullString
 
-		err := rows.Scan(&scan.ID, &scan.PDSID, &scan.Status, &responseTime, &scanDataJSON, &scan.ScannedAt)
+		err := rows.Scan(&scan.ID, &scan.EndpointID, &scan.Status, &responseTime, &scanDataJSON, &scan.ScannedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -714,7 +730,7 @@ func (s *SQLiteDB) GetPDSScans(ctx context.Context, pdsID int64, limit int) ([]*
 		}
 
 		if scanDataJSON.Valid && scanDataJSON.String != "" {
-			var scanData PDSScanData
+			var scanData EndpointScanData
 			if err := json.Unmarshal([]byte(scanDataJSON.String), &scanData); err == nil {
 				scan.ScanData = &scanData
 			}
@@ -726,28 +742,48 @@ func (s *SQLiteDB) GetPDSScans(ctx context.Context, pdsID int64, limit int) ([]*
 	return scans, rows.Err()
 }
 
-// GetPDSStats returns aggregate statistics
-func (s *SQLiteDB) GetPDSStats(ctx context.Context) (*PDSStats, error) {
+// GetEndpointStats returns aggregate statistics about all endpoints
+func (s *SQLiteDB) GetEndpointStats(ctx context.Context) (*EndpointStats, error) {
 	query := `
         SELECT 
-            COUNT(*) as total_pds,
-            SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as online_pds,
-            SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) as offline_pds,
+            COUNT(*) as total_endpoints,
+            SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as online_endpoints,
+            SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) as offline_endpoints,
             (SELECT AVG(response_time) FROM pds_scans WHERE response_time > 0 
              AND scanned_at > datetime('now', '-1 hour')) as avg_response_time,
             SUM(user_count) as total_dids
-        FROM pds_servers
+        FROM endpoints
     `
 
-	var stats PDSStats
+	var stats EndpointStats
 	var avgResponseTime sql.NullFloat64
 
 	err := s.db.QueryRowContext(ctx, query).Scan(
-		&stats.TotalPDS, &stats.OnlinePDS, &stats.OfflinePDS, &avgResponseTime, &stats.TotalDIDs,
+		&stats.TotalEndpoints, &stats.OnlineEndpoints, &stats.OfflineEndpoints,
+		&avgResponseTime, &stats.TotalDIDs,
 	)
 
 	if avgResponseTime.Valid {
 		stats.AvgResponseTime = avgResponseTime.Float64
+	}
+
+	// Get counts by type
+	typeQuery := `
+        SELECT endpoint_type, COUNT(*) 
+        FROM endpoints 
+        GROUP BY endpoint_type
+    `
+	rows, err := s.db.QueryContext(ctx, typeQuery)
+	if err == nil {
+		defer rows.Close()
+		stats.ByType = make(map[string]int64)
+		for rows.Next() {
+			var typ string
+			var count int64
+			if err := rows.Scan(&typ, &count); err == nil {
+				stats.ByType[typ] = count
+			}
+		}
 	}
 
 	return &stats, err

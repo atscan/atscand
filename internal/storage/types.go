@@ -15,39 +15,41 @@ type DID struct {
 	UpdatedAt   time.Time
 }
 
-// PDS represents a Personal Data Server
-type PDS struct {
-	ID           int64  // NEW: Primary key
-	Endpoint     string // UNIQUE but not primary key
+// Endpoint represents any AT Protocol service endpoint
+type Endpoint struct {
+	ID           int64
+	EndpointType string // "pds", "labeler", etc.
+	Endpoint     string
 	DiscoveredAt time.Time
 	LastChecked  time.Time
-	Status       int // 0=unknown, 1=online, 2=offline
+	Status       int
 	UserCount    int64
 	UpdatedAt    time.Time
 }
 
-// PDSUpdate contains fields to update for a PDS
-type PDSUpdate struct {
+// EndpointUpdate contains fields to update for an Endpoint
+type EndpointUpdate struct {
 	Status       int
 	LastChecked  time.Time
-	ResponseTime float64 // milliseconds as float
-	ScanData     *PDSScanData
+	ResponseTime float64
+	ScanData     *EndpointScanData
 }
 
-// PDSScanData contains data from a PDS scan
-type PDSScanData struct {
+// EndpointScanData contains data from an endpoint scan
+type EndpointScanData struct {
 	ServerInfo interface{} `json:"server_info,omitempty"`
 	DIDs       []string    `json:"dids,omitempty"`
 	DIDCount   int         `json:"did_count"`
+	Metadata   interface{} `json:"metadata,omitempty"` // Type-specific metadata
 }
 
-// PDSScan represents a historical PDS scan
-type PDSScan struct {
+// EndpointScan represents a historical endpoint scan
+type EndpointScan struct {
 	ID           int64
-	PDSID        int64
+	EndpointID   int64
 	Status       int
 	ResponseTime float64
-	ScanData     *PDSScanData
+	ScanData     *EndpointScanData
 	ScannedAt    time.Time
 }
 
@@ -58,23 +60,39 @@ const (
 	PDSStatusOffline = 2
 )
 
-// PDSFilter for querying PDS servers
-type PDSFilter struct {
+// Endpoint status constants (aliases for compatibility)
+const (
+	EndpointStatusUnknown = PDSStatusUnknown
+	EndpointStatusOnline  = PDSStatusOnline
+	EndpointStatusOffline = PDSStatusOffline
+)
+
+// EndpointFilter for querying endpoints
+type EndpointFilter struct {
+	Type         string // "pds", "labeler", etc.
 	Status       string
 	MinUserCount int64
 	Limit        int
 	Offset       int
 }
 
-// PDSStats contains aggregate statistics about PDS servers
-type PDSStats struct {
-	TotalPDS        int64   `json:"total_pds"`
-	UniquePDS       int64   `json:"unique_pds"`
-	OnlinePDS       int64   `json:"online_pds"`
-	OfflinePDS      int64   `json:"offline_pds"`
-	AvgResponseTime float64 `json:"avg_response_time"`
-	TotalDIDs       int64   `json:"total_dids"`
+// EndpointStats contains aggregate statistics about endpoints
+type EndpointStats struct {
+	TotalEndpoints   int64            `json:"total_endpoints"`
+	ByType           map[string]int64 `json:"by_type"`
+	OnlineEndpoints  int64            `json:"online_endpoints"`
+	OfflineEndpoints int64            `json:"offline_endpoints"`
+	AvgResponseTime  float64          `json:"avg_response_time"`
+	TotalDIDs        int64            `json:"total_dids"` // Only for PDS
 }
+
+// Legacy type aliases for backward compatibility in code
+type PDS = Endpoint
+type PDSUpdate = EndpointUpdate
+type PDSScanData = EndpointScanData
+type PDSScan = EndpointScan
+type PDSFilter = EndpointFilter
+type PDSStats = EndpointStats
 
 // PLCMetrics contains metrics from PLC directory scans
 type PLCMetrics struct {
@@ -88,15 +106,15 @@ type PLCMetrics struct {
 
 // PLCBundle represents a cached bundle of PLC operations
 type PLCBundle struct {
-	BundleNumber   int // PRIMARY KEY
+	BundleNumber   int
 	StartTime      time.Time
 	EndTime        time.Time
 	BoundaryCIDs   []string
 	DIDs           []string
-	Hash           string // SHA256 of uncompressed JSONL (verifiable against PLC)
-	CompressedHash string // SHA256 of compressed file on disk
-	CompressedSize int64  // Size of compressed file in bytes
-	PrevBundleHash string // Hash of previous bundle (for chain)
+	Hash           string
+	CompressedHash string
+	CompressedSize int64
+	PrevBundleHash string
 	Compressed     bool
 	CreatedAt      time.Time
 }
@@ -106,25 +124,25 @@ func (b *PLCBundle) GetFilePath(bundleDir string) string {
 	return filepath.Join(bundleDir, fmt.Sprintf("%06d.jsonl.zst", b.BundleNumber))
 }
 
-// OperationCount() returns 1000 (all bundles have exactly 1000 operations)
+// OperationCount returns the number of operations in a bundle (always 10000)
 func (b *PLCBundle) OperationCount() int {
-	return 1000
+	return 10000
 }
 
 // MempoolOperation represents an operation waiting to be bundled
 type MempoolOperation struct {
 	ID        int64
 	DID       string
-	Operation string // JSON of the full operation
+	Operation string
 	CID       string
 	CreatedAt time.Time
 	AddedAt   time.Time
 }
 
-// ScanCursor now stores bundle number
+// ScanCursor stores scanning progress
 type ScanCursor struct {
 	Source           string
-	LastBundleNumber int // NEW: Last processed bundle number
+	LastBundleNumber int
 	LastScanTime     time.Time
 	RecordsProcessed int64
 }

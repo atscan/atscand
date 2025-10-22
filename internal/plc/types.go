@@ -69,3 +69,8 @@ type DIDHistory struct {
 	Current    *PLCOperation     `json:"current"`
 	Operations []DIDHistoryEntry `json:"operations"`
 }
+
+type EndpointInfo struct {
+	Type     string
+	Endpoint string
+}

@@ -29,7 +29,10 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	startTime := time.Now()
 	log.Info("Starting PDS availability scan...")
 
-	servers, err := s.db.GetPDSServers(ctx, nil)
+	// Get only PDS endpoints
+	servers, err := s.db.GetEndpoints(ctx, &storage.EndpointFilter{
+		Type: "pds",
+	})
 	if err != nil {
 		return err
 	}
@@ -37,7 +40,7 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	log.Info("Scanning %d PDS servers...", len(servers))
 
 	// Worker pool
-	jobs := make(chan *storage.PDS, len(servers))
+	jobs := make(chan *storage.Endpoint, len(servers))
 	results := make(chan *PDSStatus, len(servers))
 
 	var wg sync.WaitGroup
@@ -74,20 +77,20 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 		}
 
 		// Build scan data
-		scanData := &storage.PDSScanData{
+		scanData := &storage.EndpointScanData{
 			ServerInfo: status.Description,
 			DIDs:       status.DIDs,
 			DIDCount:   len(status.DIDs),
 		}
 
-		// Update using PDS ID
-		if err := s.db.UpdatePDSStatus(ctx, status.PDSID, &storage.PDSUpdate{
+		// Update using Endpoint ID
+		if err := s.db.UpdateEndpointStatus(ctx, status.EndpointID, &storage.EndpointUpdate{
 			Status:       statusCode,
 			LastChecked:  status.LastChecked,
 			ResponseTime: status.ResponseTime.Seconds() * 1000, // Convert to ms
 			ScanData:     scanData,
 		}); err != nil {
-			log.Error("Error updating PDS ID %d: %v", status.PDSID, err)
+			log.Error("Error updating endpoint ID %d: %v", status.EndpointID, err)
 		}
 
 		if status.Available {
@@ -104,7 +107,7 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	return nil
 }
 
-func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.PDS, results chan<- *PDSStatus) {
+func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.Endpoint, results chan<- *PDSStatus) {
 	for server := range jobs {
 		select {
 		case <-ctx.Done():
@@ -116,9 +119,9 @@ func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.PDS, results 
 	}
 }
 
-func (s *Scanner) scanPDS(ctx context.Context, pdsID int64, endpoint string) *PDSStatus {
+func (s *Scanner) scanPDS(ctx context.Context, endpointID int64, endpoint string) *PDSStatus {
 	status := &PDSStatus{
-		PDSID:       pdsID, // Store ID
+		EndpointID:  endpointID, // Store Endpoint ID
 		Endpoint:    endpoint,
 		LastChecked: time.Now(),
 	}
@@ -146,7 +149,7 @@ func (s *Scanner) scanPDS(ctx context.Context, pdsID int64, endpoint string) *PD
 		status.Description = desc
 	}
 
-	// List repos (DIDs)
+	// Optionally list repos (DIDs) - commented out by default for performance
 	/*dids, err := s.client.ListRepos(ctx, endpoint)
 	if err != nil {
 		log.Verbose("Warning: failed to list repos for %s: %v", endpoint, err)

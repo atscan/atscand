@@ -52,37 +52,38 @@ func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCCo
 func (s *Server) setupRoutes() {
 	api := s.router.PathPrefix("/api/v1").Subrouter()
 
-	// PDS endpoints
-	api.HandleFunc("/pds", s.handleGetPDSList).Methods("GET")
-	api.HandleFunc("/pds/stats", s.handleGetPDSStats).Methods("GET")
-	api.HandleFunc("/pds/{endpoint}", s.handleGetPDS).Methods("GET")
+	// Endpoint routes (replaces PDS routes)
+	api.HandleFunc("/endpoints", s.handleGetEndpoints).Methods("GET")
+	api.HandleFunc("/endpoints/stats", s.handleGetEndpointStats).Methods("GET")
+	api.HandleFunc("/endpoints/{endpoint}", s.handleGetEndpoint).Methods("GET")
 
-	// Metrics endpoints
-	api.HandleFunc("/metrics/plc", s.handleGetPLCMetrics).Methods("GET")
-
-	// PLC Bundle endpoints
+	// PLC Bundle routes
 	api.HandleFunc("/plc/bundles", s.handleGetPLCBundles).Methods("GET")
 	api.HandleFunc("/plc/bundles/stats", s.handleGetPLCBundleStats).Methods("GET")
 	api.HandleFunc("/plc/bundles/chain", s.handleGetChainInfo).Methods("GET")
 	api.HandleFunc("/plc/bundles/verify-chain", s.handleVerifyChain).Methods("POST")
+	api.HandleFunc("/plc/bundles/{number}", s.handleGetPLCBundle).Methods("GET")
 	api.HandleFunc("/plc/bundles/{number}/dids", s.handleGetPLCBundleDIDs).Methods("GET")
 	api.HandleFunc("/plc/bundles/{number}/download", s.handleDownloadPLCBundle).Methods("GET")
 	api.HandleFunc("/plc/bundles/{bundleNumber}/verify", s.handleVerifyPLCBundle).Methods("POST")
-	api.HandleFunc("/plc/bundles/{number}", s.handleGetPLCBundle).Methods("GET")
+
+	// PLC Export endpoint (simulates PLC directory)
 	api.HandleFunc("/plc/export", s.handlePLCExport).Methods("GET")
 
-	// PLC/DID endpoints
+	// DID routes
 	api.HandleFunc("/plc/did/{did}", s.handleGetDID).Methods("GET")
 	api.HandleFunc("/plc/did/{did}/history", s.handleGetDIDHistory).Methods("GET")
 
-	// Mempool endpoint - NEW
+	// Mempool routes
 	api.HandleFunc("/mempool/stats", s.handleGetMempoolStats).Methods("GET")
 
-	// Chain verification - NEW
+	// Metrics routes
+	api.HandleFunc("/metrics/plc", s.handleGetPLCMetrics).Methods("GET")
 
 	// Health check
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
 }
+
 func (s *Server) Start() error {
 	log.Info("API server listening on %s", s.server.Addr)
 	return s.server.ListenAndServe()
