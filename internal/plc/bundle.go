@@ -17,7 +17,6 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// BUNDLE_SIZE is the number of operations per bundle
 const BUNDLE_SIZE = 10000
 
 type BundleManager struct {
@@ -27,6 +26,8 @@ type BundleManager struct {
 	decoder *zstd.Decoder
 	db      storage.Database
 }
+
+// ===== INITIALIZATION =====
 
 func NewBundleManager(dir string, enabled bool, db storage.Database) (*BundleManager, error) {
 	if !enabled {
@@ -49,7 +50,7 @@ func NewBundleManager(dir string, enabled bool, db storage.Database) (*BundleMan
 
 	return &BundleManager{
 		dir:     dir,
-		enabled: true,
+		enabled: enabled,
 		encoder: encoder,
 		decoder: decoder,
 		db:      db,
@@ -65,447 +66,288 @@ func (bm *BundleManager) Close() {
 	}
 }
 
-// GetBundleFilename returns filename for bundle number (6-digit decimal, JSONL format)
-func (bm *BundleManager) GetBundleFilename(bundleNumber int) string {
-	return fmt.Sprintf("%06d.jsonl.zst", bundleNumber)
+// ===== BUNDLE FILE ABSTRACTION =====
+
+type bundleFile struct {
+	path             string
+	operations       []PLCOperation
+	uncompressedHash string
+	compressedHash   string
 }
 
-// GetBundlePath returns full path for bundle number
-func (bm *BundleManager) GetBundlePath(bundleNumber int) string {
-	return filepath.Join(bm.dir, bm.GetBundleFilename(bundleNumber))
+func (bm *BundleManager) newBundleFile(bundleNum int) *bundleFile {
+	return &bundleFile{
+		path: filepath.Join(bm.dir, fmt.Sprintf("%06d.jsonl.zst", bundleNum)),
+	}
 }
 
-// BundleExists checks if bundle file exists locally
-func (bm *BundleManager) BundleExists(bundleNumber int) bool {
-	_, err := os.Stat(bm.GetBundlePath(bundleNumber))
+func (bf *bundleFile) exists() bool {
+	_, err := os.Stat(bf.path)
 	return err == nil
 }
 
-// LoadBundle returns exactly 1000 unique operations by fetching additional batches if needed
-func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNumber int, plcClient *Client) ([]PLCOperation, bool, error) {
-	if !bm.enabled {
-		return nil, false, fmt.Errorf("bundle manager disabled")
+func (bm *BundleManager) load(bf *bundleFile) error {
+	compressed, err := os.ReadFile(bf.path)
+	if err != nil {
+		return fmt.Errorf("read failed: %w", err)
 	}
 
-	path := bm.GetBundlePath(bundleNumber)
-
-	// Try to load from local file first
-	if bm.BundleExists(bundleNumber) {
-		log.Verbose("→ Loading bundle %06d from local file", bundleNumber)
-
-		// Check if bundle exists in database
-		dbBundle, dbErr := bm.db.GetBundleByNumber(ctx, bundleNumber)
-		bundleInDB := dbErr == nil && dbBundle != nil
-
-		if bundleInDB {
-			// Verify compressed file hash
-			if dbBundle.CompressedHash != "" {
-				valid, err := bm.verifyBundleHash(path, dbBundle.CompressedHash)
-				if err != nil {
-					log.Error("Warning: failed to verify compressed hash for bundle %06d: %v", bundleNumber, err)
-				} else if !valid {
-					log.Error("⚠ Compressed hash mismatch for bundle %06d! Re-fetching...", bundleNumber)
-					os.Remove(path)
-					return bm.LoadBundle(ctx, bundleNumber, plcClient)
-				} else {
-					log.Verbose("✓ Hash verified for bundle %06d", bundleNumber)
-				}
-			}
-		}
-
-		// Load operations from file
-		operations, err := bm.loadBundleFromFile(path)
-		if err != nil {
-			return nil, false, fmt.Errorf("failed to load bundle from file: %w", err)
-		}
-
-		// If not in database, index it now
-		if !bundleInDB {
-			// Calculate both hashes
-			fileData, err := os.ReadFile(path)
-			if err != nil {
-				log.Error("Warning: failed to read file: %v", err)
-			} else {
-				compressedHash := bm.calculateHash(fileData)
-
-				// Calculate uncompressed hash
-				var jsonlData []byte
-				for _, op := range operations {
-					jsonlData = append(jsonlData, op.RawJSON...)
-					jsonlData = append(jsonlData, '\n')
-				}
-				uncompressedHash := bm.calculateHash(jsonlData)
-
-				if err := bm.indexBundleWithHash(ctx, bundleNumber, operations, path, uncompressedHash, compressedHash); err != nil {
-					log.Error("Warning: failed to index bundle: %v", err)
-				} else {
-					log.Info("✓ Indexed bundle %06d", bundleNumber)
-				}
-			}
-		}
-
-		// If loaded from disk, it's always complete
-		return operations, true, nil
+	decompressed, err := bm.decoder.DecodeAll(compressed, nil)
+	if err != nil {
+		return fmt.Errorf("decompress failed: %w", err)
 	}
 
-	// Bundle doesn't exist locally - fetch from PLC directory
-	log.Info("→ Bundle %06d not found locally, fetching from PLC directory...", bundleNumber)
-
-	var afterTimestamp string
-	var prevBoundaryCIDs map[string]bool
-
-	if bundleNumber > 1 {
-		prevBundle, err := bm.db.GetBundleByNumber(ctx, bundleNumber-1)
-		if err == nil && prevBundle != nil {
-			afterTimestamp = prevBundle.EndTime.Format(time.RFC3339Nano)
-
-			// Get boundary CIDs from previous bundle
-			if len(prevBundle.BoundaryCIDs) > 0 {
-				prevBoundaryCIDs = make(map[string]bool)
-				for _, cid := range prevBundle.BoundaryCIDs {
-					prevBoundaryCIDs[cid] = true
-				}
-				log.Verbose("  Using %d boundary CIDs from previous bundle", len(prevBoundaryCIDs))
-			} else {
-				// Fallback: load previous bundle's operations
-				prevPath := bm.GetBundlePath(bundleNumber - 1)
-				if bm.BundleExists(bundleNumber - 1) {
-					prevOps, err := bm.loadBundleFromFile(prevPath)
-					if err == nil {
-						_, prevBoundaryCIDs = GetBoundaryCIDs(prevOps)
-						log.Verbose("  Computed %d boundary CIDs from previous bundle file", len(prevBoundaryCIDs))
-					}
-				}
-			}
-		}
-	}
-
-	// Collect operations until we have exactly BUNDLE_SIZE unique ones
-	var allOperations []PLCOperation
-	seenCIDs := make(map[string]bool)
-
-	// Track what we've already seen from previous bundle
-	for cid := range prevBoundaryCIDs {
-		seenCIDs[cid] = true
-	}
-
-	currentAfter := afterTimestamp
-
-	// Scale maxFetches based on bundle size
-	// Assume worst case: 90% dedup rate, need buffer
-	maxFetches := (BUNDLE_SIZE / 900) + 5 // For 10k: ~16 fetches, for 1k: ~6 fetches
-	fetchCount := 0
-
-	for len(allOperations) < BUNDLE_SIZE && fetchCount < maxFetches {
-		fetchCount++
-
-		// Calculate how many more operations we need
-		remaining := BUNDLE_SIZE - len(allOperations)
-
-		// Determine fetch size based on remaining operations
-		var fetchSize int
-		if fetchCount == 1 {
-			// First fetch: always get 1000 (PLC limit)
-			fetchSize = 1000
-		} else if remaining < 100 {
-			// Need less than 100: fetch 50
-			fetchSize = 50
-		} else if remaining < 500 {
-			// Need 100-500: fetch 200
-			fetchSize = 200
-		} else {
-			// Need 500+: fetch 1000
-			fetchSize = 1000
-		}
-
-		// Fetch next batch
-		log.Verbose("  Fetch #%d: need %d more, requesting %d", fetchCount, remaining, fetchSize)
-
-		rawOperations, err := bm.fetchBundleFromPLCWithCount(ctx, plcClient, currentAfter, fetchSize)
-		if err != nil {
-			return nil, false, fmt.Errorf("failed to fetch bundle from PLC: %w", err)
-		}
-
-		if len(rawOperations) == 0 {
-			// No more data available
-			log.Info("  No more operations available after %d fetches (got %d/%d)",
-				fetchCount, len(allOperations), BUNDLE_SIZE)
-			break
-		}
-
-		log.Verbose("    Got %d raw operations", len(rawOperations))
-
-		// Filter out duplicates and add unique operations
-		newOpsAdded := 0
-		for _, op := range rawOperations {
-			if !seenCIDs[op.CID] {
-				seenCIDs[op.CID] = true
-				allOperations = append(allOperations, op)
-				newOpsAdded++
-
-				if len(allOperations) >= BUNDLE_SIZE {
-					break
-				}
-			}
-		}
-
-		log.Verbose("    Added %d unique operations (total: %d/%d, %d dupes)",
-			newOpsAdded, len(allOperations), BUNDLE_SIZE, len(rawOperations)-newOpsAdded)
-
-		// If we added no new operations, we're stuck
-		if newOpsAdded == 0 {
-			log.Error("  No new unique operations found, stopping")
-			break
-		}
-
-		// Update cursor for next fetch
-		if len(rawOperations) > 0 {
-			lastOp := rawOperations[len(rawOperations)-1]
-			currentAfter = lastOp.CreatedAt.Format(time.RFC3339Nano)
-		}
-
-		// If PLC returned less than requested, we've reached the end
-		if len(rawOperations) < fetchSize {
-			log.Info("  Reached end of PLC data (got %d < %d requested)", len(rawOperations), fetchSize)
-			break
-		}
-	}
-
-	// Warn if we hit the fetch limit
-	if fetchCount >= maxFetches {
-		log.Verbose("  ⚠ Hit maxFetches limit (%d) with only %d/%d operations",
-			maxFetches, len(allOperations), BUNDLE_SIZE)
-	}
-
-	// Check if we got exactly BUNDLE_SIZE operations
-	isComplete := len(allOperations) >= BUNDLE_SIZE
-
-	if len(allOperations) > BUNDLE_SIZE {
-		// Trim to exactly BUNDLE_SIZE
-		log.Verbose("  Trimming from %d to %d operations", len(allOperations), BUNDLE_SIZE)
-		allOperations = allOperations[:BUNDLE_SIZE]
-	}
-
-	log.Info("  Collected %d unique operations after %d fetches (complete=%v, target=%d)",
-		len(allOperations), fetchCount, isComplete, BUNDLE_SIZE)
-
-	// Only save as bundle if complete
-	if isComplete {
-		// Save bundle with both hashes
-		uncompressedHash, compressedHash, err := bm.saveBundleFileWithHash(path, allOperations)
-		if err != nil {
-			log.Error("Warning: failed to save bundle file: %v", err)
-		} else {
-			// Index with both hashes
-			if err := bm.indexBundleWithHash(ctx, bundleNumber, allOperations, path, uncompressedHash, compressedHash); err != nil {
-				log.Error("Warning: failed to index bundle: %v", err)
-			} else {
-				log.Info("✓ Bundle %06d saved [%d ops, hash: %s, compressed: %s]",
-					bundleNumber, len(allOperations), uncompressedHash[:16]+"...", compressedHash[:16]+"...")
-			}
-		}
-	}
-
-	return allOperations, isComplete, nil
+	bf.operations = bm.parseJSONL(decompressed)
+	return nil
 }
 
-// fetchBundleFromPLCWithCount fetches operations with a specific count
-func (bm *BundleManager) fetchBundleFromPLCWithCount(ctx context.Context, client *Client, afterTimestamp string, count int) ([]PLCOperation, error) {
-	return client.Export(ctx, ExportOptions{
-		Count: count,
-		After: afterTimestamp,
-	})
-}
+func (bm *BundleManager) save(bf *bundleFile) error {
+	jsonlData := bm.serializeJSONL(bf.operations)
+	bf.uncompressedHash = bm.hash(jsonlData)
 
-// saveBundleFileWithHash - NO trailing newline
-func (bm *BundleManager) saveBundleFileWithHash(path string, operations []PLCOperation) (string, string, error) {
-	var jsonlData []byte
-	for _, op := range operations {
-		jsonlData = append(jsonlData, op.RawJSON...)
-		jsonlData = append(jsonlData, '\n')
-	}
-
-	uncompressedHash := bm.calculateHash(jsonlData)
 	compressed := bm.encoder.EncodeAll(jsonlData, nil)
-	compressedHash := bm.calculateHash(compressed)
+	bf.compressedHash = bm.hash(compressed)
 
-	if err := os.WriteFile(path, compressed, 0644); err != nil {
-		return "", "", err
-	}
-
-	return uncompressedHash, compressedHash, nil
+	return os.WriteFile(bf.path, compressed, 0644)
 }
 
-// fetchBundleFromPLC fetches operations from PLC directory (returns RAW operations)
-func (bm *BundleManager) fetchBundleFromPLC(ctx context.Context, client *Client, afterTimestamp string) ([]PLCOperation, error) {
-	// Just fetch - no deduplication here
-	return client.Export(ctx, ExportOptions{
-		Count: 1000,
-		After: afterTimestamp,
-	})
-}
+func (bm *BundleManager) parseJSONL(data []byte) []PLCOperation {
+	var ops []PLCOperation
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 
-// StripBoundaryDuplicates removes operations that were already seen on the previous page
-// This is exported so it can be used in verification
-func StripBoundaryDuplicates(operations []PLCOperation, boundaryTimestamp string, prevBoundaryCIDs map[string]bool) []PLCOperation {
-	if len(operations) == 0 {
-		return operations
-	}
-
-	boundaryTime, err := time.Parse(time.RFC3339Nano, boundaryTimestamp)
-	if err != nil {
-		return operations
-	}
-
-	// Skip operations at the start that match the boundary
-	startIdx := 0
-	for startIdx < len(operations) {
-		op := operations[startIdx]
-
-		// If timestamp is AFTER boundary, we're past duplicates
-		if op.CreatedAt.After(boundaryTime) {
-			break
-		}
-
-		// Same timestamp - check if we've seen this CID before
-		if op.CreatedAt.Equal(boundaryTime) {
-			if prevBoundaryCIDs[op.CID] {
-				// This is a duplicate, skip it
-				startIdx++
-				continue
-			}
-			// Same timestamp but new CID - keep it
-			break
-		}
-
-		// Earlier timestamp (shouldn't happen)
-		break
-	}
-
-	return operations[startIdx:]
-}
-
-// Keep the private version for internal use
-func stripBoundaryDuplicates(operations []PLCOperation, boundaryTimestamp string, prevBoundaryCIDs map[string]bool) []PLCOperation {
-	return StripBoundaryDuplicates(operations, boundaryTimestamp, prevBoundaryCIDs)
-}
-
-// GetBoundaryCIDs returns all CIDs that share the same timestamp as the last operation
-func GetBoundaryCIDs(operations []PLCOperation) (time.Time, map[string]bool) {
-	if len(operations) == 0 {
-		return time.Time{}, nil
-	}
-
-	lastOp := operations[len(operations)-1]
-	boundaryTime := lastOp.CreatedAt
-	cidSet := make(map[string]bool)
-
-	// Walk backwards from the end, collecting all CIDs with the same timestamp
-	for i := len(operations) - 1; i >= 0; i-- {
-		op := operations[i]
-		if op.CreatedAt.Equal(boundaryTime) {
-			cidSet[op.CID] = true
-		} else {
-			// Different timestamp, we're done
-			break
-		}
-	}
-
-	return boundaryTime, cidSet
-}
-
-// saveBundleFile (keep for compatibility, calls saveBundleFileWithHash)
-func (bm *BundleManager) saveBundleFile(path string, operations []PLCOperation) error {
-	_, _, err := bm.saveBundleFileWithHash(path, operations) // ✅ All 3 values
-	return err
-}
-
-// loadBundleFromFile loads operations from bundle file (JSONL format)
-func (bm *BundleManager) loadBundleFromFile(path string) ([]PLCOperation, error) {
-	// Read compressed file
-	compressedData, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read bundle file: %w", err)
-	}
-
-	// Decompress
-	decompressed, err := bm.decoder.DecodeAll(compressedData, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress bundle: %w", err)
-	}
-
-	// Parse JSONL (newline-delimited JSON)
-	var operations []PLCOperation
-	scanner := bufio.NewScanner(bytes.NewReader(decompressed))
-
-	lineNum := 0
 	for scanner.Scan() {
-		lineNum++
 		line := scanner.Bytes()
-
-		// Skip empty lines
 		if len(line) == 0 {
 			continue
 		}
 
 		var op PLCOperation
-		if err := json.Unmarshal(line, &op); err != nil {
-			return nil, fmt.Errorf("failed to parse operation on line %d: %w", lineNum, err)
+		if err := json.Unmarshal(line, &op); err == nil {
+			op.RawJSON = append([]byte(nil), line...)
+			ops = append(ops, op)
 		}
-
-		// CRITICAL: Store the original raw JSON bytes
-		op.RawJSON = make([]byte, len(line))
-		copy(op.RawJSON, line)
-
-		operations = append(operations, op)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading JSONL: %w", err)
-	}
-
-	return operations, nil
+	return ops
 }
 
-// indexBundleWithHash stores bundle with both hashes
-func (bm *BundleManager) indexBundleWithHash(ctx context.Context, bundleNumber int, operations []PLCOperation, path string, uncompressedHash, compressedHash string) error {
-	// Get previous bundle's hash (uncompressed)
-	var prevBundleHash string
-	if bundleNumber > 1 {
-		prevBundle, err := bm.db.GetBundleByNumber(ctx, bundleNumber-1)
-		if err == nil && prevBundle != nil {
-			prevBundleHash = prevBundle.Hash // Use uncompressed hash for chain
-			log.Verbose("  Linking to previous bundle %06d (hash: %s)", bundleNumber-1, prevBundleHash[:16]+"...")
+func (bm *BundleManager) serializeJSONL(ops []PLCOperation) []byte {
+	var buf []byte
+	for _, op := range ops {
+		buf = append(buf, op.RawJSON...)
+		buf = append(buf, '\n')
+	}
+	return buf
+}
+
+// ===== BUNDLE FETCHING =====
+
+type bundleFetcher struct {
+	client       *Client
+	seenCIDs     map[string]bool
+	currentAfter string
+	fetchCount   int
+}
+
+func newBundleFetcher(client *Client, afterTime string, prevBoundaryCIDs map[string]bool) *bundleFetcher {
+	seen := make(map[string]bool)
+	for cid := range prevBoundaryCIDs {
+		seen[cid] = true
+	}
+
+	return &bundleFetcher{
+		client:       client,
+		seenCIDs:     seen,
+		currentAfter: afterTime,
+	}
+}
+
+func (bf *bundleFetcher) fetchUntilComplete(ctx context.Context, target int) ([]PLCOperation, bool) {
+	var ops []PLCOperation
+	maxFetches := (target / 900) + 5
+
+	for len(ops) < target && bf.fetchCount < maxFetches {
+		bf.fetchCount++
+		batchSize := bf.calculateBatchSize(target - len(ops))
+
+		log.Verbose("  Fetch #%d: need %d more, requesting %d", bf.fetchCount, target-len(ops), batchSize)
+
+		batch, shouldContinue := bf.fetchBatch(ctx, batchSize)
+
+		for _, op := range batch {
+			if !bf.seenCIDs[op.CID] {
+				bf.seenCIDs[op.CID] = true
+				ops = append(ops, op)
+
+				if len(ops) >= target {
+					return ops[:target], true
+				}
+			}
+		}
+
+		if !shouldContinue {
+			break
 		}
 	}
 
-	// Extract unique DIDs
-	didSet := make(map[string]bool)
-	for _, op := range operations {
-		didSet[op.DID] = true
+	return ops, len(ops) >= target
+}
+
+func (bf *bundleFetcher) calculateBatchSize(remaining int) int {
+	if bf.fetchCount == 0 {
+		return 1000
+	}
+	if remaining < 100 {
+		return 50
+	}
+	if remaining < 500 {
+		return 200
+	}
+	return 1000
+}
+
+func (bf *bundleFetcher) fetchBatch(ctx context.Context, size int) ([]PLCOperation, bool) {
+	ops, err := bf.client.Export(ctx, ExportOptions{
+		Count: size,
+		After: bf.currentAfter,
+	})
+
+	if err != nil || len(ops) == 0 {
+		return nil, false
 	}
 
-	dids := make([]string, 0, len(didSet))
-	for did := range didSet {
-		dids = append(dids, did)
+	if len(ops) > 0 {
+		bf.currentAfter = ops[len(ops)-1].CreatedAt.Format(time.RFC3339Nano)
 	}
 
-	// Get compressed file size
-	fileInfo, _ := os.Stat(path)
-	compressedSize := int64(0)
-	if fileInfo != nil {
-		compressedSize = fileInfo.Size()
+	return ops, len(ops) >= size
+}
+
+// ===== MAIN BUNDLE LOADING =====
+
+func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNum int, plcClient *Client) ([]PLCOperation, bool, error) {
+	if !bm.enabled {
+		return nil, false, fmt.Errorf("bundle manager disabled")
 	}
+
+	bf := bm.newBundleFile(bundleNum)
+
+	// Try local file first
+	if bf.exists() {
+		return bm.loadFromFile(ctx, bundleNum, bf)
+	}
+
+	// Fetch from PLC
+	return bm.fetchFromPLC(ctx, bundleNum, bf, plcClient)
+}
+
+func (bm *BundleManager) loadFromFile(ctx context.Context, bundleNum int, bf *bundleFile) ([]PLCOperation, bool, error) {
+	log.Verbose("→ Loading bundle %06d from local file", bundleNum)
+
+	// Verify hash if bundle is in DB
+	if dbBundle, err := bm.db.GetBundleByNumber(ctx, bundleNum); err == nil && dbBundle != nil {
+		if err := bm.verifyHash(bf.path, dbBundle.CompressedHash); err != nil {
+			log.Error("⚠ Hash mismatch for bundle %06d! Re-fetching...", bundleNum)
+			os.Remove(bf.path)
+			return nil, false, fmt.Errorf("hash mismatch")
+		}
+		log.Verbose("✓ Hash verified for bundle %06d", bundleNum)
+	}
+
+	if err := bm.load(bf); err != nil {
+		return nil, false, err
+	}
+
+	// Index if not in DB
+	if _, err := bm.db.GetBundleByNumber(ctx, bundleNum); err != nil {
+		bf.compressedHash = bm.hashFile(bf.path)
+		bf.uncompressedHash = bm.hash(bm.serializeJSONL(bf.operations))
+		bm.indexBundle(ctx, bundleNum, bf)
+	}
+
+	return bf.operations, true, nil
+}
+
+func (bm *BundleManager) fetchFromPLC(ctx context.Context, bundleNum int, bf *bundleFile, client *Client) ([]PLCOperation, bool, error) {
+	log.Info("→ Bundle %06d not found locally, fetching from PLC directory...", bundleNum)
+
+	afterTime, prevCIDs := bm.getBoundaryInfo(ctx, bundleNum)
+	fetcher := newBundleFetcher(client, afterTime, prevCIDs)
+
+	ops, isComplete := fetcher.fetchUntilComplete(ctx, BUNDLE_SIZE)
+
+	log.Info("  Collected %d unique operations after %d fetches (complete=%v)",
+		len(ops), fetcher.fetchCount, isComplete)
+
+	if isComplete {
+		bf.operations = ops
+		if err := bm.save(bf); err != nil {
+			log.Error("Warning: failed to save bundle: %v", err)
+		} else {
+			bm.indexBundle(ctx, bundleNum, bf)
+			log.Info("✓ Bundle %06d saved [%d ops, hash: %s...]",
+				bundleNum, len(ops), bf.uncompressedHash[:16])
+		}
+	}
+
+	return ops, isComplete, nil
+}
+
+func (bm *BundleManager) getBoundaryInfo(ctx context.Context, bundleNum int) (string, map[string]bool) {
+	if bundleNum == 1 {
+		return "", nil
+	}
+
+	prevBundle, err := bm.db.GetBundleByNumber(ctx, bundleNum-1)
+	if err != nil {
+		return "", nil
+	}
+
+	afterTime := prevBundle.EndTime.Format(time.RFC3339Nano)
+
+	// Return stored boundary CIDs if available
+	if len(prevBundle.BoundaryCIDs) > 0 {
+		cids := make(map[string]bool)
+		for _, cid := range prevBundle.BoundaryCIDs {
+			cids[cid] = true
+		}
+		return afterTime, cids
+	}
+
+	// Fallback: compute from file
+	bf := bm.newBundleFile(bundleNum - 1)
+	if bf.exists() {
+		if err := bm.load(bf); err == nil {
+			_, cids := GetBoundaryCIDs(bf.operations)
+			return afterTime, cids
+		}
+	}
+
+	return afterTime, nil
+}
+
+// ===== BUNDLE INDEXING =====
+
+func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bundleFile) error {
+	prevHash := ""
+	if bundleNum > 1 {
+		if prev, err := bm.db.GetBundleByNumber(ctx, bundleNum-1); err == nil {
+			prevHash = prev.Hash
+		}
+	}
+
+	dids := bm.extractUniqueDIDs(bf.operations)
+	fileSize := bm.getFileSize(bf.path)
 
 	bundle := &storage.PLCBundle{
-		BundleNumber:   bundleNumber,
-		StartTime:      operations[0].CreatedAt,
-		EndTime:        operations[len(operations)-1].CreatedAt,
+		BundleNumber:   bundleNum,
+		StartTime:      bf.operations[0].CreatedAt,
+		EndTime:        bf.operations[len(bf.operations)-1].CreatedAt,
 		DIDs:           dids,
-		Hash:           uncompressedHash, // Primary hash (JSONL)
-		CompressedHash: compressedHash,   // File integrity hash
-		CompressedSize: compressedSize,   // Compressed size
-		PrevBundleHash: prevBundleHash,   // Chain link
+		Hash:           bf.uncompressedHash,
+		CompressedHash: bf.compressedHash,
+		CompressedSize: fileSize,
+		PrevBundleHash: prevHash,
 		Compressed:     true,
 		CreatedAt:      time.Now(),
 	}
@@ -513,27 +355,21 @@ func (bm *BundleManager) indexBundleWithHash(ctx context.Context, bundleNumber i
 	return bm.db.CreateBundle(ctx, bundle)
 }
 
-// indexBundle (keep for compatibility) - FIX: Calculate both hashes
-func (bm *BundleManager) indexBundle(ctx context.Context, bundleNumber int, operations []PLCOperation, path string) error {
-	// Calculate compressed hash from file
-	fileData, err := os.ReadFile(path)
-	if err != nil {
-		return err
+func (bm *BundleManager) extractUniqueDIDs(ops []PLCOperation) []string {
+	didSet := make(map[string]bool)
+	for _, op := range ops {
+		didSet[op.DID] = true
 	}
-	compressedHash := bm.calculateHash(fileData)
 
-	// Calculate uncompressed hash from operations
-	var jsonlData []byte
-	for _, op := range operations {
-		jsonlData = append(jsonlData, op.RawJSON...)
-		jsonlData = append(jsonlData, '\n')
+	dids := make([]string, 0, len(didSet))
+	for did := range didSet {
+		dids = append(dids, did)
 	}
-	uncompressedHash := bm.calculateHash(jsonlData)
-
-	return bm.indexBundleWithHash(ctx, bundleNumber, operations, path, uncompressedHash, compressedHash)
+	return dids
 }
 
-// Update CreateBundleFromMempool
+// ===== MEMPOOL BUNDLE CREATION =====
+
 func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations []PLCOperation) (int, error) {
 	if !bm.enabled {
 		return 0, fmt.Errorf("bundle manager disabled")
@@ -547,72 +383,27 @@ func (bm *BundleManager) CreateBundleFromMempool(ctx context.Context, operations
 	if err != nil {
 		return 0, err
 	}
-	bundleNumber := lastBundle + 1
+	bundleNum := lastBundle + 1
 
-	path := bm.GetBundlePath(bundleNumber)
+	bf := bm.newBundleFile(bundleNum)
+	bf.operations = operations
 
-	// Save bundle with both hashes
-	uncompressedHash, compressedHash, err := bm.saveBundleFileWithHash(path, operations)
-	if err != nil {
+	if err := bm.save(bf); err != nil {
 		return 0, err
 	}
 
-	// Index bundle
-	if err := bm.indexBundleWithHash(ctx, bundleNumber, operations, path, uncompressedHash, compressedHash); err != nil {
+	if err := bm.indexBundle(ctx, bundleNum, bf); err != nil {
 		return 0, err
 	}
 
-	log.Info("✓ Created bundle %06d from mempool (hash: %s)",
-		bundleNumber, uncompressedHash[:16]+"...")
+	log.Info("✓ Created bundle %06d from mempool (hash: %s...)",
+		bundleNum, bf.uncompressedHash[:16])
 
-	return bundleNumber, nil
+	return bundleNum, nil
 }
 
-// EnsureBundleContinuity checks that all bundles from 1 to N exist
-func (bm *BundleManager) EnsureBundleContinuity(ctx context.Context, targetBundle int) error {
-	if !bm.enabled {
-		return nil
-	}
+// ===== VERIFICATION =====
 
-	for i := 1; i < targetBundle; i++ {
-		if !bm.BundleExists(i) {
-			// Check if in database
-			_, err := bm.db.GetBundleByNumber(ctx, i)
-			if err != nil {
-				return fmt.Errorf("bundle %06d is missing (required for continuity)", i)
-			}
-		}
-	}
-
-	return nil
-}
-
-// GetStats returns bundle statistics
-func (bm *BundleManager) GetStats(ctx context.Context) (int64, int64, error) {
-	if !bm.enabled {
-		return 0, 0, nil
-	}
-	return bm.db.GetBundleStats(ctx)
-}
-
-// calculateHash computes SHA256 hash of data
-func (bm *BundleManager) calculateHash(data []byte) string {
-	hash := sha256.Sum256(data)
-	return hex.EncodeToString(hash[:])
-}
-
-// verifyBundleHash checks if file hash matches expected hash
-func (bm *BundleManager) verifyBundleHash(path string, expectedHash string) (bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false, err
-	}
-
-	actualHash := bm.calculateHash(data)
-	return actualHash == expectedHash, nil
-}
-
-// VerifyChain - FIX
 func (bm *BundleManager) VerifyChain(ctx context.Context, endBundle int) error {
 	if !bm.enabled {
 		return fmt.Errorf("bundle manager disabled")
@@ -626,16 +417,10 @@ func (bm *BundleManager) VerifyChain(ctx context.Context, endBundle int) error {
 			return fmt.Errorf("bundle %06d not found: %w", i, err)
 		}
 
-		// Compute file path
-		filePath := bm.GetBundlePath(i)
-
 		// Verify file hash
-		valid, err := bm.verifyBundleHash(filePath, bundle.CompressedHash)
-		if err != nil {
+		path := bm.newBundleFile(i).path
+		if err := bm.verifyHash(path, bundle.CompressedHash); err != nil {
 			return fmt.Errorf("bundle %06d hash verification failed: %w", i, err)
-		}
-		if !valid {
-			return fmt.Errorf("bundle %06d compressed hash mismatch!", i)
 		}
 
 		// Verify chain link
@@ -660,7 +445,60 @@ func (bm *BundleManager) VerifyChain(ctx context.Context, endBundle int) error {
 	return nil
 }
 
-// GetChainInfo returns information about the bundle chain
+func (bm *BundleManager) EnsureBundleContinuity(ctx context.Context, targetBundle int) error {
+	if !bm.enabled {
+		return nil
+	}
+
+	for i := 1; i < targetBundle; i++ {
+		if !bm.newBundleFile(i).exists() {
+			if _, err := bm.db.GetBundleByNumber(ctx, i); err != nil {
+				return fmt.Errorf("bundle %06d is missing (required for continuity)", i)
+			}
+		}
+	}
+
+	return nil
+}
+
+// ===== UTILITY METHODS =====
+
+func (bm *BundleManager) hash(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
+func (bm *BundleManager) hashFile(path string) string {
+	data, _ := os.ReadFile(path)
+	return bm.hash(data)
+}
+
+func (bm *BundleManager) verifyHash(path, expectedHash string) error {
+	if expectedHash == "" {
+		return nil
+	}
+
+	actualHash := bm.hashFile(path)
+	if actualHash != expectedHash {
+		return fmt.Errorf("hash mismatch")
+	}
+	return nil
+}
+
+func (bm *BundleManager) getFileSize(path string) int64 {
+	if info, err := os.Stat(path); err == nil {
+		return info.Size()
+	}
+	return 0
+}
+
+func (bm *BundleManager) GetStats(ctx context.Context) (int64, int64, error) {
+	if !bm.enabled {
+		return 0, 0, nil
+	}
+	return bm.db.GetBundleStats(ctx)
+}
+
 func (bm *BundleManager) GetChainInfo(ctx context.Context) (map[string]interface{}, error) {
 	lastBundle, err := bm.db.GetLastBundleNumber(ctx)
 	if err != nil {
@@ -674,16 +512,8 @@ func (bm *BundleManager) GetChainInfo(ctx context.Context) (map[string]interface
 		}, nil
 	}
 
-	// Quick check first and last
-	firstBundle, err := bm.db.GetBundleByNumber(ctx, 1)
-	if err != nil {
-		return nil, err
-	}
-
-	lastBundleData, err := bm.db.GetBundleByNumber(ctx, lastBundle)
-	if err != nil {
-		return nil, err
-	}
+	firstBundle, _ := bm.db.GetBundleByNumber(ctx, 1)
+	lastBundleData, _ := bm.db.GetBundleByNumber(ctx, lastBundle)
 
 	return map[string]interface{}{
 		"chain_length":     lastBundle,
@@ -693,4 +523,56 @@ func (bm *BundleManager) GetChainInfo(ctx context.Context) (map[string]interface
 		"chain_end_time":   lastBundleData.EndTime,
 		"chain_head_hash":  lastBundleData.Hash,
 	}, nil
+}
+
+// ===== EXPORTED HELPERS =====
+
+func GetBoundaryCIDs(operations []PLCOperation) (time.Time, map[string]bool) {
+	if len(operations) == 0 {
+		return time.Time{}, nil
+	}
+
+	lastOp := operations[len(operations)-1]
+	boundaryTime := lastOp.CreatedAt
+	cidSet := make(map[string]bool)
+
+	for i := len(operations) - 1; i >= 0; i-- {
+		op := operations[i]
+		if op.CreatedAt.Equal(boundaryTime) {
+			cidSet[op.CID] = true
+		} else {
+			break
+		}
+	}
+
+	return boundaryTime, cidSet
+}
+
+func StripBoundaryDuplicates(operations []PLCOperation, boundaryTimestamp string, prevBoundaryCIDs map[string]bool) []PLCOperation {
+	if len(operations) == 0 {
+		return operations
+	}
+
+	boundaryTime, err := time.Parse(time.RFC3339Nano, boundaryTimestamp)
+	if err != nil {
+		return operations
+	}
+
+	startIdx := 0
+	for startIdx < len(operations) {
+		op := operations[startIdx]
+
+		if op.CreatedAt.After(boundaryTime) {
+			break
+		}
+
+		if op.CreatedAt.Equal(boundaryTime) && prevBoundaryCIDs[op.CID] {
+			startIdx++
+			continue
+		}
+
+		break
+	}
+
+	return operations[startIdx:]
 }

@@ -43,7 +43,9 @@ func (s *Scanner) Close() {
 
 // ScanMetrics tracks scan progress
 type ScanMetrics struct {
-	totalProcessed int64
+	totalFetched   int64 // Total ops fetched from PLC/bundles
+	totalProcessed int64 // Unique ops processed (after dedup)
+	newEndpoints   int64 // New endpoints discovered
 	endpointCounts map[string]int64
 	currentBundle  int
 	startTime      time.Time
@@ -59,8 +61,13 @@ func newMetrics(startBundle int) *ScanMetrics {
 
 func (m *ScanMetrics) logSummary() {
 	summary := formatEndpointCounts(m.endpointCounts)
-	log.Info("PLC scan completed: %d operations, %s in %v",
-		m.totalProcessed, summary, time.Since(m.startTime))
+	if m.newEndpoints > 0 {
+		log.Info("PLC scan completed: %d operations processed (%d fetched), %s in %v",
+			m.totalProcessed, m.totalFetched, summary, time.Since(m.startTime))
+	} else {
+		log.Info("PLC scan completed: %d operations processed (%d fetched), 0 new endpoints in %v",
+			m.totalProcessed, m.totalFetched, time.Since(m.startTime))
+	}
 }
 
 func (s *Scanner) Scan(ctx context.Context) error {
@@ -190,7 +197,8 @@ func (s *Scanner) handleCompleteBundle(ctx context.Context, ops []PLCOperation, 
 	}
 
 	s.mergeCounts(m.endpointCounts, counts)
-	m.totalProcessed += int64(len(ops))
+	m.totalProcessed += int64(len(ops)) // Unique ops after dedup
+	m.newEndpoints += sumCounts(counts) // NEW: Track new endpoints
 
 	batchTotal := sumCounts(counts)
 	log.Verbose("✓ Processed bundle %06d: %d operations (after dedup), %d new endpoints",
@@ -268,6 +276,7 @@ func (s *Scanner) fetchNextBatch(ctx context.Context, limit int, m *ScanMetrics)
 	}
 
 	fetchedCount := len(ops)
+	m.totalFetched += int64(fetchedCount) // Track all fetched
 	log.Verbose("  Fetched %d operations from PLC", fetchedCount)
 
 	if fetchedCount == 0 {
@@ -276,24 +285,28 @@ func (s *Scanner) fetchNextBatch(ctx context.Context, limit int, m *ScanMetrics)
 		return false, nil
 	}
 
-	// ✅ Fix: Handle errors from GetMempoolCount
 	beforeCount, err := s.db.GetMempoolCount(ctx)
 	if err != nil {
 		return false, err
 	}
 
+	endpointsBefore := sumCounts(m.endpointCounts)
 	if err := s.addToMempool(ctx, ops, m.endpointCounts); err != nil {
 		return false, err
 	}
+	endpointsAfter := sumCounts(m.endpointCounts)
+	m.newEndpoints += (endpointsAfter - endpointsBefore) // Add new endpoints found
 
 	afterCount, err := s.db.GetMempoolCount(ctx)
 	if err != nil {
 		return false, err
 	}
 
-	m.totalProcessed += int64(fetchedCount)
+	uniqueAdded := int64(afterCount - beforeCount) // Cast to int64
+	m.totalProcessed += uniqueAdded                // Track unique ops processed
+
 	log.Verbose("  Added %d new unique operations to mempool (%d were duplicates)",
-		afterCount-beforeCount, fetchedCount-(afterCount-beforeCount))
+		uniqueAdded, int64(fetchedCount)-uniqueAdded)
 
 	// Continue only if got full batch
 	shouldContinue := fetchedCount >= limit
@@ -347,8 +360,13 @@ func (s *Scanner) processMempool(ctx context.Context, m *ScanMetrics) error {
 		}
 
 		// Process and update metrics
+		countsBefore := sumCounts(m.endpointCounts)
 		counts, _ := s.processBatch(ctx, ops)
 		s.mergeCounts(m.endpointCounts, counts)
+		newEndpointsFound := sumCounts(m.endpointCounts) - countsBefore
+
+		m.totalProcessed += int64(len(ops))
+		m.newEndpoints += newEndpointsFound // NEW: Track new endpoints
 		m.currentBundle = bundleNum
 
 		if err := s.updateCursorForBundle(ctx, bundleNum, m.totalProcessed); err != nil {
