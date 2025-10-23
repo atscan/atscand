@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 )
 
 var (
@@ -21,25 +22,31 @@ func Init(verbose bool) {
 		verboseWriter = os.Stdout
 	}
 
-	infoLog = log.New(infoWriter, "INFO: ", log.Ldate|log.Ltime|log.Lshortfile)
-	verboseLog = log.New(verboseWriter, "VERBOSE: ", log.Ldate|log.Ltime|log.Lshortfile)
-	errorLog = log.New(os.Stderr, "ERROR: ", log.Ldate|log.Ltime|log.Lshortfile)
+	// Use no flags, we'll add our own ISO 8601 timestamps
+	infoLog = log.New(infoWriter, "", 0)
+	verboseLog = log.New(verboseWriter, "", 0)
+	errorLog = log.New(os.Stderr, "", 0)
+}
+
+// timestamp returns current time in ISO 8601 format
+func timestamp() string {
+	return time.Now().Format(time.RFC3339)
 }
 
 func Verbose(format string, v ...interface{}) {
-	verboseLog.Printf(format, v...)
+	verboseLog.Printf("%s [VERBOSE] %s", timestamp(), fmt.Sprintf(format, v...))
 }
 
 func Info(format string, v ...interface{}) {
-	infoLog.Printf(format, v...)
+	infoLog.Printf("%s [INFO] %s", timestamp(), fmt.Sprintf(format, v...))
 }
 
 func Error(format string, v ...interface{}) {
-	errorLog.Printf(format, v...)
+	errorLog.Printf("%s [ERROR] %s", timestamp(), fmt.Sprintf(format, v...))
 }
 
 func Fatal(format string, v ...interface{}) {
-	errorLog.Fatalf(format, v...)
+	errorLog.Fatalf("%s [FATAL] %s", timestamp(), fmt.Sprintf(format, v...))
 }
 
 // Banner prints a startup banner
