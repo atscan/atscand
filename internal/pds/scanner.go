@@ -7,21 +7,24 @@ import (
 
 	"github.com/acarl005/stripansi"
 	"github.com/atscan/atscanner/internal/config"
+	"github.com/atscan/atscanner/internal/ipinfo"
 	"github.com/atscan/atscanner/internal/log"
 	"github.com/atscan/atscanner/internal/storage"
 )
 
 type Scanner struct {
-	client *Client
-	db     storage.Database
-	config config.PDSConfig
+	client       *Client
+	db           storage.Database
+	config       config.PDSConfig
+	ipInfoClient *ipinfo.Client
 }
 
 func NewScanner(db storage.Database, cfg config.PDSConfig) *Scanner {
 	return &Scanner{
-		client: NewClient(cfg.Timeout),
-		db:     db,
-		config: cfg,
+		client:       NewClient(cfg.Timeout),
+		db:           db,
+		config:       cfg,
+		ipInfoClient: ipinfo.NewClient(),
 	}
 }
 
@@ -121,9 +124,9 @@ func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.Endpoint, res
 
 func (s *Scanner) scanPDS(ctx context.Context, endpointID int64, endpoint string) *PDSStatus {
 	status := &PDSStatus{
-		EndpointID:  endpointID, // Store Endpoint ID
+		EndpointID:  endpointID,
 		Endpoint:    endpoint,
-		LastChecked: time.Now(),
+		LastChecked: time.Now().UTC(),
 	}
 
 	// Health check
@@ -141,6 +144,9 @@ func (s *Scanner) scanPDS(ctx context.Context, endpointID int64, endpoint string
 		return status
 	}
 
+	// Fetch and update IP info if needed
+	s.updateIPInfoIfNeeded(ctx, endpointID, endpoint)
+
 	// Describe server
 	desc, err := s.client.DescribeServer(ctx, endpoint)
 	if err != nil {
@@ -150,14 +156,60 @@ func (s *Scanner) scanPDS(ctx context.Context, endpointID int64, endpoint string
 	}
 
 	// Optionally list repos (DIDs) - commented out by default for performance
-	/*dids, err := s.client.ListRepos(ctx, endpoint)
+	dids, err := s.client.ListRepos(ctx, endpoint)
 	if err != nil {
 		log.Verbose("Warning: failed to list repos for %s: %v", endpoint, err)
 		status.DIDs = []string{}
 	} else {
 		status.DIDs = dids
 		log.Verbose("  → Found %d users on %s", len(dids), endpoint)
-	}*/
+	}
 
 	return status
+}
+
+func (s *Scanner) updateIPInfoIfNeeded(ctx context.Context, endpointID int64, endpoint string) {
+	// Check if IP info client is in backoff
+	if s.ipInfoClient.IsInBackoff() {
+		// Silently skip during backoff period
+		return
+	}
+
+	// Extract IP from endpoint
+	ip, err := ipinfo.ExtractIPFromEndpoint(endpoint)
+	if err != nil {
+		log.Verbose("Failed to extract IP from %s: %v", endpoint, err)
+		return
+	}
+
+	// Check if we need to update IP info
+	shouldUpdate, err := s.db.ShouldUpdateIPInfo(ctx, endpointID, ip)
+	if err != nil {
+		log.Verbose("Failed to check IP info status: %v", err)
+		return
+	}
+
+	if !shouldUpdate {
+		return // IP hasn't changed, no need to fetch
+	}
+
+	// Fetch IP info from ipapi.is
+	log.Verbose("Fetching IP info for %s (%s)", endpoint, ip)
+	ipInfo, err := s.ipInfoClient.GetIPInfo(ctx, ip)
+	if err != nil {
+		// Log only once when backoff starts
+		if s.ipInfoClient.IsInBackoff() {
+			log.Info("⚠ IP info API unavailable, pausing requests for 5 minutes")
+		} else {
+			log.Verbose("Failed to fetch IP info for %s: %v", ip, err)
+		}
+		return
+	}
+
+	// Update database
+	if err := s.db.UpdateEndpointIPInfo(ctx, endpointID, ip, ipInfo); err != nil {
+		log.Error("Failed to update IP info for endpoint %d: %v", endpointID, err)
+	} else {
+		log.Verbose("✓ Updated IP info for %s: %s", endpoint, ip)
+	}
 }

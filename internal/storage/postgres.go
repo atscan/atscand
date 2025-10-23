@@ -63,6 +63,8 @@ func (p *PostgresDB) Migrate() error {
         last_checked TIMESTAMP,
         status INTEGER DEFAULT 0,
         user_count BIGINT DEFAULT 0,
+        ip TEXT,
+        ip_info JSONB,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(endpoint_type, endpoint)
     );
@@ -71,6 +73,8 @@ func (p *PostgresDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_endpoints_status ON endpoints(status);
     CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
     CREATE INDEX IF NOT EXISTS idx_endpoints_user_count ON endpoints(user_count);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_ip ON endpoints(ip);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_ip_info ON endpoints USING gin(ip_info);
 
     CREATE TABLE IF NOT EXISTS pds_scans (
         id BIGSERIAL PRIMARY KEY,
@@ -542,16 +546,33 @@ func (p *PostgresDB) GetMempoolUncompressedSize(ctx context.Context) (int64, err
 // ===== ENDPOINT OPERATIONS =====
 
 func (p *PostgresDB) UpsertEndpoint(ctx context.Context, endpoint *Endpoint) error {
+	var ipInfoJSON []byte
+	var err error
+	if endpoint.IPInfo != nil {
+		ipInfoJSON, err = json.Marshal(endpoint.IPInfo)
+		if err != nil {
+			return fmt.Errorf("failed to marshal ip_info: %w", err)
+		}
+	}
+
 	query := `
-        INSERT INTO endpoints (endpoint_type, endpoint, discovered_at, last_checked, status)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO endpoints (endpoint_type, endpoint, discovered_at, last_checked, status, ip, ip_info)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT(endpoint_type, endpoint) DO UPDATE SET
-            last_checked = EXCLUDED.last_checked
+            last_checked = EXCLUDED.last_checked,
+            ip = CASE 
+                WHEN EXCLUDED.ip IS NOT NULL AND EXCLUDED.ip != '' THEN EXCLUDED.ip 
+                ELSE endpoints.ip 
+            END,
+            ip_info = CASE 
+                WHEN EXCLUDED.ip_info IS NOT NULL THEN EXCLUDED.ip_info 
+                ELSE endpoints.ip_info 
+            END
         RETURNING id
     `
-	err := p.db.QueryRowContext(ctx, query,
+	err = p.db.QueryRowContext(ctx, query,
 		endpoint.EndpointType, endpoint.Endpoint, endpoint.DiscoveredAt,
-		endpoint.LastChecked, endpoint.Status).Scan(&endpoint.ID)
+		endpoint.LastChecked, endpoint.Status, endpoint.IP, ipInfoJSON).Scan(&endpoint.ID)
 	return err
 }
 
@@ -571,17 +592,20 @@ func (p *PostgresDB) GetEndpointIDByEndpoint(ctx context.Context, endpoint strin
 
 func (p *PostgresDB) GetEndpoint(ctx context.Context, endpoint string, endpointType string) (*Endpoint, error) {
 	query := `
-        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, user_count, updated_at
+        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, user_count, 
+               ip, ip_info, updated_at
         FROM endpoints 
         WHERE endpoint = $1 AND endpoint_type = $2
     `
 
 	var ep Endpoint
 	var lastChecked sql.NullTime
+	var ip sql.NullString
+	var ipInfoJSON []byte
 
 	err := p.db.QueryRowContext(ctx, query, endpoint, endpointType).Scan(
 		&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
-		&ep.Status, &ep.UserCount, &ep.UpdatedAt,
+		&ep.Status, &ep.UserCount, &ip, &ipInfoJSON, &ep.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -591,29 +615,15 @@ func (p *PostgresDB) GetEndpoint(ctx context.Context, endpoint string, endpointT
 		ep.LastChecked = lastChecked.Time
 	}
 
-	return &ep, nil
-}
-
-func (p *PostgresDB) GetEndpointByID(ctx context.Context, id int64) (*Endpoint, error) {
-	query := `
-        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, user_count, updated_at
-        FROM endpoints 
-        WHERE id = $1
-    `
-
-	var ep Endpoint
-	var lastChecked sql.NullTime
-
-	err := p.db.QueryRowContext(ctx, query, id).Scan(
-		&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
-		&ep.Status, &ep.UserCount, &ep.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
+	if ip.Valid {
+		ep.IP = ip.String
 	}
 
-	if lastChecked.Valid {
-		ep.LastChecked = lastChecked.Time
+	if len(ipInfoJSON) > 0 {
+		var ipInfo map[string]interface{}
+		if err := json.Unmarshal(ipInfoJSON, &ipInfo); err == nil {
+			ep.IPInfo = ipInfo
+		}
 	}
 
 	return &ep, nil
@@ -621,7 +631,8 @@ func (p *PostgresDB) GetEndpointByID(ctx context.Context, id int64) (*Endpoint, 
 
 func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) ([]*Endpoint, error) {
 	query := `
-        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, user_count, updated_at
+        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, user_count, 
+               ip, ip_info, updated_at
         FROM endpoints
         WHERE 1=1
     `
@@ -670,10 +681,12 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 	for rows.Next() {
 		var ep Endpoint
 		var lastChecked sql.NullTime
+		var ip sql.NullString
+		var ipInfoJSON []byte
 
 		err := rows.Scan(
 			&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
-			&ep.Status, &ep.UserCount, &ep.UpdatedAt,
+			&ep.Status, &ep.UserCount, &ip, &ipInfoJSON, &ep.UpdatedAt,
 		)
 		if err != nil {
 			return nil, err
@@ -681,6 +694,17 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 
 		if lastChecked.Valid {
 			ep.LastChecked = lastChecked.Time
+		}
+
+		if ip.Valid {
+			ep.IP = ip.String
+		}
+
+		if len(ipInfoJSON) > 0 {
+			var ipInfo map[string]interface{}
+			if err := json.Unmarshal(ipInfoJSON, &ipInfo); err == nil {
+				ep.IPInfo = ipInfo
+			}
 		}
 
 		endpoints = append(endpoints, &ep)
@@ -706,7 +730,7 @@ func (p *PostgresDB) UpdateEndpointStatus(ctx context.Context, endpointID int64,
         SET status = $1, last_checked = $2, user_count = $3, updated_at = $4
         WHERE id = $5
     `
-	_, err = tx.ExecContext(ctx, query, update.Status, update.LastChecked, userCount, time.Now(), endpointID)
+	_, err = tx.ExecContext(ctx, query, update.Status, update.LastChecked, userCount, time.Now().UTC(), endpointID)
 	if err != nil {
 		return err
 	}
@@ -721,6 +745,22 @@ func (p *PostgresDB) UpdateEndpointStatus(ctx context.Context, endpointID int64,
         VALUES ($1, $2, $3, $4)
     `
 	_, err = tx.ExecContext(ctx, scanQuery, endpointID, update.Status, update.ResponseTime, scanDataJSON)
+	if err != nil {
+		return err
+	}
+
+	// Keep only the 3 most recent scans per endpoint
+	cleanupQuery := `
+        DELETE FROM pds_scans 
+        WHERE pds_id = $1 
+        AND id NOT IN (
+            SELECT id FROM pds_scans 
+            WHERE pds_id = $1 
+            ORDER BY scanned_at DESC 
+            LIMIT 3
+        )
+    `
+	_, err = tx.ExecContext(ctx, cleanupQuery, endpointID)
 	if err != nil {
 		return err
 	}
@@ -814,6 +854,36 @@ func (p *PostgresDB) GetEndpointStats(ctx context.Context) (*EndpointStats, erro
 	}
 
 	return &stats, err
+}
+
+// Add method to check if IP needs update
+func (p *PostgresDB) ShouldUpdateIPInfo(ctx context.Context, endpointID int64, currentIP string) (bool, error) {
+	query := `SELECT ip FROM endpoints WHERE id = $1`
+
+	var storedIP sql.NullString
+	err := p.db.QueryRowContext(ctx, query, endpointID).Scan(&storedIP)
+	if err != nil {
+		return false, err
+	}
+
+	// Update if no IP stored or IP changed
+	return !storedIP.Valid || storedIP.String != currentIP, nil
+}
+
+// Update IP info for an endpoint
+func (p *PostgresDB) UpdateEndpointIPInfo(ctx context.Context, endpointID int64, ip string, ipInfo map[string]interface{}) error {
+	ipInfoJSON, err := json.Marshal(ipInfo)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ip_info: %w", err)
+	}
+
+	query := `
+        UPDATE endpoints 
+        SET ip = $1, ip_info = $2, updated_at = $3
+        WHERE id = $4
+    `
+	_, err = p.db.ExecContext(ctx, query, ip, ipInfoJSON, time.Now(), endpointID)
+	return err
 }
 
 // ===== CURSOR OPERATIONS =====

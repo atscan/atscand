@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/atscan/atscanner/internal/log"
@@ -94,7 +95,7 @@ func formatBundleResponse(bundle *storage.PLCBundle) map[string]interface{} {
 }
 
 func formatEndpointResponse(ep *storage.Endpoint) map[string]interface{} {
-	return map[string]interface{}{
+	response := map[string]interface{}{
 		"id":            ep.ID,
 		"endpoint_type": ep.EndpointType,
 		"endpoint":      ep.Endpoint,
@@ -103,6 +104,39 @@ func formatEndpointResponse(ep *storage.Endpoint) map[string]interface{} {
 		"status":        statusToString(ep.Status),
 		"user_count":    ep.UserCount,
 	}
+
+	// Add IP if available
+	if ep.IP != "" {
+		response["ip"] = ep.IP
+	}
+
+	// Extract specific fields from ip_info
+	if ep.IPInfo != nil {
+		// Extract location info
+		if location, ok := ep.IPInfo["location"].(map[string]interface{}); ok {
+			if city, ok := location["city"].(string); ok {
+				response["city"] = city
+			}
+			if countryCode, ok := location["country_code"].(string); ok {
+				response["country_code"] = countryCode
+			}
+			if country, ok := location["country"].(string); ok {
+				response["country"] = country
+			}
+		}
+
+		// Extract ASN info
+		if asn, ok := ep.IPInfo["asn"].(map[string]interface{}); ok {
+			if asnNumber, ok := asn["asn"].(float64); ok {
+				response["asn"] = int(asnNumber)
+			}
+		}
+
+		// Optionally include full ip_info for detailed view
+		// response["ip_info"] = ep.IPInfo
+	}
+
+	return response
 }
 
 func statusToString(status int) string {
@@ -152,6 +186,7 @@ func (s *Server) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
 		endpointType = "pds"
 	}
 
+	endpoint = "https://" + normalizeEndpoint(endpoint)
 	ep, err := s.db.GetEndpoint(r.Context(), endpoint, endpointType)
 	if err != nil {
 		resp.error("Endpoint not found", http.StatusNotFound)
@@ -163,6 +198,7 @@ func (s *Server) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
 	result := formatEndpointResponse(ep)
 	result["recent_scans"] = scans
 
+	result["ipinfo"] = ep.IPInfo
 	resp.json(result)
 }
 
@@ -1100,4 +1136,11 @@ func computeOperationsHash(ops []plc.PLCOperation) string {
 	}
 	hash := sha256.Sum256(jsonlData)
 	return hex.EncodeToString(hash[:])
+}
+
+func normalizeEndpoint(endpoint string) string {
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	endpoint = strings.TrimSuffix(endpoint, "/")
+	return endpoint
 }

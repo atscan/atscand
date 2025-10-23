@@ -23,12 +23,15 @@ type Database interface {
 	// Endpoint operations
 	UpsertEndpoint(ctx context.Context, endpoint *Endpoint) error
 	GetEndpoint(ctx context.Context, endpoint string, endpointType string) (*Endpoint, error)
-	GetEndpointByID(ctx context.Context, id int64) (*Endpoint, error)
 	GetEndpoints(ctx context.Context, filter *EndpointFilter) ([]*Endpoint, error)
 	UpdateEndpointStatus(ctx context.Context, endpointID int64, update *EndpointUpdate) error
 	EndpointExists(ctx context.Context, endpoint string, endpointType string) (bool, error)
 	GetEndpointIDByEndpoint(ctx context.Context, endpoint string, endpointType string) (int64, error)
 	GetEndpointScans(ctx context.Context, endpointID int64, limit int) ([]*EndpointScan, error)
+
+	// IP info operations
+	ShouldUpdateIPInfo(ctx context.Context, endpointID int64, currentIP string) (bool, error)
+	UpdateEndpointIPInfo(ctx context.Context, endpointID int64, ip string, ipInfo map[string]interface{}) error
 
 	// Cursor operations
 	GetScanCursor(ctx context.Context, source string) (*ScanCursor, error)

@@ -24,6 +24,8 @@ type Endpoint struct {
 	LastChecked  time.Time
 	Status       int
 	UserCount    int64
+	IP           string
+	IPInfo       map[string]interface{}
 	UpdatedAt    time.Time
 }
 
