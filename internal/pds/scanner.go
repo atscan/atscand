@@ -34,26 +34,30 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	startTime := time.Now()
 	log.Info("Starting PDS availability scan...")
 
-	// Get only PDS endpoints
+	// Get only PDS endpoints that need checking (stale or never checked)
 	servers, err := s.db.GetEndpoints(ctx, &storage.EndpointFilter{
-		Type: "pds",
+		Type:            "pds",
+		OnlyStale:       true,                     // NEW: Only get stale endpoints
+		RecheckInterval: s.config.RecheckInterval, // NEW: Use recheck interval from config
 	})
 	if err != nil {
 		return err
 	}
 
-	// 2. ADD THIS BLOCK TO SHUFFLE THE LIST
+	if len(servers) == 0 {
+		log.Info("No endpoints need scanning at this time")
+		return nil
+	}
+
+	log.Info("Found %d endpoints that need scanning (not checked in last %s)", len(servers), s.config.RecheckInterval)
+
+	// Shuffle the servers slice in place
 	if len(servers) > 0 {
-		// Create a new random source to avoid using the global one
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		// Shuffle the servers slice in place
 		r.Shuffle(len(servers), func(i, j int) {
 			servers[i], servers[j] = servers[j], servers[i]
 		})
 		log.Info("Randomized scan order for %d PDS servers...", len(servers))
-	} else {
-		log.Info("Scanning 0 PDS servers...")
-		return nil // No need to continue if there are no servers
 	}
 
 	// Worker pool

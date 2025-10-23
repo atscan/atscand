@@ -72,11 +72,13 @@ const (
 
 // EndpointFilter for querying endpoints
 type EndpointFilter struct {
-	Type         string // "pds", "labeler", etc.
-	Status       string
-	MinUserCount int64
-	Limit        int
-	Offset       int
+	Type            string // "pds", "labeler", etc.
+	Status          string
+	MinUserCount    int64
+	OnlyStale       bool          // NEW: Only return endpoints that need re-checking
+	RecheckInterval time.Duration // NEW: How long before an endpoint is considered stale
+	Limit           int
+	Offset          int
 }
 
 // EndpointStats contains aggregate statistics about endpoints

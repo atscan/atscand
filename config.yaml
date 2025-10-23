@@ -11,10 +11,10 @@ plc:
   index_dids: true
 
 pds:
-  scan_interval: "15m"
+  scan_interval: "30m"
   timeout: "30s"
   workers: 20
-  recheck_interval: "5m"
+  recheck_interval: "30m"
   scan_retention: 3
 
 api:

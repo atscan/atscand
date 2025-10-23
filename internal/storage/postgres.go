@@ -302,6 +302,11 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 			args = append(args, statusInt)
 			argIdx++
 		}
+
+		// NEW: Filter for stale endpoints only
+		if filter.OnlyStale && filter.RecheckInterval > 0 {
+			query += fmt.Sprintf(" AND (last_checked IS NULL OR last_checked < NOW() - INTERVAL '%d seconds')", int(filter.RecheckInterval.Seconds()))
+		}
 	}
 
 	query += " ORDER BY id DESC"
