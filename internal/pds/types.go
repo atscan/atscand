@@ -30,3 +30,11 @@ type PDSStatus struct {
 	Description  *ServerDescription
 	DIDs         []string
 }
+
+type ScanResult struct {
+	Status       int
+	ResponseTime time.Duration
+	ErrorMessage string
+	Description  *ServerDescription
+	DIDs         []string
+}

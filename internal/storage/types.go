@@ -18,14 +18,13 @@ type DID struct {
 // Endpoint represents any AT Protocol service endpoint
 type Endpoint struct {
 	ID           int64
-	EndpointType string // "pds", "labeler", etc.
+	EndpointType string
 	Endpoint     string
 	DiscoveredAt time.Time
 	LastChecked  time.Time
 	Status       int
-	UserCount    int64
 	IP           string
-	IPInfo       map[string]interface{}
+	IPResolvedAt time.Time
 	UpdatedAt    time.Time
 }
 
@@ -39,10 +38,10 @@ type EndpointUpdate struct {
 
 // EndpointScanData contains data from an endpoint scan
 type EndpointScanData struct {
-	ServerInfo interface{} `json:"server_info,omitempty"`
-	DIDs       []string    `json:"dids,omitempty"`
-	DIDCount   int         `json:"did_count"`
-	Metadata   interface{} `json:"metadata,omitempty"` // Type-specific metadata
+	ServerInfo interface{}            `json:"server_info,omitempty"`
+	DIDs       []string               `json:"dids,omitempty"`
+	DIDCount   int                    `json:"did_count"`
+	Metadata   map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // EndpointScan represents a historical endpoint scan
@@ -158,4 +157,55 @@ type DIDRecord struct {
 	DID           string    `json:"did"`
 	BundleNumbers []int     `json:"bundle_numbers"`
 	CreatedAt     time.Time `json:"created_at"`
+}
+
+// IPInfo represents IP information (stored with IP as primary key)
+type IPInfo struct {
+	IP           string
+	City         string
+	Country      string
+	CountryCode  string
+	ASN          int
+	ASNOrg       string
+	IsDatacenter bool
+	IsVPN        bool
+	Latitude     float32
+	Longitude    float32
+	RawData      map[string]interface{}
+	FetchedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// PDSListItem is a virtual type created by JOIN for /pds endpoint
+type PDSListItem struct {
+	// From endpoints table
+	ID           int64
+	Endpoint     string
+	DiscoveredAt time.Time
+	LastChecked  time.Time
+	Status       int
+	IP           string
+
+	// From latest endpoint_scans (via JOIN)
+	LatestScan *struct {
+		UserCount    int
+		ResponseTime float64
+		ScannedAt    time.Time
+	}
+
+	// From ip_infos table (via JOIN on endpoints.ip)
+	IPInfo *IPInfo
+}
+
+// PDSDetail is extended version for /pds/{endpoint}
+type PDSDetail struct {
+	PDSListItem
+
+	// Additional data from latest scan
+	LatestScan *struct {
+		UserCount    int
+		ResponseTime float64
+		ServerInfo   interface{} // Full server description
+		ScannedAt    time.Time
+	}
 }

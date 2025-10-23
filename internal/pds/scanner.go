@@ -2,6 +2,7 @@ package pds
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -44,157 +45,159 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 
 	// Worker pool
 	jobs := make(chan *storage.Endpoint, len(servers))
-	results := make(chan *PDSStatus, len(servers))
-
 	var wg sync.WaitGroup
+
 	for i := 0; i < s.config.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.worker(ctx, jobs, results)
+			s.worker(ctx, jobs)
 		}()
 	}
 
-	go func() {
-		for _, server := range servers {
-			jobs <- server
-		}
-		close(jobs)
-	}()
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Process results
-	successCount := 0
-	failureCount := 0
-	totalUsers := int64(0)
-
-	for status := range results {
-		// Determine status code
-		statusCode := storage.PDSStatusOffline
-		if status.Available {
-			statusCode = storage.PDSStatusOnline
-		}
-
-		// Build scan data
-		scanData := &storage.EndpointScanData{
-			ServerInfo: status.Description,
-			DIDs:       status.DIDs,
-			DIDCount:   len(status.DIDs),
-		}
-
-		// Update using Endpoint ID
-		if err := s.db.UpdateEndpointStatus(ctx, status.EndpointID, &storage.EndpointUpdate{
-			Status:       statusCode,
-			LastChecked:  status.LastChecked,
-			ResponseTime: status.ResponseTime.Seconds() * 1000, // Convert to ms
-			ScanData:     scanData,
-		}); err != nil {
-			log.Error("Error updating endpoint ID %d: %v", status.EndpointID, err)
-		}
-
-		if status.Available {
-			successCount++
-			totalUsers += int64(len(status.DIDs))
-		} else {
-			failureCount++
-		}
+	// Send jobs
+	for _, server := range servers {
+		jobs <- server
 	}
+	close(jobs)
 
-	log.Info("PDS scan completed: %d available, %d unavailable, %d total users in %v",
-		successCount, failureCount, totalUsers, time.Since(startTime))
+	// Wait for completion
+	wg.Wait()
+
+	log.Info("PDS scan completed in %v", time.Since(startTime))
 
 	return nil
 }
 
-func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.Endpoint, results chan<- *PDSStatus) {
+func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.Endpoint) {
 	for server := range jobs {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			status := s.scanPDS(ctx, server.ID, server.Endpoint)
-			results <- status
+			s.scanAndSaveEndpoint(ctx, server)
 		}
 	}
 }
 
-func (s *Scanner) scanPDS(ctx context.Context, endpointID int64, endpoint string) *PDSStatus {
-	status := &PDSStatus{
-		EndpointID:  endpointID,
-		Endpoint:    endpoint,
-		LastChecked: time.Now().UTC(),
-	}
-
-	// Health check
-	available, responseTime, err := s.client.CheckHealth(ctx, endpoint)
-	status.Available = available
-	status.ResponseTime = responseTime
-
+func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint) {
+	// STEP 1: Resolve IP (before any network call)
+	ip, err := ipinfo.ExtractIPFromEndpoint(ep.Endpoint)
 	if err != nil {
-		status.ErrorMessage = err.Error()
-		return status
-	}
-
-	if !available {
-		status.ErrorMessage = "health check failed"
-		return status
-	}
-
-	// Fetch and update IP info if needed
-	s.updateIPInfoIfNeeded(ctx, endpointID, endpoint)
-
-	// Describe server
-	desc, err := s.client.DescribeServer(ctx, endpoint)
-	if err != nil {
-		log.Verbose("Warning: failed to describe server %s: %v", stripansi.Strip(endpoint), err)
-	} else {
-		status.Description = desc
-	}
-
-	// Optionally list repos (DIDs) - commented out by default for performance
-	dids, err := s.client.ListRepos(ctx, endpoint)
-	if err != nil {
-		log.Verbose("Warning: failed to list repos for %s: %v", endpoint, err)
-		status.DIDs = []string{}
-	} else {
-		status.DIDs = dids
-		log.Verbose("  → Found %d users on %s", len(dids), endpoint)
-	}
-
-	return status
-}
-
-func (s *Scanner) updateIPInfoIfNeeded(ctx context.Context, endpointID int64, endpoint string) {
-	// Check if IP info client is in backoff
-	if s.ipInfoClient.IsInBackoff() {
-		// Silently skip during backoff period
+		// Mark as offline due to DNS failure
+		s.saveScanResult(ctx, ep.ID, &ScanResult{
+			Status:       storage.EndpointStatusOffline,
+			ErrorMessage: fmt.Sprintf("DNS resolution failed: %v", err),
+		})
 		return
 	}
 
-	// Extract IP from endpoint
-	ip, err := ipinfo.ExtractIPFromEndpoint(endpoint)
+	// Update IP immediately
+	s.db.UpdateEndpointIP(ctx, ep.ID, ip, time.Now())
+
+	// STEP 2: Health check
+	available, responseTime, err := s.client.CheckHealth(ctx, ep.Endpoint)
+	if err != nil || !available {
+		errMsg := "health check failed"
+		if err != nil {
+			errMsg = err.Error()
+		}
+		s.saveScanResult(ctx, ep.ID, &ScanResult{
+			Status:       storage.EndpointStatusOffline,
+			ResponseTime: responseTime,
+			ErrorMessage: errMsg,
+		})
+		return
+	}
+
+	// STEP 3: Fetch PDS-specific data
+	desc, err := s.client.DescribeServer(ctx, ep.Endpoint)
 	if err != nil {
-		log.Verbose("Failed to extract IP from %s: %v", endpoint, err)
+		log.Verbose("Warning: failed to describe server %s: %v", stripansi.Strip(ep.Endpoint), err)
+	}
+
+	dids, err := s.client.ListRepos(ctx, ep.Endpoint)
+	if err != nil {
+		log.Verbose("Warning: failed to list repos for %s: %v", ep.Endpoint, err)
+		dids = []string{}
+	}
+
+	// STEP 4: SAVE IMMEDIATELY
+	s.saveScanResult(ctx, ep.ID, &ScanResult{
+		Status:       storage.EndpointStatusOnline,
+		ResponseTime: responseTime,
+		Description:  desc,
+		DIDs:         dids,
+	})
+
+	// STEP 5: Fetch IP info if needed (async, with backoff)
+	go s.updateIPInfoIfNeeded(ctx, ip)
+}
+
+func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *ScanResult) {
+	// Build scan_data with PDS-specific info in Metadata
+	scanData := &storage.EndpointScanData{
+		DIDCount: len(result.DIDs),
+		Metadata: make(map[string]interface{}),
+	}
+
+	// Add PDS-specific metadata
+	if result.Status == storage.EndpointStatusOnline {
+		scanData.Metadata["user_count"] = len(result.DIDs)
+		if result.Description != nil {
+			scanData.Metadata["server_info"] = result.Description
+		}
+	} else {
+		// Include error message for offline status
+		if result.ErrorMessage != "" {
+			scanData.Metadata["error"] = result.ErrorMessage
+		}
+	}
+
+	// Save scan record
+	scan := &storage.EndpointScan{
+		EndpointID:   endpointID,
+		Status:       result.Status,
+		ResponseTime: result.ResponseTime.Seconds() * 1000, // Convert to ms
+		ScanData:     scanData,
+		ScannedAt:    time.Now(),
+	}
+
+	if err := s.db.SaveEndpointScan(ctx, scan); err != nil {
+		log.Error("Failed to save scan for endpoint %d: %v", endpointID, err)
+	}
+
+	// Update endpoint status
+	update := &storage.EndpointUpdate{
+		Status:       result.Status,
+		LastChecked:  time.Now(),
+		ResponseTime: result.ResponseTime.Seconds() * 1000,
+	}
+
+	if err := s.db.UpdateEndpointStatus(ctx, endpointID, update); err != nil {
+		log.Error("Failed to update endpoint status for %d: %v", endpointID, err)
+	}
+}
+
+func (s *Scanner) updateIPInfoIfNeeded(ctx context.Context, ip string) {
+	// Check if IP info client is in backoff
+	if s.ipInfoClient.IsInBackoff() {
 		return
 	}
 
 	// Check if we need to update IP info
-	shouldUpdate, err := s.db.ShouldUpdateIPInfo(ctx, endpointID, ip)
+	exists, needsUpdate, err := s.db.ShouldUpdateIPInfo(ctx, ip)
 	if err != nil {
 		log.Verbose("Failed to check IP info status: %v", err)
 		return
 	}
 
-	if !shouldUpdate {
-		return // IP hasn't changed, no need to fetch
+	if exists && !needsUpdate {
+		return // IP info is fresh
 	}
 
 	// Fetch IP info from ipapi.is
-	log.Verbose("Fetching IP info for %s (%s)", endpoint, ip)
+	log.Verbose("Fetching IP info for %s", ip)
 	ipInfo, err := s.ipInfoClient.GetIPInfo(ctx, ip)
 	if err != nil {
 		// Log only once when backoff starts
@@ -207,9 +210,9 @@ func (s *Scanner) updateIPInfoIfNeeded(ctx context.Context, endpointID int64, en
 	}
 
 	// Update database
-	if err := s.db.UpdateEndpointIPInfo(ctx, endpointID, ip, ipInfo); err != nil {
-		log.Error("Failed to update IP info for endpoint %d: %v", endpointID, err)
+	if err := s.db.UpsertIPInfo(ctx, ip, ipInfo); err != nil {
+		log.Error("Failed to update IP info for %s: %v", ip, err)
 	} else {
-		log.Verbose("✓ Updated IP info for %s: %s", endpoint, ip)
+		log.Verbose("✓ Updated IP info for %s", ip)
 	}
 }

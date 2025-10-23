@@ -56,10 +56,14 @@ func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCCo
 func (s *Server) setupRoutes() {
 	api := s.router.PathPrefix("/api/v1").Subrouter()
 
-	// Endpoint routes (replaces PDS routes)
+	// Generic endpoints (keep as-is)
 	api.HandleFunc("/endpoints", s.handleGetEndpoints).Methods("GET")
 	api.HandleFunc("/endpoints/stats", s.handleGetEndpointStats).Methods("GET")
-	api.HandleFunc("/endpoints/{endpoint}", s.handleGetEndpoint).Methods("GET")
+
+	// NEW: PDS-specific endpoints (virtual, created via JOINs)
+	api.HandleFunc("/pds", s.handleGetPDSList).Methods("GET")
+	api.HandleFunc("/pds/{endpoint}", s.handleGetPDSDetail).Methods("GET")
+	api.HandleFunc("/pds/stats", s.handleGetPDSStats).Methods("GET")
 
 	// PLC Bundle routes
 	api.HandleFunc("/plc/bundles", s.handleGetPLCBundles).Methods("GET")

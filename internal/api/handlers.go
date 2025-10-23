@@ -102,7 +102,7 @@ func formatEndpointResponse(ep *storage.Endpoint) map[string]interface{} {
 		"discovered_at": ep.DiscoveredAt,
 		"last_checked":  ep.LastChecked,
 		"status":        statusToString(ep.Status),
-		"user_count":    ep.UserCount,
+		// REMOVED: "user_count": ep.UserCount,  // No longer exists
 	}
 
 	// Add IP if available
@@ -110,31 +110,8 @@ func formatEndpointResponse(ep *storage.Endpoint) map[string]interface{} {
 		response["ip"] = ep.IP
 	}
 
-	// Extract specific fields from ip_info
-	if ep.IPInfo != nil {
-		// Extract location info
-		if location, ok := ep.IPInfo["location"].(map[string]interface{}); ok {
-			if city, ok := location["city"].(string); ok {
-				response["city"] = city
-			}
-			if countryCode, ok := location["country_code"].(string); ok {
-				response["country_code"] = countryCode
-			}
-			if country, ok := location["country"].(string); ok {
-				response["country"] = country
-			}
-		}
-
-		// Extract ASN info
-		if asn, ok := ep.IPInfo["asn"].(map[string]interface{}); ok {
-			if asnNumber, ok := asn["asn"].(float64); ok {
-				response["asn"] = int(asnNumber)
-			}
-		}
-
-		// Optionally include full ip_info for detailed view
-		// response["ip_info"] = ep.IPInfo
-	}
+	// REMOVED: IP info extraction - no longer in Endpoint struct
+	// IPInfo is now in separate table, joined only in PDS handlers
 
 	return response
 }
@@ -159,7 +136,7 @@ func (s *Server) handleGetEndpoints(w http.ResponseWriter, r *http.Request) {
 		Type:         r.URL.Query().Get("type"),
 		Status:       r.URL.Query().Get("status"),
 		MinUserCount: getQueryInt64(r, "min_user_count", 0),
-		Limit:        getQueryInt(r, "limit", 0),
+		Limit:        getQueryInt(r, "limit", 50),
 		Offset:       getQueryInt(r, "offset", 0),
 	}
 
@@ -177,31 +154,6 @@ func (s *Server) handleGetEndpoints(w http.ResponseWriter, r *http.Request) {
 	resp.json(response)
 }
 
-func (s *Server) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
-	resp := newResponse(w)
-	vars := mux.Vars(r)
-	endpoint := vars["endpoint"]
-	endpointType := r.URL.Query().Get("type")
-	if endpointType == "" {
-		endpointType = "pds"
-	}
-
-	endpoint = "https://" + normalizeEndpoint(endpoint)
-	ep, err := s.db.GetEndpoint(r.Context(), endpoint, endpointType)
-	if err != nil {
-		resp.error("Endpoint not found", http.StatusNotFound)
-		return
-	}
-
-	scans, _ := s.db.GetEndpointScans(r.Context(), ep.ID, 10)
-
-	result := formatEndpointResponse(ep)
-	result["recent_scans"] = scans
-
-	result["ipinfo"] = ep.IPInfo
-	resp.json(result)
-}
-
 func (s *Server) handleGetEndpointStats(w http.ResponseWriter, r *http.Request) {
 	resp := newResponse(w)
 	stats, err := s.db.GetEndpointStats(r.Context())
@@ -210,6 +162,196 @@ func (s *Server) handleGetEndpointStats(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	resp.json(stats)
+}
+
+// ===== PDS HANDLERS =====
+
+func (s *Server) handleGetPDSList(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	filter := &storage.EndpointFilter{
+		Type:         "pds",
+		Status:       r.URL.Query().Get("status"),
+		MinUserCount: getQueryInt64(r, "min_user_count", 0),
+		Limit:        getQueryInt(r, "limit", 50),
+		Offset:       getQueryInt(r, "offset", 0),
+	}
+
+	pdsServers, err := s.db.GetPDSList(r.Context(), filter)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := make([]map[string]interface{}, len(pdsServers))
+	for i, pds := range pdsServers {
+		response[i] = formatPDSListItem(pds)
+	}
+
+	resp.json(response)
+}
+
+func (s *Server) handleGetPDSDetail(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	endpoint := "https://" + normalizeEndpoint(vars["endpoint"])
+
+	// FIX: Use r.Context() instead of ctx
+	pds, err := s.db.GetPDSDetail(r.Context(), endpoint)
+	if err != nil {
+		resp.error("PDS not found", http.StatusNotFound)
+		return
+	}
+
+	// Get recent scans
+	scans, _ := s.db.GetEndpointScans(r.Context(), pds.ID, 10)
+
+	result := formatPDSDetail(pds)
+	result["recent_scans"] = formatScans(scans)
+
+	resp.json(result)
+}
+
+func (s *Server) handleGetPDSStats(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	ctx := r.Context()
+
+	// Get PDS-specific stats
+	stats, err := s.db.GetPDSStats(ctx)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp.json(stats)
+}
+
+func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
+	response := map[string]interface{}{
+		"id":            pds.ID,
+		"endpoint":      pds.Endpoint,
+		"discovered_at": pds.DiscoveredAt,
+		"status":        statusToString(pds.Status),
+	}
+
+	// Add last_checked if available
+	if !pds.LastChecked.IsZero() {
+		response["last_checked"] = pds.LastChecked
+	}
+
+	// Add data from latest scan (if available)
+	if pds.LatestScan != nil {
+		response["user_count"] = pds.LatestScan.UserCount
+		response["response_time"] = pds.LatestScan.ResponseTime
+		if !pds.LatestScan.ScannedAt.IsZero() {
+			response["last_scan"] = pds.LatestScan.ScannedAt
+		}
+	}
+
+	// Add IP if available
+	if pds.IP != "" {
+		response["ip"] = pds.IP
+	}
+
+	// Add IP info (from ip_infos table via JOIN)
+	if pds.IPInfo != nil {
+		if pds.IPInfo.City != "" {
+			response["city"] = pds.IPInfo.City
+		}
+		if pds.IPInfo.Country != "" {
+			response["country"] = pds.IPInfo.Country
+		}
+		if pds.IPInfo.CountryCode != "" {
+			response["country_code"] = pds.IPInfo.CountryCode
+		}
+		if pds.IPInfo.ASN > 0 {
+			response["asn"] = pds.IPInfo.ASN
+		}
+	}
+
+	return response
+}
+
+func formatPDSDetail(pds *storage.PDSDetail) map[string]interface{} {
+	// Start with list item formatting
+	response := formatPDSListItem(&pds.PDSListItem)
+
+	// Add server_info from latest scan
+	if pds.LatestScan != nil && pds.LatestScan.ServerInfo != nil {
+		response["server_info"] = pds.LatestScan.ServerInfo
+	}
+
+	// Add full IP info
+	if pds.IPInfo != nil {
+		ipInfoMap := make(map[string]interface{})
+
+		if pds.IP != "" {
+			ipInfoMap["ip"] = pds.IP
+		}
+		if pds.IPInfo.City != "" {
+			ipInfoMap["city"] = pds.IPInfo.City
+		}
+		if pds.IPInfo.Country != "" {
+			ipInfoMap["country"] = pds.IPInfo.Country
+		}
+		if pds.IPInfo.CountryCode != "" {
+			ipInfoMap["country_code"] = pds.IPInfo.CountryCode
+		}
+		if pds.IPInfo.ASN > 0 {
+			ipInfoMap["asn"] = pds.IPInfo.ASN
+		}
+		if pds.IPInfo.ASNOrg != "" {
+			ipInfoMap["asn_org"] = pds.IPInfo.ASNOrg
+		}
+		ipInfoMap["is_datacenter"] = pds.IPInfo.IsDatacenter
+		ipInfoMap["is_vpn"] = pds.IPInfo.IsVPN
+
+		if pds.IPInfo.Latitude != 0 || pds.IPInfo.Longitude != 0 {
+			ipInfoMap["latitude"] = pds.IPInfo.Latitude
+			ipInfoMap["longitude"] = pds.IPInfo.Longitude
+		}
+
+		if len(ipInfoMap) > 0 {
+			response["ip_info"] = ipInfoMap
+		}
+	}
+
+	return response
+}
+
+func formatScans(scans []*storage.EndpointScan) []map[string]interface{} {
+	result := make([]map[string]interface{}, len(scans))
+	for i, scan := range scans {
+		scanMap := map[string]interface{}{
+			"id":         scan.ID,
+			"status":     statusToString(scan.Status),
+			"scanned_at": scan.ScannedAt,
+		}
+
+		if scan.ResponseTime > 0 {
+			scanMap["response_time"] = scan.ResponseTime
+		}
+
+		if scan.ScanData != nil {
+			// Metadata is already map[string]interface{}, no type assertion needed
+			if scan.ScanData.Metadata != nil {
+				// Extract user_count from metadata
+				if userCount, ok := scan.ScanData.Metadata["user_count"].(int); ok {
+					scanMap["user_count"] = userCount
+				} else if userCount, ok := scan.ScanData.Metadata["user_count"].(float64); ok {
+					scanMap["user_count"] = int(userCount)
+				}
+			}
+
+			// Include DID count if available
+			if scan.ScanData.DIDCount > 0 {
+				scanMap["did_count"] = scan.ScanData.DIDCount
+			}
+		}
+
+		result[i] = scanMap
+	}
+	return result
 }
 
 // ===== DID HANDLERS =====

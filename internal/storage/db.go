@@ -24,14 +24,22 @@ type Database interface {
 	UpsertEndpoint(ctx context.Context, endpoint *Endpoint) error
 	GetEndpoint(ctx context.Context, endpoint string, endpointType string) (*Endpoint, error)
 	GetEndpoints(ctx context.Context, filter *EndpointFilter) ([]*Endpoint, error)
-	UpdateEndpointStatus(ctx context.Context, endpointID int64, update *EndpointUpdate) error
 	EndpointExists(ctx context.Context, endpoint string, endpointType string) (bool, error)
 	GetEndpointIDByEndpoint(ctx context.Context, endpoint string, endpointType string) (int64, error)
 	GetEndpointScans(ctx context.Context, endpointID int64, limit int) ([]*EndpointScan, error)
+	UpdateEndpointIP(ctx context.Context, endpointID int64, ip string, resolvedAt time.Time) error
+	SaveEndpointScan(ctx context.Context, scan *EndpointScan) error
+	UpdateEndpointStatus(ctx context.Context, endpointID int64, update *EndpointUpdate) error
 
-	// IP info operations
-	ShouldUpdateIPInfo(ctx context.Context, endpointID int64, currentIP string) (bool, error)
-	UpdateEndpointIPInfo(ctx context.Context, endpointID int64, ip string, ipInfo map[string]interface{}) error
+	// PDS virtual endpoints (created via JOINs)
+	GetPDSList(ctx context.Context, filter *EndpointFilter) ([]*PDSListItem, error)
+	GetPDSDetail(ctx context.Context, endpoint string) (*PDSDetail, error)
+	GetPDSStats(ctx context.Context) (*PDSStats, error)
+
+	// IP operations (IP as primary key)
+	UpsertIPInfo(ctx context.Context, ip string, ipInfo map[string]interface{}) error
+	GetIPInfo(ctx context.Context, ip string) (*IPInfo, error)
+	ShouldUpdateIPInfo(ctx context.Context, ip string) (exists bool, needsUpdate bool, err error)
 
 	// Cursor operations
 	GetScanCursor(ctx context.Context, source string) (*ScanCursor, error)
