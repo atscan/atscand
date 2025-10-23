@@ -303,9 +303,13 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 			argIdx++
 		}
 
-		// NEW: Filter for stale endpoints only
+		// FIXED: Filter for stale endpoints only
 		if filter.OnlyStale && filter.RecheckInterval > 0 {
-			query += fmt.Sprintf(" AND (last_checked IS NULL OR last_checked < NOW() - INTERVAL '%d seconds')", int(filter.RecheckInterval.Seconds()))
+			// Calculate cutoff time in UTC (Go side, not PostgreSQL side)
+			cutoffTime := time.Now().UTC().Add(-filter.RecheckInterval)
+			query += fmt.Sprintf(" AND (last_checked IS NULL OR last_checked < $%d)", argIdx)
+			args = append(args, cutoffTime)
+			argIdx++
 		}
 	}
 

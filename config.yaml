@@ -14,7 +14,7 @@ pds:
   scan_interval: "30m"
   timeout: "30s"
   workers: 20
-  recheck_interval: "30m"
+  recheck_interval: "1.5h"
   scan_retention: 3
 
 api:
