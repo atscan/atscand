@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atscan/atscanner/internal/log"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -20,10 +21,12 @@ type PostgresDB struct {
 }
 
 func NewPostgresDB(connString string) (*PostgresDB, error) {
+	log.Info("Connecting to PostgreSQL database...")
+
 	// Open standard sql.DB (for compatibility)
 	db, err := sql.Open("pgx", connString)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
 	// Connection pool settings
@@ -32,21 +35,29 @@ func NewPostgresDB(connString string) (*PostgresDB, error) {
 	db.SetConnMaxLifetime(5 * time.Minute)
 	db.SetConnMaxIdleTime(2 * time.Minute)
 
+	log.Verbose("  Max open connections: 50")
+	log.Verbose("  Max idle connections: 25")
+	log.Verbose("  Connection max lifetime: 5m")
+
 	// Test connection
+	log.Info("Testing database connection...")
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
+	log.Info("✓ Database connection successful")
 
 	// Also create pgx pool for COPY operations
+	log.Verbose("Creating pgx connection pool...")
 	pool, err := pgxpool.New(context.Background(), connString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pgx pool: %w", err)
 	}
+	log.Verbose("✓ Connection pool created")
 
 	return &PostgresDB{
 		db:            db,
 		pool:          pool,
-		scanRetention: 3,
+		scanRetention: 3, // Default
 	}, nil
 }
 
@@ -58,6 +69,8 @@ func (p *PostgresDB) Close() error {
 }
 
 func (p *PostgresDB) Migrate() error {
+	log.Info("Running database migrations...")
+
 	schema := `
     -- Endpoints table (NO user_count, NO ip_info)
     CREATE TABLE IF NOT EXISTS endpoints (
@@ -180,7 +193,12 @@ func (p *PostgresDB) Migrate() error {
     `
 
 	_, err := p.db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	log.Info("✓ Database migrations completed successfully")
+	return nil
 }
 
 // ===== ENDPOINT OPERATIONS =====
