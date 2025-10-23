@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/atscan/atscanner/internal/log"
+	"github.com/atscan/atscanner/internal/monitor"
 )
 
 type Job struct {
@@ -34,6 +35,9 @@ func (s *Scheduler) AddJob(name string, interval time.Duration, fn func()) {
 		Interval: interval,
 		Fn:       fn,
 	})
+
+	// Register job with tracker
+	monitor.GetTracker().RegisterJob(name)
 }
 
 func (s *Scheduler) Start(ctx context.Context) {
@@ -52,16 +56,36 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 
 	// Run immediately
 	log.Info("Starting job: %s", job.Name)
-	job.Fn()
+	s.executeJob(job)
 
 	for {
+		// Set next run time
+		monitor.GetTracker().SetNextRun(job.Name, time.Now().Add(job.Interval))
+
 		select {
 		case <-ctx.Done():
 			log.Info("Stopping job: %s", job.Name)
 			return
 		case <-ticker.C:
 			log.Info("Running job: %s", job.Name)
-			job.Fn()
+			s.executeJob(job)
 		}
 	}
+}
+
+func (s *Scheduler) executeJob(job *Job) {
+	monitor.GetTracker().StartJob(job.Name)
+
+	// Run job and capture any panic
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("Job %s panicked: %v", job.Name, r)
+				monitor.GetTracker().CompleteJob(job.Name, nil)
+			}
+		}()
+
+		job.Fn()
+		monitor.GetTracker().CompleteJob(job.Name, nil)
+	}()
 }

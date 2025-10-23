@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/acarl005/stripansi"
 	"github.com/atscan/atscanner/internal/config"
 	"github.com/atscan/atscanner/internal/ipinfo"
 	"github.com/atscan/atscanner/internal/log"
+	"github.com/atscan/atscanner/internal/monitor"
 	"github.com/atscan/atscanner/internal/storage"
 )
 
@@ -34,11 +36,11 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	startTime := time.Now()
 	log.Info("Starting PDS availability scan...")
 
-	// Get only PDS endpoints that need checking (stale or never checked)
+	// Get only PDS endpoints that need checking
 	servers, err := s.db.GetEndpoints(ctx, &storage.EndpointFilter{
 		Type:            "pds",
-		OnlyStale:       true,                     // NEW: Only get stale endpoints
-		RecheckInterval: s.config.RecheckInterval, // NEW: Use recheck interval from config
+		OnlyStale:       true,
+		RecheckInterval: s.config.RecheckInterval,
 	})
 	if err != nil {
 		return err
@@ -46,35 +48,41 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 
 	if len(servers) == 0 {
 		log.Info("No endpoints need scanning at this time")
+		monitor.GetTracker().UpdateProgress("pds_scan", 0, 0, "No endpoints need scanning")
 		return nil
 	}
 
-	log.Info("Found %d endpoints that need scanning (not checked in last %s)", len(servers), s.config.RecheckInterval)
+	log.Info("Found %d endpoints that need scanning", len(servers))
+	monitor.GetTracker().UpdateProgress("pds_scan", 0, len(servers), "Preparing to scan")
 
-	// Shuffle the servers slice in place
+	// Shuffle servers
 	if len(servers) > 0 {
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
 		r.Shuffle(len(servers), func(i, j int) {
 			servers[i], servers[j] = servers[j], servers[i]
 		})
-		log.Info("Randomized scan order for %d PDS servers...", len(servers))
 	}
 
-	// Worker pool
-	jobs := make(chan *storage.Endpoint, len(servers))
+	// Initialize workers in tracker
+	monitor.GetTracker().InitWorkers("pds_scan", s.config.Workers)
+
+	// Worker pool with progress tracking
+	jobs := make(chan *workerJob, len(servers))
 	var wg sync.WaitGroup
+	var completed int32
 
 	for i := 0; i < s.config.Workers; i++ {
 		wg.Add(1)
-		go func() {
+		workerID := i + 1
+		go func(id int) {
 			defer wg.Done()
-			s.worker(ctx, jobs)
-		}()
+			s.workerWithProgress(ctx, id, jobs, &completed, len(servers))
+		}(workerID)
 	}
 
 	// Send jobs
 	for _, server := range servers {
-		jobs <- server
+		jobs <- &workerJob{endpoint: server}
 	}
 	close(jobs)
 
@@ -82,8 +90,37 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	wg.Wait()
 
 	log.Info("PDS scan completed in %v", time.Since(startTime))
+	monitor.GetTracker().UpdateProgress("pds_scan", len(servers), len(servers), "Completed")
 
 	return nil
+}
+
+type workerJob struct {
+	endpoint *storage.Endpoint
+}
+
+func (s *Scanner) workerWithProgress(ctx context.Context, workerID int, jobs <-chan *workerJob, completed *int32, total int) {
+	for job := range jobs {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			// Update worker status
+			monitor.GetTracker().StartWorker("pds_scan", workerID, job.endpoint.Endpoint)
+
+			// Scan endpoint
+			s.scanAndSaveEndpoint(ctx, job.endpoint)
+
+			// Update progress
+			atomic.AddInt32(completed, 1)
+			current := atomic.LoadInt32(completed)
+			monitor.GetTracker().UpdateProgress("pds_scan", int(current), total,
+				fmt.Sprintf("Scanned %d/%d endpoints", current, total))
+
+			// Mark worker as idle
+			monitor.GetTracker().CompleteWorker("pds_scan", workerID)
+		}
+	}
 }
 
 func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.Endpoint) {

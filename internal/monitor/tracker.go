@@ -1,5 +1,4 @@
 package monitor
-package monitor
 
 import (
 	"sync"
@@ -21,17 +20,17 @@ type JobStatus struct {
 }
 
 type Progress struct {
-	Current int    `json:"current"`
-	Total   int    `json:"total"`
+	Current int     `json:"current"`
+	Total   int     `json:"total"`
 	Percent float64 `json:"percent"`
-	Message string `json:"message,omitempty"`
+	Message string  `json:"message,omitempty"`
 }
 
 type WorkerStatus struct {
-	ID          int       `json:"id"`
-	Status      string    `json:"status"` // "idle", "working"
-	CurrentTask string    `json:"current_task,omitempty"`
-	StartedAt   time.Time `json:"started_at,omitempty"`
+	ID          int           `json:"id"`
+	Status      string        `json:"status"` // "idle", "working"
+	CurrentTask string        `json:"current_task,omitempty"`
+	StartedAt   time.Time     `json:"started_at,omitempty"`
 	Duration    time.Duration `json:"duration,omitempty"`
 }
 
@@ -58,7 +57,7 @@ func GetTracker() *Tracker {
 func (t *Tracker) RegisterJob(name string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	t.jobs[name] = &JobStatus{
 		Name:   name,
 		Status: "idle",
@@ -68,7 +67,7 @@ func (t *Tracker) RegisterJob(name string) {
 func (t *Tracker) StartJob(name string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if job, exists := t.jobs[name]; exists {
 		job.Status = "running"
 		job.StartTime = time.Now()
@@ -80,11 +79,11 @@ func (t *Tracker) StartJob(name string) {
 func (t *Tracker) CompleteJob(name string, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if job, exists := t.jobs[name]; exists {
 		job.LastRun = time.Now()
 		job.Duration = time.Since(job.StartTime)
-		
+
 		if err != nil {
 			job.Status = "error"
 			job.Error = err.Error()
@@ -93,7 +92,7 @@ func (t *Tracker) CompleteJob(name string, err error) {
 			job.Status = "completed"
 			job.SuccessCount++
 		}
-		
+
 		job.Progress = nil // Clear progress
 	}
 }
@@ -101,13 +100,13 @@ func (t *Tracker) CompleteJob(name string, err error) {
 func (t *Tracker) UpdateProgress(name string, current, total int, message string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if job, exists := t.jobs[name]; exists {
 		var percent float64
 		if total > 0 {
 			percent = float64(current) / float64(total) * 100
 		}
-		
+
 		job.Progress = &Progress{
 			Current: current,
 			Total:   total,
@@ -120,7 +119,7 @@ func (t *Tracker) UpdateProgress(name string, current, total int, message string
 func (t *Tracker) SetNextRun(name string, nextRun time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if job, exists := t.jobs[name]; exists {
 		job.NextRun = nextRun
 	}
@@ -129,7 +128,7 @@ func (t *Tracker) SetNextRun(name string, nextRun time.Time) {
 func (t *Tracker) GetJobStatus(name string) *JobStatus {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	if job, exists := t.jobs[name]; exists {
 		// Create a copy
 		jobCopy := *job
@@ -137,12 +136,12 @@ func (t *Tracker) GetJobStatus(name string) *JobStatus {
 			progressCopy := *job.Progress
 			jobCopy.Progress = &progressCopy
 		}
-		
+
 		// Calculate duration for running jobs
 		if jobCopy.Status == "running" {
 			jobCopy.Duration = time.Since(jobCopy.StartTime)
 		}
-		
+
 		return &jobCopy
 	}
 	return nil
@@ -151,7 +150,7 @@ func (t *Tracker) GetJobStatus(name string) *JobStatus {
 func (t *Tracker) GetAllJobs() map[string]*JobStatus {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	result := make(map[string]*JobStatus)
 	for name, job := range t.jobs {
 		jobCopy := *job
@@ -159,12 +158,12 @@ func (t *Tracker) GetAllJobs() map[string]*JobStatus {
 			progressCopy := *job.Progress
 			jobCopy.Progress = &progressCopy
 		}
-		
+
 		// Calculate duration for running jobs
 		if jobCopy.Status == "running" {
 			jobCopy.Duration = time.Since(jobCopy.StartTime)
 		}
-		
+
 		result[name] = &jobCopy
 	}
 	return result
@@ -174,7 +173,7 @@ func (t *Tracker) GetAllJobs() map[string]*JobStatus {
 func (t *Tracker) InitWorkers(jobName string, count int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	workers := make([]WorkerStatus, count)
 	for i := 0; i < count; i++ {
 		workers[i] = WorkerStatus{
@@ -188,7 +187,7 @@ func (t *Tracker) InitWorkers(jobName string, count int) {
 func (t *Tracker) StartWorker(jobName string, workerID int, task string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if workers, exists := t.workers[jobName]; exists && workerID > 0 && workerID <= len(workers) {
 		workers[workerID-1].Status = "working"
 		workers[workerID-1].CurrentTask = task
@@ -199,7 +198,7 @@ func (t *Tracker) StartWorker(jobName string, workerID int, task string) {
 func (t *Tracker) CompleteWorker(jobName string, workerID int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if workers, exists := t.workers[jobName]; exists && workerID > 0 && workerID <= len(workers) {
 		workers[workerID-1].Status = "idle"
 		workers[workerID-1].CurrentTask = ""
@@ -211,7 +210,7 @@ func (t *Tracker) CompleteWorker(jobName string, workerID int) {
 func (t *Tracker) GetWorkers(jobName string) []WorkerStatus {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	if workers, exists := t.workers[jobName]; exists {
 		// Create a copy with calculated durations
 		result := make([]WorkerStatus, len(workers))

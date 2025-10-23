@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/atscan/atscanner/internal/log"
+	"github.com/atscan/atscanner/internal/monitor"
 	"github.com/atscan/atscanner/internal/plc"
 	"github.com/atscan/atscanner/internal/storage"
 	"github.com/gorilla/mux"
@@ -1260,6 +1261,56 @@ func (s *Server) collectOperations(ctx context.Context, startBundle int, afterTi
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	newResponse(w).json(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleGetJobStatus(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	tracker := monitor.GetTracker()
+
+	jobs := tracker.GetAllJobs()
+
+	result := make(map[string]interface{})
+	for name, job := range jobs {
+		jobData := map[string]interface{}{
+			"name":          job.Name,
+			"status":        job.Status,
+			"run_count":     job.RunCount,
+			"success_count": job.SuccessCount,
+			"error_count":   job.ErrorCount,
+		}
+
+		if !job.LastRun.IsZero() {
+			jobData["last_run"] = job.LastRun
+			jobData["last_duration"] = job.Duration.String()
+		}
+
+		if !job.NextRun.IsZero() {
+			jobData["next_run"] = job.NextRun
+			jobData["next_run_in"] = time.Until(job.NextRun).Round(time.Second).String()
+		}
+
+		if job.Status == "running" {
+			jobData["running_for"] = job.Duration.Round(time.Second).String()
+
+			if job.Progress != nil {
+				jobData["progress"] = job.Progress
+			}
+
+			// Add worker status
+			workers := tracker.GetWorkers(name)
+			if len(workers) > 0 {
+				jobData["workers"] = workers
+			}
+		}
+
+		if job.Error != "" {
+			jobData["error"] = job.Error
+		}
+
+		result[name] = jobData
+	}
+
+	resp.json(result)
 }
 
 // ===== UTILITY FUNCTIONS =====

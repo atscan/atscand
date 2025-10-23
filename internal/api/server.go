@@ -89,6 +89,9 @@ func (s *Server) setupRoutes() {
 	// Metrics routes
 	api.HandleFunc("/metrics/plc", s.handleGetPLCMetrics).Methods("GET")
 
+	// Job status endpoint
+	api.HandleFunc("/jobs", s.handleGetJobStatus).Methods("GET")
+
 	// Health check
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
 }
