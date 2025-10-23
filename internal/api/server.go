@@ -62,8 +62,8 @@ func (s *Server) setupRoutes() {
 
 	// NEW: PDS-specific endpoints (virtual, created via JOINs)
 	api.HandleFunc("/pds", s.handleGetPDSList).Methods("GET")
-	api.HandleFunc("/pds/{endpoint}", s.handleGetPDSDetail).Methods("GET")
 	api.HandleFunc("/pds/stats", s.handleGetPDSStats).Methods("GET")
+	api.HandleFunc("/pds/{endpoint}", s.handleGetPDSDetail).Methods("GET")
 
 	// PLC Bundle routes
 	api.HandleFunc("/plc/bundles", s.handleGetPLCBundles).Methods("GET")

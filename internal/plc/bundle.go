@@ -369,7 +369,7 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 		Cursor:           cursor,
 		PrevBundleHash:   prevHash,
 		Compressed:       true,
-		CreatedAt:        time.Now(),
+		CreatedAt:        time.Now().UTC(),
 	}
 
 	// Create bundle first

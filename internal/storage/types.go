@@ -50,6 +50,7 @@ type EndpointScan struct {
 	EndpointID   int64
 	Status       int
 	ResponseTime float64
+	UserCount    int64
 	ScanData     *EndpointScanData
 	ScannedAt    time.Time
 }
@@ -161,19 +162,19 @@ type DIDRecord struct {
 
 // IPInfo represents IP information (stored with IP as primary key)
 type IPInfo struct {
-	IP           string
-	City         string
-	Country      string
-	CountryCode  string
-	ASN          int
-	ASNOrg       string
-	IsDatacenter bool
-	IsVPN        bool
-	Latitude     float32
-	Longitude    float32
-	RawData      map[string]interface{}
-	FetchedAt    time.Time
-	UpdatedAt    time.Time
+	IP           string                 `json:"ip"`
+	City         string                 `json:"city,omitempty"`
+	Country      string                 `json:"country,omitempty"`
+	CountryCode  string                 `json:"country_code,omitempty"`
+	ASN          int                    `json:"asn,omitempty"`
+	ASNOrg       string                 `json:"asn_org,omitempty"`
+	IsDatacenter bool                   `json:"is_datacenter"`
+	IsVPN        bool                   `json:"is_vpn"`
+	Latitude     float32                `json:"latitude,omitempty"`
+	Longitude    float32                `json:"longitude,omitempty"`
+	RawData      map[string]interface{} `json:"raw_data,omitempty"`
+	FetchedAt    time.Time              `json:"fetched_at"`
+	UpdatedAt    time.Time              `json:"updated_at"`
 }
 
 // PDSListItem is a virtual type created by JOIN for /pds endpoint

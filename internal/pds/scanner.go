@@ -3,6 +3,7 @@ package pds
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -41,7 +42,18 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 		return err
 	}
 
-	log.Info("Scanning %d PDS servers...", len(servers))
+	if len(servers) > 0 {
+		// Create a new random source to avoid using the global one
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		// Shuffle the servers slice in place
+		r.Shuffle(len(servers), func(i, j int) {
+			servers[i], servers[j] = servers[j], servers[i]
+		})
+		log.Info("Randomized scan order for %d PDS servers...", len(servers))
+	} else {
+		log.Info("Scanning 0 PDS servers...")
+		return nil // No need to continue if there are no servers
+	}
 
 	// Worker pool
 	jobs := make(chan *storage.Endpoint, len(servers))
@@ -93,7 +105,7 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 	}
 
 	// Update IP immediately
-	s.db.UpdateEndpointIP(ctx, ep.ID, ip, time.Now())
+	s.db.UpdateEndpointIP(ctx, ep.ID, ip, time.Now().UTC())
 
 	// STEP 2: Health check
 	available, responseTime, err := s.client.CheckHealth(ctx, ep.Endpoint)
@@ -141,9 +153,12 @@ func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *
 		Metadata: make(map[string]interface{}),
 	}
 
+	var userCount int64 // NEW: Declare user count
+
 	// Add PDS-specific metadata
 	if result.Status == storage.EndpointStatusOnline {
-		scanData.Metadata["user_count"] = len(result.DIDs)
+		userCount = int64(len(result.DIDs))         // NEW: Get user count
+		scanData.Metadata["user_count"] = userCount // Keep in JSON for completeness
 		if result.Description != nil {
 			scanData.Metadata["server_info"] = result.Description
 		}
@@ -159,8 +174,9 @@ func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *
 		EndpointID:   endpointID,
 		Status:       result.Status,
 		ResponseTime: result.ResponseTime.Seconds() * 1000, // Convert to ms
+		UserCount:    userCount,                            // NEW: Set the top-level field
 		ScanData:     scanData,
-		ScannedAt:    time.Now(),
+		ScannedAt:    time.Now().UTC(),
 	}
 
 	if err := s.db.SaveEndpointScan(ctx, scan); err != nil {
@@ -170,7 +186,7 @@ func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *
 	// Update endpoint status
 	update := &storage.EndpointUpdate{
 		Status:       result.Status,
-		LastChecked:  time.Now(),
+		LastChecked:  time.Now().UTC(),
 		ResponseTime: result.ResponseTime.Seconds() * 1000,
 	}
 

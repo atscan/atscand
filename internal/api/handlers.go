@@ -283,37 +283,7 @@ func formatPDSDetail(pds *storage.PDSDetail) map[string]interface{} {
 
 	// Add full IP info
 	if pds.IPInfo != nil {
-		ipInfoMap := make(map[string]interface{})
-
-		if pds.IP != "" {
-			ipInfoMap["ip"] = pds.IP
-		}
-		if pds.IPInfo.City != "" {
-			ipInfoMap["city"] = pds.IPInfo.City
-		}
-		if pds.IPInfo.Country != "" {
-			ipInfoMap["country"] = pds.IPInfo.Country
-		}
-		if pds.IPInfo.CountryCode != "" {
-			ipInfoMap["country_code"] = pds.IPInfo.CountryCode
-		}
-		if pds.IPInfo.ASN > 0 {
-			ipInfoMap["asn"] = pds.IPInfo.ASN
-		}
-		if pds.IPInfo.ASNOrg != "" {
-			ipInfoMap["asn_org"] = pds.IPInfo.ASNOrg
-		}
-		ipInfoMap["is_datacenter"] = pds.IPInfo.IsDatacenter
-		ipInfoMap["is_vpn"] = pds.IPInfo.IsVPN
-
-		if pds.IPInfo.Latitude != 0 || pds.IPInfo.Longitude != 0 {
-			ipInfoMap["latitude"] = pds.IPInfo.Latitude
-			ipInfoMap["longitude"] = pds.IPInfo.Longitude
-		}
-
-		if len(ipInfoMap) > 0 {
-			response["ip_info"] = ipInfoMap
-		}
+		response["ip_info"] = pds.IPInfo // This now includes raw_data
 	}
 
 	return response
@@ -332,16 +302,28 @@ func formatScans(scans []*storage.EndpointScan) []map[string]interface{} {
 			scanMap["response_time"] = scan.ResponseTime
 		}
 
+		// NEW: Use the top-level UserCount field first
+		if scan.UserCount > 0 {
+			scanMap["user_count"] = scan.UserCount
+		} else if scan.ScanData != nil && scan.ScanData.Metadata != nil {
+			// Fallback to metadata for older scans
+			if userCount, ok := scan.ScanData.Metadata["user_count"].(int); ok {
+				scanMap["user_count"] = userCount
+			} else if userCount, ok := scan.ScanData.Metadata["user_count"].(float64); ok {
+				scanMap["user_count"] = int(userCount)
+			}
+		}
+
 		if scan.ScanData != nil {
 			// Metadata is already map[string]interface{}, no type assertion needed
-			if scan.ScanData.Metadata != nil {
-				// Extract user_count from metadata
-				if userCount, ok := scan.ScanData.Metadata["user_count"].(int); ok {
-					scanMap["user_count"] = userCount
-				} else if userCount, ok := scan.ScanData.Metadata["user_count"].(float64); ok {
-					scanMap["user_count"] = int(userCount)
-				}
-			}
+			// if scan.ScanData.Metadata != nil {
+			// 	// Extract user_count from metadata
+			// 	if userCount, ok := scan.ScanData.Metadata["user_count"].(int); ok {
+			// 		scanMap["user_count"] = userCount
+			// 	} else if userCount, ok := scan.ScanData.Metadata["user_count"].(float64); ok {
+			// 		scanMap["user_count"] = int(userCount)
+			// 	}
+			// } -- OLD Block (replaced by above)
 
 			// Include DID count if available
 			if scan.ScanData.DIDCount > 0 {

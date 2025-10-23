@@ -530,7 +530,7 @@ func (s *Scanner) updateCursor(ctx context.Context, cursor *storage.ScanCursor, 
 	return s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
 		Source:           "plc_directory",
 		LastBundleNumber: m.currentBundle - 1,
-		LastScanTime:     time.Now(),
+		LastScanTime:     time.Now().UTC(),
 		RecordsProcessed: cursor.RecordsProcessed + m.totalProcessed,
 	})
 }
@@ -539,7 +539,7 @@ func (s *Scanner) updateCursorForBundle(ctx context.Context, bundle int, totalPr
 	return s.db.UpdateScanCursor(ctx, &storage.ScanCursor{
 		Source:           "plc_directory",
 		LastBundleNumber: bundle,
-		LastScanTime:     time.Now(),
+		LastScanTime:     time.Now().UTC(),
 		RecordsProcessed: totalProcessed,
 	})
 }
