@@ -42,6 +42,7 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 		return err
 	}
 
+	// 2. ADD THIS BLOCK TO SHUFFLE THE LIST
 	if len(servers) > 0 {
 		// Create a new random source to avoid using the global one
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -108,7 +109,7 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 	s.db.UpdateEndpointIP(ctx, ep.ID, ip, time.Now().UTC())
 
 	// STEP 2: Health check
-	available, responseTime, err := s.client.CheckHealth(ctx, ep.Endpoint)
+	available, responseTime, version, err := s.client.CheckHealth(ctx, ep.Endpoint) // CHANGED: receive version
 	if err != nil || !available {
 		errMsg := "health check failed"
 		if err != nil {
@@ -140,6 +141,7 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 		ResponseTime: responseTime,
 		Description:  desc,
 		DIDs:         dids,
+		Version:      version, // CHANGED: Pass version
 	})
 
 	// STEP 5: Fetch IP info if needed (async, with backoff)
@@ -174,7 +176,8 @@ func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *
 		EndpointID:   endpointID,
 		Status:       result.Status,
 		ResponseTime: result.ResponseTime.Seconds() * 1000, // Convert to ms
-		UserCount:    userCount,                            // NEW: Set the top-level field
+		UserCount:    userCount,
+		Version:      result.Version, // NEW: Set the version field
 		ScanData:     scanData,
 		ScannedAt:    time.Now().UTC(),
 	}

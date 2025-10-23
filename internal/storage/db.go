@@ -29,6 +29,7 @@ type Database interface {
 	GetEndpointScans(ctx context.Context, endpointID int64, limit int) ([]*EndpointScan, error)
 	UpdateEndpointIP(ctx context.Context, endpointID int64, ip string, resolvedAt time.Time) error
 	SaveEndpointScan(ctx context.Context, scan *EndpointScan) error
+	SetScanRetention(retention int)
 	UpdateEndpointStatus(ctx context.Context, endpointID int64, update *EndpointUpdate) error
 
 	// PDS virtual endpoints (created via JOINs)

@@ -43,6 +43,9 @@ func main() {
 	}
 	defer db.Close()
 
+	// Set scan retention from config
+	db.SetScanRetention(cfg.PDS.ScanRetention)
+
 	// Run migrations
 	if err := db.Migrate(); err != nil {
 		log.Fatal("Failed to run migrations: %v", err)

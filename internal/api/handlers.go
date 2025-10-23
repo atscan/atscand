@@ -243,6 +243,9 @@ func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
 	if pds.LatestScan != nil {
 		response["user_count"] = pds.LatestScan.UserCount
 		response["response_time"] = pds.LatestScan.ResponseTime
+		if pds.LatestScan.Version != "" { // NEW: Add this block
+			response["version"] = pds.LatestScan.Version
+		}
 		if !pds.LatestScan.ScannedAt.IsZero() {
 			response["last_scan"] = pds.LatestScan.ScannedAt
 		}
@@ -276,14 +279,28 @@ func formatPDSDetail(pds *storage.PDSDetail) map[string]interface{} {
 	// Start with list item formatting
 	response := formatPDSListItem(&pds.PDSListItem)
 
-	// Add server_info from latest scan
-	if pds.LatestScan != nil && pds.LatestScan.ServerInfo != nil {
-		response["server_info"] = pds.LatestScan.ServerInfo
+	// Add server_info and version from latest scan (PDSDetail's LatestScan takes precedence)
+	if pds.LatestScan != nil {
+		// Override with detail-specific scan data
+		response["user_count"] = pds.LatestScan.UserCount
+		response["response_time"] = pds.LatestScan.ResponseTime
+
+		if pds.LatestScan.Version != "" {
+			response["version"] = pds.LatestScan.Version
+		}
+
+		if !pds.LatestScan.ScannedAt.IsZero() {
+			response["last_scan"] = pds.LatestScan.ScannedAt
+		}
+
+		if pds.LatestScan.ServerInfo != nil {
+			response["server_info"] = pds.LatestScan.ServerInfo
+		}
 	}
 
 	// Add full IP info
 	if pds.IPInfo != nil {
-		response["ip_info"] = pds.IPInfo // This now includes raw_data
+		response["ip_info"] = pds.IPInfo
 	}
 
 	return response
@@ -302,7 +319,12 @@ func formatScans(scans []*storage.EndpointScan) []map[string]interface{} {
 			scanMap["response_time"] = scan.ResponseTime
 		}
 
-		// NEW: Use the top-level UserCount field first
+		// NEW: Add version if available
+		if scan.Version != "" {
+			scanMap["version"] = scan.Version
+		}
+
+		// Use the top-level UserCount field first
 		if scan.UserCount > 0 {
 			scanMap["user_count"] = scan.UserCount
 		} else if scan.ScanData != nil && scan.ScanData.Metadata != nil {
@@ -315,16 +337,6 @@ func formatScans(scans []*storage.EndpointScan) []map[string]interface{} {
 		}
 
 		if scan.ScanData != nil {
-			// Metadata is already map[string]interface{}, no type assertion needed
-			// if scan.ScanData.Metadata != nil {
-			// 	// Extract user_count from metadata
-			// 	if userCount, ok := scan.ScanData.Metadata["user_count"].(int); ok {
-			// 		scanMap["user_count"] = userCount
-			// 	} else if userCount, ok := scan.ScanData.Metadata["user_count"].(float64); ok {
-			// 		scanMap["user_count"] = int(userCount)
-			// 	}
-			// } -- OLD Block (replaced by above)
-
 			// Include DID count if available
 			if scan.ScanData.DIDCount > 0 {
 				scanMap["did_count"] = scan.ScanData.DIDCount

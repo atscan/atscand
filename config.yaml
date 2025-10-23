@@ -15,6 +15,7 @@ pds:
   timeout: "30s"
   workers: 20
   recheck_interval: "5m"
+  scan_retention: 3
 
 api:
   host: "0.0.0.0"

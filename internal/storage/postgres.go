@@ -14,8 +14,9 @@ import (
 )
 
 type PostgresDB struct {
-	db   *sql.DB
-	pool *pgxpool.Pool // Add this for COPY support
+	db            *sql.DB
+	pool          *pgxpool.Pool
+	scanRetention int
 }
 
 func NewPostgresDB(connString string) (*PostgresDB, error) {
@@ -42,7 +43,11 @@ func NewPostgresDB(connString string) (*PostgresDB, error) {
 		return nil, fmt.Errorf("failed to create pgx pool: %w", err)
 	}
 
-	return &PostgresDB{db: db, pool: pool}, nil
+	return &PostgresDB{
+		db:            db,
+		pool:          pool,
+		scanRetention: 3,
+	}, nil
 }
 
 func (p *PostgresDB) Close() error {
@@ -99,7 +104,8 @@ func (p *PostgresDB) Migrate() error {
 		endpoint_id BIGINT NOT NULL,
 		status INTEGER NOT NULL,
 		response_time DOUBLE PRECISION,
-		user_count BIGINT, -- NEW: Add user_count column
+		user_count BIGINT,
+		version TEXT,
 		scan_data JSONB,
 		scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (endpoint_id) REFERENCES endpoints(id) ON DELETE CASCADE
@@ -107,7 +113,7 @@ func (p *PostgresDB) Migrate() error {
 
 	CREATE INDEX IF NOT EXISTS idx_endpoint_scans_endpoint_status_scanned ON endpoint_scans(endpoint_id, status, scanned_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_endpoint_scans_scanned_at ON endpoint_scans(scanned_at);
-	CREATE INDEX IF NOT EXISTS idx_endpoint_scans_user_count ON endpoint_scans(user_count DESC NULLS LAST); -- NEW: Index for sorting
+	CREATE INDEX IF NOT EXISTS idx_endpoint_scans_user_count ON endpoint_scans(user_count DESC NULLS LAST);
 
 	CREATE TABLE IF NOT EXISTS plc_metrics (
         id BIGSERIAL PRIMARY KEY,
@@ -345,25 +351,56 @@ func (p *PostgresDB) UpdateEndpointIP(ctx context.Context, endpointID int64, ip 
 
 // ===== SCAN OPERATIONS =====
 
+func (p *PostgresDB) SetScanRetention(retention int) {
+	p.scanRetention = retention
+}
+
 func (p *PostgresDB) SaveEndpointScan(ctx context.Context, scan *EndpointScan) error {
 	var scanDataJSON []byte
 	if scan.ScanData != nil {
 		scanDataJSON, _ = json.Marshal(scan.ScanData)
 	}
 
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	query := `
-		INSERT INTO endpoint_scans (endpoint_id, status, response_time, user_count, scan_data, scanned_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO endpoint_scans (endpoint_id, status, response_time, user_count, version, scan_data, scanned_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`
-	_, err := p.db.ExecContext(ctx, query, scan.EndpointID, scan.Status, scan.ResponseTime, scan.UserCount, scanDataJSON, scan.ScannedAt)
-	return err
+	_, err = tx.ExecContext(ctx, query, scan.EndpointID, scan.Status, scan.ResponseTime, scan.UserCount, scan.Version, scanDataJSON, scan.ScannedAt)
+	if err != nil {
+		return err
+	}
+
+	// Use configured retention value
+	cleanupQuery := `
+		DELETE FROM endpoint_scans
+		WHERE endpoint_id = $1
+		AND id NOT IN (
+			SELECT id
+			FROM endpoint_scans
+			WHERE endpoint_id = $1
+			ORDER BY scanned_at DESC
+			LIMIT $2
+		)
+	`
+	_, err = tx.ExecContext(ctx, cleanupQuery, scan.EndpointID, p.scanRetention)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (p *PostgresDB) GetEndpointScans(ctx context.Context, endpointID int64, limit int) ([]*EndpointScan, error) {
 	query := `
-		SELECT id, endpoint_id, status, response_time, user_count, scan_data, scanned_at
-		FROM endpoint_scans
-		WHERE endpoint_id = $1
+        SELECT id, endpoint_id, status, response_time, user_count, version, scan_data, scanned_at
+        FROM endpoint_scans
+        WHERE endpoint_id = $1
         ORDER BY scanned_at DESC
         LIMIT $2
     `
@@ -378,10 +415,11 @@ func (p *PostgresDB) GetEndpointScans(ctx context.Context, endpointID int64, lim
 	for rows.Next() {
 		var scan EndpointScan
 		var responseTime sql.NullFloat64
-		var userCount sql.NullInt64 // NEW: Use NullInt64
+		var userCount sql.NullInt64
+		var version sql.NullString // NEW
 		var scanDataJSON []byte
 
-		err := rows.Scan(&scan.ID, &scan.EndpointID, &scan.Status, &responseTime, &userCount, &scanDataJSON, &scan.ScannedAt)
+		err := rows.Scan(&scan.ID, &scan.EndpointID, &scan.Status, &responseTime, &userCount, &version, &scanDataJSON, &scan.ScannedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -390,8 +428,12 @@ func (p *PostgresDB) GetEndpointScans(ctx context.Context, endpointID int64, lim
 			scan.ResponseTime = responseTime.Float64
 		}
 
-		if userCount.Valid { // NEW: Check validity and set
+		if userCount.Valid {
 			scan.UserCount = userCount.Int64
+		}
+
+		if version.Valid { // NEW
+			scan.Version = version.String
 		}
 
 		if len(scanDataJSON) > 0 {
@@ -411,18 +453,18 @@ func (p *PostgresDB) GetEndpointScans(ctx context.Context, endpointID int64, lim
 
 func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]*PDSListItem, error) {
 	query := `
-		SELECT 
-			e.id, e.endpoint, e.discovered_at, e.last_checked, e.status, e.ip,
-			latest.user_count, latest.response_time, latest.scanned_at,
-			i.city, i.country, i.country_code, i.asn, i.asn_org,
+        SELECT 
+            e.id, e.endpoint, e.discovered_at, e.last_checked, e.status, e.ip,
+            latest.user_count, latest.response_time, latest.version, latest.scanned_at,
+            i.city, i.country, i.country_code, i.asn, i.asn_org,
             i.is_datacenter, i.is_vpn, i.latitude, i.longitude
         FROM endpoints e
-		LEFT JOIN LATERAL (
-			SELECT 
-				-- COALESCE((scan_data->'metadata'->>'user_count')::int, 0) as user_count, -- OLD
-				user_count, -- NEW: Use the column directly
-				response_time,
-				scanned_at
+        LEFT JOIN LATERAL (
+            SELECT 
+                user_count,
+                response_time,
+                version,
+                scanned_at
             FROM endpoint_scans
             WHERE endpoint_id = e.id AND status = 1
             ORDER BY scanned_at DESC
@@ -478,11 +520,12 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 		var lat, lon sql.NullFloat64
 		var userCount sql.NullInt32
 		var responseTime sql.NullFloat64
+		var version sql.NullString // ADD THIS LINE
 		var scannedAt sql.NullTime
 
 		err := rows.Scan(
 			&item.ID, &item.Endpoint, &item.DiscoveredAt, &item.LastChecked, &item.Status, &ip,
-			&userCount, &responseTime, &scannedAt,
+			&userCount, &responseTime, &version, &scannedAt, // ADD &version HERE
 			&city, &country, &countryCode, &asn, &asnOrg,
 			&isDatacenter, &isVPN, &lat, &lon,
 		)
@@ -499,10 +542,12 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 			item.LatestScan = &struct {
 				UserCount    int
 				ResponseTime float64
+				Version      string
 				ScannedAt    time.Time
 			}{
 				UserCount:    int(userCount.Int32),
 				ResponseTime: responseTime.Float64,
+				Version:      version.String,
 				ScannedAt:    scannedAt.Time,
 			}
 		}
@@ -531,20 +576,21 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 
 func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDetail, error) {
 	query := `
-		SELECT 
-			e.id, e.endpoint, e.discovered_at, e.last_checked, e.status, e.ip,
-			latest.user_count,
-			latest.response_time,
-			latest.scan_data->'metadata'->'server_info' as server_info,
-			latest.scanned_at,
-			i.city, i.country, i.country_code, i.asn, i.asn_org,
-			i.is_datacenter, i.is_vpn, i.latitude, i.longitude,
-			i.raw_data -- NEW: Select the raw_data column
-		FROM endpoints e
-		LEFT JOIN LATERAL (
-			SELECT scan_data, response_time, scanned_at, user_count -- NEW: Select user_count
-			FROM endpoint_scans
-			WHERE endpoint_id = e.id
+        SELECT 
+            e.id, e.endpoint, e.discovered_at, e.last_checked, e.status, e.ip,
+            latest.user_count,
+            latest.response_time,
+            latest.version,  -- ADD THIS LINE
+            latest.scan_data->'metadata'->'server_info' as server_info,
+            latest.scanned_at,
+            i.city, i.country, i.country_code, i.asn, i.asn_org,
+            i.is_datacenter, i.is_vpn, i.latitude, i.longitude,
+            i.raw_data
+        FROM endpoints e
+        LEFT JOIN LATERAL (
+            SELECT scan_data, response_time, version, scanned_at, user_count  -- ADD version HERE
+            FROM endpoint_scans
+            WHERE endpoint_id = e.id
             ORDER BY scanned_at DESC
             LIMIT 1
         ) latest ON true
@@ -559,16 +605,17 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 	var lat, lon sql.NullFloat64
 	var userCount sql.NullInt32
 	var responseTime sql.NullFloat64
+	var version sql.NullString // ADD THIS LINE
 	var serverInfoJSON []byte
 	var scannedAt sql.NullTime
-	var rawDataJSON []byte // NEW: Add a variable for raw_data
+	var rawDataJSON []byte
 
 	err := p.db.QueryRowContext(ctx, query, endpoint).Scan(
 		&detail.ID, &detail.Endpoint, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip,
-		&userCount, &responseTime, &serverInfoJSON, &scannedAt,
+		&userCount, &responseTime, &version, &serverInfoJSON, &scannedAt, // ADD &version HERE
 		&city, &country, &countryCode, &asn, &asnOrg,
 		&isDatacenter, &isVPN, &lat, &lon,
-		&rawDataJSON, // NEW: Scan into the variable
+		&rawDataJSON,
 	)
 	if err != nil {
 		return nil, err
@@ -588,11 +635,13 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 		detail.LatestScan = &struct {
 			UserCount    int
 			ResponseTime float64
+			Version      string // ADD THIS LINE
 			ServerInfo   interface{}
 			ScannedAt    time.Time
 		}{
 			UserCount:    int(userCount.Int32),
 			ResponseTime: responseTime.Float64,
+			Version:      version.String, // ADD THIS LINE
 			ServerInfo:   serverInfo,
 			ScannedAt:    scannedAt.Time,
 		}
@@ -632,8 +681,7 @@ func (p *PostgresDB) GetPDSStats(ctx context.Context) (*PDSStats, error) {
 		WITH latest_scans AS (
 			SELECT DISTINCT ON (endpoint_id)
 				endpoint_id,
-				-- COALESCE((scan_data->'metadata'->>'user_count')::int, 0) as user_count, -- OLD
-				user_count, -- NEW: Use the column directly
+				user_count,
 				status
 			FROM endpoint_scans
 			WHERE endpoint_id IN (SELECT id FROM endpoints WHERE endpoint_type = 'pds')
@@ -705,8 +753,7 @@ func (p *PostgresDB) GetEndpointStats(ctx context.Context) (*EndpointStats, erro
 		WITH latest_pds_scans AS (
 			SELECT DISTINCT ON (endpoint_id)
 				endpoint_id,
-				-- COALESCE((scan_data->'metadata'->>'user_count')::int, 0) as user_count -- OLD
-				user_count -- NEW: Use the column directly
+				user_count
 			FROM endpoint_scans
 			WHERE endpoint_id IN (SELECT id FROM endpoints WHERE endpoint_type = 'pds')
 			ORDER BY endpoint_id, scanned_at DESC

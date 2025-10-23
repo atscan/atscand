@@ -16,7 +16,7 @@ type Config struct {
 
 type DatabaseConfig struct {
 	Path string `yaml:"path"`
-	Type string `yaml:"type"` // sqlite, postgres
+	Type string `yaml:"type"` // postgres
 }
 
 type PLCConfig struct {
@@ -33,6 +33,7 @@ type PDSConfig struct {
 	Timeout         time.Duration `yaml:"timeout"`
 	Workers         int           `yaml:"workers"`
 	RecheckInterval time.Duration `yaml:"recheck_interval"`
+	ScanRetention   int           `yaml:"scan_retention"`
 }
 
 type APIConfig struct {
@@ -73,6 +74,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.PDS.Workers == 0 {
 		cfg.PDS.Workers = 10
+	}
+	if cfg.PDS.ScanRetention == 0 {
+		cfg.PDS.ScanRetention = 3
 	}
 	if cfg.API.Port == 0 {
 		cfg.API.Port = 8080

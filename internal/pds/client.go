@@ -111,23 +111,41 @@ func (c *Client) DescribeServer(ctx context.Context, endpoint string) (*ServerDe
 	return &desc, nil
 }
 
-// CheckHealth performs a basic health check
-func (c *Client) CheckHealth(ctx context.Context, endpoint string) (bool, time.Duration, error) {
+// CheckHealth performs a basic health check, ensuring the endpoint returns JSON with a "version"
+func (c *Client) CheckHealth(ctx context.Context, endpoint string) (bool, time.Duration, string, error) {
 	startTime := time.Now()
 
 	url := fmt.Sprintf("%s/xrpc/_health", endpoint)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return false, 0, err
+		return false, 0, "", err
 	}
 
 	resp, err := c.httpClient.Do(req)
 	duration := time.Since(startTime)
 
 	if err != nil {
-		return false, duration, err
+		return false, duration, "", err
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode == http.StatusOK, duration, nil
+	if resp.StatusCode != http.StatusOK {
+		return false, duration, "", fmt.Errorf("health check returned status %d", resp.StatusCode)
+	}
+
+	// Decode the JSON response and check for "version"
+	var healthResponse struct {
+		Version string `json:"version"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&healthResponse); err != nil {
+		return false, duration, "", fmt.Errorf("failed to decode health JSON: %w", err)
+	}
+
+	if healthResponse.Version == "" {
+		return false, duration, "", fmt.Errorf("health JSON response missing 'version' field")
+	}
+
+	// All checks passed
+	return true, duration, healthResponse.Version, nil
 }

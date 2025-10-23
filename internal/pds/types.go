@@ -37,4 +37,5 @@ type ScanResult struct {
 	ErrorMessage string
 	Description  *ServerDescription
 	DIDs         []string
+	Version      string // NEW: Add this field to pass the version
 }

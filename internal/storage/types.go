@@ -51,6 +51,7 @@ type EndpointScan struct {
 	Status       int
 	ResponseTime float64
 	UserCount    int64
+	Version      string // NEW: Add this field
 	ScanData     *EndpointScanData
 	ScannedAt    time.Time
 }
@@ -191,6 +192,7 @@ type PDSListItem struct {
 	LatestScan *struct {
 		UserCount    int
 		ResponseTime float64
+		Version      string // NEW: Add this
 		ScannedAt    time.Time
 	}
 
@@ -206,6 +208,7 @@ type PDSDetail struct {
 	LatestScan *struct {
 		UserCount    int
 		ResponseTime float64
+		Version      string      // ADD THIS LINE
 		ServerInfo   interface{} // Full server description
 		ScannedAt    time.Time
 	}
