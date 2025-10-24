@@ -864,6 +864,9 @@ func (p *PostgresDB) GetEndpointStats(ctx context.Context) (*EndpointStats, erro
 	err := p.db.QueryRowContext(ctx, query).Scan(
 		&stats.TotalEndpoints, &stats.OnlineEndpoints, &stats.OfflineEndpoints,
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	// Get average response time from recent scans
 	avgQuery := `
@@ -872,7 +875,7 @@ func (p *PostgresDB) GetEndpointStats(ctx context.Context) (*EndpointStats, erro
         WHERE response_time > 0 AND scanned_at > NOW() - INTERVAL '1 hour'
     `
 	var avgResponseTime sql.NullFloat64
-	p.db.QueryRowContext(ctx, avgQuery).Scan(&avgResponseTime)
+	_ = p.db.QueryRowContext(ctx, avgQuery).Scan(&avgResponseTime)
 	if avgResponseTime.Valid {
 		stats.AvgResponseTime = avgResponseTime.Float64
 	}
@@ -898,18 +901,25 @@ func (p *PostgresDB) GetEndpointStats(ctx context.Context) (*EndpointStats, erro
 
 	// Get total DIDs from latest PDS scans
 	didQuery := `
-		WITH latest_pds_scans AS (
-			SELECT DISTINCT ON (endpoint_id)
-				endpoint_id,
-				user_count
-			FROM endpoint_scans
-			WHERE endpoint_id IN (SELECT id FROM endpoints WHERE endpoint_type = 'pds')
-			ORDER BY endpoint_id, scanned_at DESC
+		WITH unique_servers AS (
+			SELECT DISTINCT ON (COALESCE(e.server_did, e.id::text))
+				e.id
+			FROM endpoints e
+			WHERE e.endpoint_type = 'pds'
+			ORDER BY COALESCE(e.server_did, e.id::text), e.discovered_at ASC
+		),
+		latest_pds_scans AS (
+			SELECT DISTINCT ON (us.id)
+				us.id,
+				es.user_count
+			FROM unique_servers us
+			LEFT JOIN endpoint_scans es ON us.id = es.endpoint_id
+			ORDER BY us.id, es.scanned_at DESC
         )
         SELECT SUM(user_count) FROM latest_pds_scans
     `
 	var totalDIDs sql.NullInt64
-	p.db.QueryRowContext(ctx, didQuery).Scan(&totalDIDs)
+	_ = p.db.QueryRowContext(ctx, didQuery).Scan(&totalDIDs)
 	if totalDIDs.Valid {
 		stats.TotalDIDs = totalDIDs.Int64
 	}
@@ -1695,9 +1705,9 @@ func (p *PostgresDB) GetCountryLeaderboard(ctx context.Context) ([]*CountryStats
 			pbc.country,
 			pbc.country_code,
 			pbc.active_pds_count,
-			ROUND((pbc.active_pds_count * 100.0 / NULLIF(t.total_pds, 0))::numeric, 4) as pds_percentage,
+			ROUND((pbc.active_pds_count * 100.0 / NULLIF(t.total_pds, 0))::numeric, 2) as pds_percentage,
 			COALESCE(pbc.total_users, 0) as total_users,
-			ROUND((COALESCE(pbc.total_users, 0) * 100.0 / NULLIF(t.total_users_global, 0))::numeric, 4) as users_percentage,
+			ROUND((COALESCE(pbc.total_users, 0) * 100.0 / NULLIF(t.total_users_global, 0))::numeric, 2) as users_percentage,
 			ROUND(COALESCE(pbc.avg_response_time, 0)::numeric, 2) as avg_response_time_ms
 		FROM pds_by_country pbc
 		CROSS JOIN totals t
