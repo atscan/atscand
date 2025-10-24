@@ -93,6 +93,7 @@ func (p *PostgresDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
     CREATE INDEX IF NOT EXISTS idx_endpoints_ip ON endpoints(ip);
     CREATE INDEX IF NOT EXISTS idx_endpoints_server_did ON endpoints(server_did);
+	CREATE INDEX IF NOT EXISTS idx_endpoints_server_did_type_discovered ON endpoints(server_did, endpoint_type, discovered_at);
 
     -- IP infos table (IP as PRIMARY KEY)
     CREATE TABLE IF NOT EXISTS ip_infos (
@@ -670,8 +671,37 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 
 func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDetail, error) {
 	query := `
+		WITH target_endpoint AS (
+			SELECT 
+				e.id, 
+				e.endpoint, 
+				e.server_did, 
+				e.discovered_at, 
+				e.last_checked, 
+				e.status, 
+				e.ip
+			FROM endpoints e
+			WHERE e.endpoint = $1 AND e.endpoint_type = 'pds'
+		),
+		aliases_agg AS (
+			SELECT 
+				te.server_did,
+				array_agg(e.endpoint ORDER BY e.discovered_at) FILTER (WHERE e.endpoint != te.endpoint) as aliases,
+				MIN(e.discovered_at) as first_discovered_at
+			FROM target_endpoint te
+			LEFT JOIN endpoints e ON te.server_did = e.server_did 
+				AND e.endpoint_type = 'pds'
+				AND te.server_did IS NOT NULL
+			GROUP BY te.server_did
+		)
 		SELECT 
-			e.id, e.endpoint, e.server_did, e.discovered_at, e.last_checked, e.status, e.ip,
+			te.id, 
+			te.endpoint, 
+			te.server_did, 
+			te.discovered_at, 
+			te.last_checked, 
+			te.status, 
+			te.ip,
 			latest.user_count,
 			latest.response_time,
 			latest.version,
@@ -679,17 +709,19 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 			latest.scanned_at,
 			i.city, i.country, i.country_code, i.asn, i.asn_org,
 			i.is_datacenter, i.is_vpn, i.latitude, i.longitude,
-			i.raw_data
-		FROM endpoints e
+			i.raw_data,
+			COALESCE(aa.aliases, ARRAY[]::text[]) as aliases,
+			aa.first_discovered_at
+		FROM target_endpoint te
+		LEFT JOIN aliases_agg aa ON te.server_did = aa.server_did
 		LEFT JOIN LATERAL (
 			SELECT scan_data, response_time, version, scanned_at, user_count
 			FROM endpoint_scans
-			WHERE endpoint_id = e.id
+			WHERE endpoint_id = te.id
 			ORDER BY scanned_at DESC
 			LIMIT 1
 		) latest ON true
-		LEFT JOIN ip_infos i ON e.ip = i.ip
-		WHERE e.endpoint = $1 AND e.endpoint_type = 'pds'
+		LEFT JOIN ip_infos i ON te.ip = i.ip
 	`
 
 	detail := &PDSDetail{}
@@ -703,6 +735,8 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 	var serverInfoJSON []byte
 	var scannedAt sql.NullTime
 	var rawDataJSON []byte
+	var aliases []string
+	var firstDiscoveredAt sql.NullTime
 
 	err := p.db.QueryRowContext(ctx, query, endpoint).Scan(
 		&detail.ID, &detail.Endpoint, &serverDID, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip,
@@ -710,6 +744,8 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 		&city, &country, &countryCode, &asn, &asnOrg,
 		&isDatacenter, &isVPN, &lat, &lon,
 		&rawDataJSON,
+		pq.Array(&aliases),
+		&firstDiscoveredAt,
 	)
 	if err != nil {
 		return nil, err
@@ -719,41 +755,18 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 		detail.IP = ip.String
 	}
 
-	// NEW: Get aliases if this endpoint has a server_did
-	if serverDID.Valid && serverDID.String != "" {
-		aliasQuery := `
-			SELECT endpoint, discovered_at
-			FROM endpoints
-			WHERE server_did = $1
-			  AND endpoint_type = 'pds'
-			  AND endpoint != $2
-			ORDER BY discovered_at ASC
-		`
+	if serverDID.Valid {
+		detail.ServerDID = serverDID.String
+	}
 
-		rows, err := p.db.QueryContext(ctx, aliasQuery, serverDID.String, endpoint)
-		if err == nil {
-			defer rows.Close()
-
-			var aliases []string
-			var primaryDiscoveredAt time.Time
-
-			for rows.Next() {
-				var alias string
-				var discoveredAt time.Time
-				if err := rows.Scan(&alias, &discoveredAt); err == nil {
-					aliases = append(aliases, alias)
-					if primaryDiscoveredAt.IsZero() || discoveredAt.Before(detail.DiscoveredAt) {
-						primaryDiscoveredAt = discoveredAt
-					}
-				}
-			}
-
-			detail.Aliases = aliases
-			detail.IsPrimary = detail.DiscoveredAt.Equal(primaryDiscoveredAt) ||
-				detail.DiscoveredAt.Before(primaryDiscoveredAt)
-		}
+	// Set aliases and is_primary
+	detail.Aliases = aliases
+	if serverDID.Valid && serverDID.String != "" && firstDiscoveredAt.Valid {
+		// Has server_did - check if this is the first discovered
+		detail.IsPrimary = detail.DiscoveredAt.Equal(firstDiscoveredAt.Time) ||
+			detail.DiscoveredAt.Before(firstDiscoveredAt.Time)
 	} else {
-		// No server_did means it's a unique server
+		// No server_did means unique server
 		detail.IsPrimary = true
 	}
 

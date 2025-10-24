@@ -276,6 +276,9 @@ func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
 		if pds.IPInfo.ASN > 0 {
 			response["asn"] = pds.IPInfo.ASN
 		}
+		if pds.IPInfo.IsDatacenter {
+			response["is_datacenter"] = pds.IPInfo.IsDatacenter
+		}
 	}
 
 	return response
