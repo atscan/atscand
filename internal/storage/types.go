@@ -215,3 +215,24 @@ type PDSDetail struct {
 		ScannedAt    time.Time
 	}
 }
+
+type CountryStats struct {
+	Country           string  `json:"country"`
+	CountryCode       string  `json:"country_code"`
+	ActivePDSCount    int64   `json:"active_pds_count"`
+	PDSPercentage     float64 `json:"pds_percentage"`
+	TotalUsers        int64   `json:"total_users"`
+	UsersPercentage   float64 `json:"users_percentage"`
+	AvgResponseTimeMS float64 `json:"avg_response_time_ms"`
+}
+
+type VersionStats struct {
+	Version         string    `json:"version"`
+	PDSCount        int64     `json:"pds_count"`
+	Percentage      float64   `json:"percentage"`
+	PercentageText  string    `json:"percentage_text"`
+	TotalUsers      int64     `json:"total_users"`
+	UsersPercentage float64   `json:"users_percentage"`
+	FirstSeen       time.Time `json:"first_seen"`
+	LastSeen        time.Time `json:"last_seen"`
+}

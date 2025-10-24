@@ -1260,6 +1260,47 @@ func (s *Server) collectOperations(ctx context.Context, startBundle int, afterTi
 	return allOps
 }
 
+func (s *Server) handleGetCountryLeaderboard(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	stats, err := s.db.GetCountryLeaderboard(r.Context())
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp.json(stats)
+}
+
+func (s *Server) handleGetVersionStats(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	stats, err := s.db.GetVersionStats(r.Context())
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Add summary totals
+	var totalPDS int64
+	var totalUsers int64
+	for _, stat := range stats {
+		totalPDS += stat.PDSCount
+		totalUsers += stat.TotalUsers
+	}
+
+	result := map[string]interface{}{
+		"versions": stats,
+		"summary": map[string]interface{}{
+			"total_pds_with_version": totalPDS,
+			"total_users":            totalUsers,
+			"version_count":          len(stats),
+		},
+	}
+
+	resp.json(result)
+}
+
 // ===== HEALTH HANDLER =====
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

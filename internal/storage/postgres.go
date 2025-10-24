@@ -1531,3 +1531,180 @@ func (p *PostgresDB) GetTotalDIDCount(ctx context.Context) (int64, error) {
 	err := p.db.QueryRowContext(ctx, query).Scan(&count)
 	return count, err
 }
+
+func (p *PostgresDB) GetCountryLeaderboard(ctx context.Context) ([]*CountryStats, error) {
+	query := `
+		WITH pds_by_country AS (
+			SELECT 
+				i.country,
+				i.country_code,
+				COUNT(DISTINCT e.id) as active_pds_count,
+				SUM(latest.user_count) as total_users,
+				AVG(latest.response_time) as avg_response_time
+			FROM endpoints e
+			JOIN ip_infos i ON e.ip = i.ip
+			LEFT JOIN LATERAL (
+				SELECT user_count, response_time
+				FROM endpoint_scans
+				WHERE endpoint_id = e.id
+				ORDER BY scanned_at DESC
+				LIMIT 1
+			) latest ON true
+			WHERE e.endpoint_type = 'pds'
+			AND e.status = 1
+			AND i.country IS NOT NULL
+			AND i.country != ''
+			GROUP BY i.country, i.country_code
+		),
+		totals AS (
+			SELECT 
+				SUM(active_pds_count) as total_pds,
+				SUM(total_users) as total_users_global
+			FROM pds_by_country
+		)
+		SELECT 
+			pbc.country,
+			pbc.country_code,
+			pbc.active_pds_count,
+			ROUND((pbc.active_pds_count * 100.0 / NULLIF(t.total_pds, 0))::numeric, 2) as pds_percentage,
+			COALESCE(pbc.total_users, 0) as total_users,
+			ROUND((COALESCE(pbc.total_users, 0) * 100.0 / NULLIF(t.total_users_global, 0))::numeric, 2) as users_percentage,
+			ROUND(COALESCE(pbc.avg_response_time, 0)::numeric, 2) as avg_response_time_ms
+		FROM pds_by_country pbc
+		CROSS JOIN totals t
+		ORDER BY pbc.active_pds_count DESC;
+	`
+
+	rows, err := p.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var stats []*CountryStats
+	for rows.Next() {
+		var s CountryStats
+		var pdsPercentage, usersPercentage sql.NullFloat64
+
+		err := rows.Scan(
+			&s.Country,
+			&s.CountryCode,
+			&s.ActivePDSCount,
+			&pdsPercentage,
+			&s.TotalUsers,
+			&usersPercentage,
+			&s.AvgResponseTimeMS,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if pdsPercentage.Valid {
+			s.PDSPercentage = pdsPercentage.Float64
+		}
+		if usersPercentage.Valid {
+			s.UsersPercentage = usersPercentage.Float64
+		}
+
+		stats = append(stats, &s)
+	}
+
+	return stats, rows.Err()
+}
+
+func (p *PostgresDB) GetVersionStats(ctx context.Context) ([]*VersionStats, error) {
+	query := `
+		WITH latest_scans AS (
+			SELECT DISTINCT ON (e.id)
+				e.id,
+				es.version,
+				es.user_count,
+				es.scanned_at
+			FROM endpoints e
+			JOIN endpoint_scans es ON e.id = es.endpoint_id
+			WHERE e.endpoint_type = 'pds'
+			  AND e.status = 1
+			  AND es.version IS NOT NULL
+			  AND es.version != ''
+			ORDER BY e.id, es.scanned_at DESC
+		),
+		version_groups AS (
+			SELECT 
+				version,
+				COUNT(*) as pds_count,
+				SUM(user_count) as total_users,
+				MIN(scanned_at) as first_seen,
+				MAX(scanned_at) as last_seen
+			FROM latest_scans
+			GROUP BY version
+		),
+		totals AS (
+			SELECT 
+				SUM(pds_count) as total_pds,
+				SUM(total_users) as total_users_global
+			FROM version_groups
+		)
+		SELECT 
+			vg.version,
+			vg.pds_count,
+			(vg.pds_count * 100.0 / NULLIF(t.total_pds, 0))::numeric as percentage,
+			COALESCE(vg.total_users, 0) as total_users,
+			(COALESCE(vg.total_users, 0) * 100.0 / NULLIF(t.total_users_global, 0))::numeric as users_percentage,
+			vg.first_seen,
+			vg.last_seen
+		FROM version_groups vg
+		CROSS JOIN totals t
+		ORDER BY vg.pds_count DESC
+	`
+
+	rows, err := p.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var stats []*VersionStats
+	for rows.Next() {
+		var s VersionStats
+		var percentage, usersPercentage sql.NullFloat64
+
+		err := rows.Scan(
+			&s.Version,
+			&s.PDSCount,
+			&percentage,
+			&s.TotalUsers,
+			&usersPercentage,
+			&s.FirstSeen,
+			&s.LastSeen,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if percentage.Valid {
+			s.Percentage = percentage.Float64
+			s.PercentageText = formatPercentage(percentage.Float64)
+		}
+		if usersPercentage.Valid {
+			s.UsersPercentage = usersPercentage.Float64
+		}
+
+		stats = append(stats, &s)
+	}
+
+	return stats, rows.Err()
+}
+
+// Helper function (add if not already present)
+func formatPercentage(pct float64) string {
+	if pct >= 10 {
+		return fmt.Sprintf("%.2f%%", pct)
+	} else if pct >= 1 {
+		return fmt.Sprintf("%.3f%%", pct)
+	} else if pct >= 0.01 {
+		return fmt.Sprintf("%.4f%%", pct)
+	} else if pct > 0 {
+		return fmt.Sprintf("%.6f%%", pct)
+	}
+	return "0%"
+}

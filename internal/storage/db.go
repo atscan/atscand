@@ -75,4 +75,7 @@ type Database interface {
 	GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error)
 	AddBundleDIDs(ctx context.Context, bundleNum int, dids []string) error
 	GetTotalDIDCount(ctx context.Context) (int64, error)
+
+	GetCountryLeaderboard(ctx context.Context) ([]*CountryStats, error)
+	GetVersionStats(ctx context.Context) ([]*VersionStats, error)
 }
