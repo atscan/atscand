@@ -235,6 +235,11 @@ func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
 		"status":        statusToString(pds.Status),
 	}
 
+	// Add server_did if available
+	if pds.ServerDID != "" {
+		response["server_did"] = pds.ServerDID
+	}
+
 	// Add last_checked if available
 	if !pds.LastChecked.IsZero() {
 		response["last_checked"] = pds.LastChecked
@@ -244,7 +249,7 @@ func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
 	if pds.LatestScan != nil {
 		response["user_count"] = pds.LatestScan.UserCount
 		response["response_time"] = pds.LatestScan.ResponseTime
-		if pds.LatestScan.Version != "" { // NEW: Add this block
+		if pds.LatestScan.Version != "" {
 			response["version"] = pds.LatestScan.Version
 		}
 		if !pds.LatestScan.ScannedAt.IsZero() {
@@ -271,17 +276,23 @@ func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
 		if pds.IPInfo.ASN > 0 {
 			response["asn"] = pds.IPInfo.ASN
 		}
-		if pds.IPInfo.IsDatacenter {
-			response["is_datacenter"] = pds.IPInfo.IsDatacenter
-		}
 	}
 
 	return response
 }
 
 func formatPDSDetail(pds *storage.PDSDetail) map[string]interface{} {
-	// Start with list item formatting
+	// Start with list item formatting (includes server_did)
 	response := formatPDSListItem(&pds.PDSListItem)
+
+	// Add is_primary flag
+	response["is_primary"] = pds.IsPrimary
+
+	// Add aliases if available
+	if len(pds.Aliases) > 0 {
+		response["aliases"] = pds.Aliases
+		response["alias_count"] = len(pds.Aliases)
+	}
 
 	// Add server_info and version from latest scan (PDSDetail's LatestScan takes precedence)
 	if pds.LatestScan != nil {
@@ -1355,6 +1366,33 @@ func (s *Server) handleGetJobStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp.json(result)
+}
+
+func (s *Server) handleGetDuplicateEndpoints(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	duplicates, err := s.db.GetDuplicateEndpoints(r.Context())
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Format response
+	result := make([]map[string]interface{}, 0)
+	for serverDID, endpoints := range duplicates {
+		result = append(result, map[string]interface{}{
+			"server_did":    serverDID,
+			"primary":       endpoints[0],  // First discovered
+			"aliases":       endpoints[1:], // Other domains
+			"alias_count":   len(endpoints) - 1,
+			"total_domains": len(endpoints),
+		})
+	}
+
+	resp.json(map[string]interface{}{
+		"duplicates":              result,
+		"total_duplicate_servers": len(duplicates),
+	})
 }
 
 // ===== UTILITY FUNCTIONS =====

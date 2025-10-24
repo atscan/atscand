@@ -20,6 +20,7 @@ type Endpoint struct {
 	ID           int64
 	EndpointType string
 	Endpoint     string
+	ServerDID    string
 	DiscoveredAt time.Time
 	LastChecked  time.Time
 	Status       int
@@ -185,6 +186,7 @@ type PDSListItem struct {
 	// From endpoints table
 	ID           int64
 	Endpoint     string
+	ServerDID    string // NEW: Add this
 	DiscoveredAt time.Time
 	LastChecked  time.Time
 	Status       int
@@ -194,7 +196,7 @@ type PDSListItem struct {
 	LatestScan *struct {
 		UserCount    int
 		ResponseTime float64
-		Version      string // NEW: Add this
+		Version      string
 		ScannedAt    time.Time
 	}
 
@@ -210,10 +212,14 @@ type PDSDetail struct {
 	LatestScan *struct {
 		UserCount    int
 		ResponseTime float64
-		Version      string      // ADD THIS LINE
+		Version      string
 		ServerInfo   interface{} // Full server description
 		ScannedAt    time.Time
 	}
+
+	// NEW: Aliases (other domains pointing to same server)
+	Aliases   []string `json:"aliases,omitempty"`
+	IsPrimary bool     `json:"is_primary"`
 }
 
 type CountryStats struct {

@@ -65,6 +65,7 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/pds/stats", s.handleGetPDSStats).Methods("GET")
 	api.HandleFunc("/pds/countries", s.handleGetCountryLeaderboard).Methods("GET")
 	api.HandleFunc("/pds/versions", s.handleGetVersionStats).Methods("GET")
+	api.HandleFunc("/pds/duplicates", s.handleGetDuplicateEndpoints).Methods("GET")
 	api.HandleFunc("/pds/{endpoint}", s.handleGetPDSDetail).Methods("GET")
 
 	// PLC Bundle routes

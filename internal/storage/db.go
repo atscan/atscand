@@ -31,6 +31,8 @@ type Database interface {
 	SaveEndpointScan(ctx context.Context, scan *EndpointScan) error
 	SetScanRetention(retention int)
 	UpdateEndpointStatus(ctx context.Context, endpointID int64, update *EndpointUpdate) error
+	UpdateEndpointServerDID(ctx context.Context, endpointID int64, serverDID string) error
+	GetDuplicateEndpoints(ctx context.Context) (map[string][]string, error)
 
 	// PDS virtual endpoints (created via JOINs)
 	GetPDSList(ctx context.Context, filter *EndpointFilter) ([]*PDSListItem, error)

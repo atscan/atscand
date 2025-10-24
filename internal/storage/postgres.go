@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/lib/pq"
 )
 
 type PostgresDB struct {
@@ -77,6 +78,7 @@ func (p *PostgresDB) Migrate() error {
         id BIGSERIAL PRIMARY KEY,
         endpoint_type TEXT NOT NULL DEFAULT 'pds',
         endpoint TEXT NOT NULL,
+        server_did TEXT,
         discovered_at TIMESTAMP NOT NULL,
         last_checked TIMESTAMP,
         status INTEGER DEFAULT 0,
@@ -90,6 +92,7 @@ func (p *PostgresDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_endpoints_status ON endpoints(status);
     CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
     CREATE INDEX IF NOT EXISTS idx_endpoints_ip ON endpoints(ip);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_server_did ON endpoints(server_did);
 
     -- IP infos table (IP as PRIMARY KEY)
     CREATE TABLE IF NOT EXISTS ip_infos (
@@ -276,11 +279,12 @@ func (p *PostgresDB) GetEndpoint(ctx context.Context, endpoint string, endpointT
 
 func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) ([]*Endpoint, error) {
 	query := `
-        SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, 
-               ip, ip_resolved_at, updated_at
-        FROM endpoints
-        WHERE 1=1
-    `
+		SELECT DISTINCT ON (COALESCE(server_did, id::text))
+			id, endpoint_type, endpoint, server_did, discovered_at, last_checked, status, 
+			ip, ip_resolved_at, updated_at
+		FROM endpoints
+		WHERE 1=1
+	`
 	args := []interface{}{}
 	argIdx := 1
 
@@ -303,9 +307,8 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 			argIdx++
 		}
 
-		// FIXED: Filter for stale endpoints only
+		// Filter for stale endpoints only
 		if filter.OnlyStale && filter.RecheckInterval > 0 {
-			// Calculate cutoff time in UTC (Go side, not PostgreSQL side)
 			cutoffTime := time.Now().UTC().Add(-filter.RecheckInterval)
 			query += fmt.Sprintf(" AND (last_checked IS NULL OR last_checked < $%d)", argIdx)
 			args = append(args, cutoffTime)
@@ -313,7 +316,8 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 		}
 	}
 
-	query += " ORDER BY id DESC"
+	// NEW: Order by server_did and discovered_at to get primary endpoints
+	query += " ORDER BY COALESCE(server_did, id::text), discovered_at ASC"
 
 	if filter != nil && filter.Limit > 0 {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
@@ -330,16 +334,19 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 	for rows.Next() {
 		var ep Endpoint
 		var lastChecked, ipResolvedAt sql.NullTime
-		var ip sql.NullString
+		var ip, serverDID sql.NullString
 
 		err := rows.Scan(
-			&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
+			&ep.ID, &ep.EndpointType, &ep.Endpoint, &serverDID, &ep.DiscoveredAt, &lastChecked,
 			&ep.Status, &ip, &ipResolvedAt, &ep.UpdatedAt,
 		)
 		if err != nil {
 			return nil, err
 		}
 
+		if serverDID.Valid {
+			ep.ServerDID = serverDID.String
+		}
 		if lastChecked.Valid {
 			ep.LastChecked = lastChecked.Time
 		}
@@ -374,6 +381,50 @@ func (p *PostgresDB) UpdateEndpointIP(ctx context.Context, endpointID int64, ip 
     `
 	_, err := p.db.ExecContext(ctx, query, ip, resolvedAt, time.Now().UTC(), endpointID)
 	return err
+}
+
+func (p *PostgresDB) UpdateEndpointServerDID(ctx context.Context, endpointID int64, serverDID string) error {
+	query := `
+		UPDATE endpoints 
+		SET server_did = $1, updated_at = $2
+		WHERE id = $3
+	`
+	_, err := p.db.ExecContext(ctx, query, serverDID, time.Now().UTC(), endpointID)
+	return err
+}
+
+func (p *PostgresDB) GetDuplicateEndpoints(ctx context.Context) (map[string][]string, error) {
+	query := `
+		SELECT server_did, array_agg(endpoint ORDER BY discovered_at ASC) as endpoints
+		FROM endpoints
+		WHERE server_did IS NOT NULL 
+		  AND server_did != ''
+		  AND endpoint_type = 'pds'
+		GROUP BY server_did
+		HAVING COUNT(*) > 1
+		ORDER BY COUNT(*) DESC
+	`
+
+	rows, err := p.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	duplicates := make(map[string][]string)
+	for rows.Next() {
+		var serverDID string
+		var endpoints []string
+
+		err := rows.Scan(&serverDID, pq.Array(&endpoints))
+		if err != nil {
+			return nil, err
+		}
+
+		duplicates[serverDID] = endpoints
+	}
+
+	return duplicates, rows.Err()
 }
 
 // ===== SCAN OPERATIONS =====
@@ -480,26 +531,39 @@ func (p *PostgresDB) GetEndpointScans(ctx context.Context, endpointID int64, lim
 
 func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]*PDSListItem, error) {
 	query := `
-        SELECT 
-            e.id, e.endpoint, e.discovered_at, e.last_checked, e.status, e.ip,
-            latest.user_count, latest.response_time, latest.version, latest.scanned_at,
-            i.city, i.country, i.country_code, i.asn, i.asn_org,
-            i.is_datacenter, i.is_vpn, i.latitude, i.longitude
-        FROM endpoints e
-        LEFT JOIN LATERAL (
-            SELECT 
-                user_count,
-                response_time,
-                version,
-                scanned_at
-            FROM endpoint_scans
-            WHERE endpoint_id = e.id AND status = 1
-            ORDER BY scanned_at DESC
-            LIMIT 1
-        ) latest ON true
-        LEFT JOIN ip_infos i ON e.ip = i.ip
-        WHERE e.endpoint_type = 'pds'
-    `
+		WITH unique_servers AS (
+			SELECT DISTINCT ON (COALESCE(server_did, id::text))
+				id,
+				endpoint,
+				server_did,
+				discovered_at,
+				last_checked,
+				status,
+				ip
+			FROM endpoints
+			WHERE endpoint_type = 'pds'
+			ORDER BY COALESCE(server_did, id::text), discovered_at ASC
+		)
+		SELECT 
+			e.id, e.endpoint, e.server_did, e.discovered_at, e.last_checked, e.status, e.ip,
+			latest.user_count, latest.response_time, latest.version, latest.scanned_at,
+			i.city, i.country, i.country_code, i.asn, i.asn_org,
+			i.is_datacenter, i.is_vpn, i.latitude, i.longitude
+		FROM unique_servers e
+		LEFT JOIN LATERAL (
+			SELECT 
+				user_count,
+				response_time,
+				version,
+				scanned_at
+			FROM endpoint_scans
+			WHERE endpoint_id = e.id AND status = 1
+			ORDER BY scanned_at DESC
+			LIMIT 1
+		) latest ON true
+		LEFT JOIN ip_infos i ON e.ip = i.ip
+		WHERE 1=1
+	`
 
 	args := []interface{}{}
 	argIdx := 1
@@ -541,18 +605,18 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 	var items []*PDSListItem
 	for rows.Next() {
 		item := &PDSListItem{}
-		var ip, city, country, countryCode, asnOrg sql.NullString
+		var ip, serverDID, city, country, countryCode, asnOrg sql.NullString
 		var asn sql.NullInt32
 		var isDatacenter, isVPN sql.NullBool
 		var lat, lon sql.NullFloat64
 		var userCount sql.NullInt32
 		var responseTime sql.NullFloat64
-		var version sql.NullString // ADD THIS LINE
+		var version sql.NullString
 		var scannedAt sql.NullTime
 
 		err := rows.Scan(
-			&item.ID, &item.Endpoint, &item.DiscoveredAt, &item.LastChecked, &item.Status, &ip,
-			&userCount, &responseTime, &version, &scannedAt, // ADD &version HERE
+			&item.ID, &item.Endpoint, &serverDID, &item.DiscoveredAt, &item.LastChecked, &item.Status, &ip,
+			&userCount, &responseTime, &version, &scannedAt,
 			&city, &country, &countryCode, &asn, &asnOrg,
 			&isDatacenter, &isVPN, &lat, &lon,
 		)
@@ -562,6 +626,9 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 
 		if ip.Valid {
 			item.IP = ip.String
+		}
+		if serverDID.Valid {
+			item.ServerDID = serverDID.String
 		}
 
 		// Add latest scan data if available
@@ -603,43 +670,43 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 
 func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDetail, error) {
 	query := `
-        SELECT 
-            e.id, e.endpoint, e.discovered_at, e.last_checked, e.status, e.ip,
-            latest.user_count,
-            latest.response_time,
-            latest.version,  -- ADD THIS LINE
-            latest.scan_data->'metadata'->'server_info' as server_info,
-            latest.scanned_at,
-            i.city, i.country, i.country_code, i.asn, i.asn_org,
-            i.is_datacenter, i.is_vpn, i.latitude, i.longitude,
-            i.raw_data
-        FROM endpoints e
-        LEFT JOIN LATERAL (
-            SELECT scan_data, response_time, version, scanned_at, user_count  -- ADD version HERE
-            FROM endpoint_scans
-            WHERE endpoint_id = e.id
-            ORDER BY scanned_at DESC
-            LIMIT 1
-        ) latest ON true
-        LEFT JOIN ip_infos i ON e.ip = i.ip
-        WHERE e.endpoint = $1 AND e.endpoint_type = 'pds'
-    `
+		SELECT 
+			e.id, e.endpoint, e.server_did, e.discovered_at, e.last_checked, e.status, e.ip,
+			latest.user_count,
+			latest.response_time,
+			latest.version,
+			latest.scan_data->'metadata'->'server_info' as server_info,
+			latest.scanned_at,
+			i.city, i.country, i.country_code, i.asn, i.asn_org,
+			i.is_datacenter, i.is_vpn, i.latitude, i.longitude,
+			i.raw_data
+		FROM endpoints e
+		LEFT JOIN LATERAL (
+			SELECT scan_data, response_time, version, scanned_at, user_count
+			FROM endpoint_scans
+			WHERE endpoint_id = e.id
+			ORDER BY scanned_at DESC
+			LIMIT 1
+		) latest ON true
+		LEFT JOIN ip_infos i ON e.ip = i.ip
+		WHERE e.endpoint = $1 AND e.endpoint_type = 'pds'
+	`
 
 	detail := &PDSDetail{}
-	var ip, city, country, countryCode, asnOrg sql.NullString
+	var ip, city, country, countryCode, asnOrg, serverDID sql.NullString
 	var asn sql.NullInt32
 	var isDatacenter, isVPN sql.NullBool
 	var lat, lon sql.NullFloat64
 	var userCount sql.NullInt32
 	var responseTime sql.NullFloat64
-	var version sql.NullString // ADD THIS LINE
+	var version sql.NullString
 	var serverInfoJSON []byte
 	var scannedAt sql.NullTime
 	var rawDataJSON []byte
 
 	err := p.db.QueryRowContext(ctx, query, endpoint).Scan(
-		&detail.ID, &detail.Endpoint, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip,
-		&userCount, &responseTime, &version, &serverInfoJSON, &scannedAt, // ADD &version HERE
+		&detail.ID, &detail.Endpoint, &serverDID, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip,
+		&userCount, &responseTime, &version, &serverInfoJSON, &scannedAt,
 		&city, &country, &countryCode, &asn, &asnOrg,
 		&isDatacenter, &isVPN, &lat, &lon,
 		&rawDataJSON,
@@ -652,6 +719,44 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 		detail.IP = ip.String
 	}
 
+	// NEW: Get aliases if this endpoint has a server_did
+	if serverDID.Valid && serverDID.String != "" {
+		aliasQuery := `
+			SELECT endpoint, discovered_at
+			FROM endpoints
+			WHERE server_did = $1
+			  AND endpoint_type = 'pds'
+			  AND endpoint != $2
+			ORDER BY discovered_at ASC
+		`
+
+		rows, err := p.db.QueryContext(ctx, aliasQuery, serverDID.String, endpoint)
+		if err == nil {
+			defer rows.Close()
+
+			var aliases []string
+			var primaryDiscoveredAt time.Time
+
+			for rows.Next() {
+				var alias string
+				var discoveredAt time.Time
+				if err := rows.Scan(&alias, &discoveredAt); err == nil {
+					aliases = append(aliases, alias)
+					if primaryDiscoveredAt.IsZero() || discoveredAt.Before(detail.DiscoveredAt) {
+						primaryDiscoveredAt = discoveredAt
+					}
+				}
+			}
+
+			detail.Aliases = aliases
+			detail.IsPrimary = detail.DiscoveredAt.Equal(primaryDiscoveredAt) ||
+				detail.DiscoveredAt.Before(primaryDiscoveredAt)
+		}
+	} else {
+		// No server_did means it's a unique server
+		detail.IsPrimary = true
+	}
+
 	// Parse latest scan data
 	if userCount.Valid {
 		var serverInfo interface{}
@@ -662,13 +767,13 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 		detail.LatestScan = &struct {
 			UserCount    int
 			ResponseTime float64
-			Version      string // ADD THIS LINE
+			Version      string
 			ServerInfo   interface{}
 			ScannedAt    time.Time
 		}{
 			UserCount:    int(userCount.Int32),
 			ResponseTime: responseTime.Float64,
-			Version:      version.String, // ADD THIS LINE
+			Version:      version.String,
 			ServerInfo:   serverInfo,
 			ScannedAt:    scannedAt.Time,
 		}
@@ -687,15 +792,10 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 			IsVPN:        isVPN.Bool,
 			Latitude:     float32(lat.Float64),
 			Longitude:    float32(lon.Float64),
-			// RawData is unmarshaled below
 		}
 
-		// NEW: Unmarshal the raw_data JSON
 		if len(rawDataJSON) > 0 {
-			if err := json.Unmarshal(rawDataJSON, &detail.IPInfo.RawData); err != nil {
-				// Log the error but don't fail the request
-				fmt.Printf("Warning: failed to unmarshal raw_data for IP %s: %v\n", ip.String, err)
-			}
+			json.Unmarshal(rawDataJSON, &detail.IPInfo.RawData)
 		}
 	}
 
@@ -703,24 +803,32 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 }
 
 func (p *PostgresDB) GetPDSStats(ctx context.Context) (*PDSStats, error) {
-	// PDS stats - aggregate from latest scans
 	query := `
-		WITH latest_scans AS (
-			SELECT DISTINCT ON (endpoint_id)
-				endpoint_id,
-				user_count,
+		WITH unique_servers AS (
+			SELECT DISTINCT ON (COALESCE(server_did, id::text))
+				id,
+				COALESCE(server_did, id::text) as server_identity,
 				status
-			FROM endpoint_scans
-			WHERE endpoint_id IN (SELECT id FROM endpoints WHERE endpoint_type = 'pds')
-            ORDER BY endpoint_id, scanned_at DESC
-        )
-        SELECT 
-            COUNT(*) as total,
-            SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as online,
-            SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) as offline,
-            SUM(user_count) as total_users
-        FROM latest_scans
-    `
+			FROM endpoints
+			WHERE endpoint_type = 'pds'
+			ORDER BY COALESCE(server_did, id::text), discovered_at ASC
+		),
+		latest_scans AS (
+			SELECT DISTINCT ON (us.id)
+				us.id,
+				es.user_count,
+				us.status
+			FROM unique_servers us
+			LEFT JOIN endpoint_scans es ON us.id = es.endpoint_id
+			ORDER BY us.id, es.scanned_at DESC
+		)
+		SELECT 
+			COUNT(*) as total,
+			SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as online,
+			SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) as offline,
+			SUM(COALESCE(user_count, 0)) as total_users
+		FROM latest_scans
+	`
 
 	stats := &PDSStats{}
 	err := p.db.QueryRowContext(ctx, query).Scan(
@@ -1534,26 +1642,34 @@ func (p *PostgresDB) GetTotalDIDCount(ctx context.Context) (int64, error) {
 
 func (p *PostgresDB) GetCountryLeaderboard(ctx context.Context) ([]*CountryStats, error) {
 	query := `
-		WITH pds_by_country AS (
+		WITH unique_servers AS (
+			SELECT DISTINCT ON (COALESCE(e.server_did, e.id::text))
+				e.id,
+				e.ip,
+				e.status
+			FROM endpoints e
+			WHERE e.endpoint_type = 'pds'
+			ORDER BY COALESCE(e.server_did, e.id::text), e.discovered_at ASC
+		),
+		pds_by_country AS (
 			SELECT 
 				i.country,
 				i.country_code,
-				COUNT(DISTINCT e.id) as active_pds_count,
+				COUNT(DISTINCT us.id) as active_pds_count,
 				SUM(latest.user_count) as total_users,
 				AVG(latest.response_time) as avg_response_time
-			FROM endpoints e
-			JOIN ip_infos i ON e.ip = i.ip
+			FROM unique_servers us
+			JOIN ip_infos i ON us.ip = i.ip
 			LEFT JOIN LATERAL (
 				SELECT user_count, response_time
 				FROM endpoint_scans
-				WHERE endpoint_id = e.id
+				WHERE endpoint_id = us.id
 				ORDER BY scanned_at DESC
 				LIMIT 1
 			) latest ON true
-			WHERE e.endpoint_type = 'pds'
-			AND e.status = 1
-			AND i.country IS NOT NULL
-			AND i.country != ''
+			WHERE us.status = 1
+			  AND i.country IS NOT NULL
+			  AND i.country != ''
 			GROUP BY i.country, i.country_code
 		),
 		totals AS (
@@ -1566,13 +1682,13 @@ func (p *PostgresDB) GetCountryLeaderboard(ctx context.Context) ([]*CountryStats
 			pbc.country,
 			pbc.country_code,
 			pbc.active_pds_count,
-			ROUND((pbc.active_pds_count * 100.0 / NULLIF(t.total_pds, 0))::numeric, 2) as pds_percentage,
+			ROUND((pbc.active_pds_count * 100.0 / NULLIF(t.total_pds, 0))::numeric, 4) as pds_percentage,
 			COALESCE(pbc.total_users, 0) as total_users,
-			ROUND((COALESCE(pbc.total_users, 0) * 100.0 / NULLIF(t.total_users_global, 0))::numeric, 2) as users_percentage,
+			ROUND((COALESCE(pbc.total_users, 0) * 100.0 / NULLIF(t.total_users_global, 0))::numeric, 4) as users_percentage,
 			ROUND(COALESCE(pbc.avg_response_time, 0)::numeric, 2) as avg_response_time_ms
 		FROM pds_by_country pbc
 		CROSS JOIN totals t
-		ORDER BY pbc.active_pds_count DESC;
+		ORDER BY pbc.active_pds_count DESC
 	`
 
 	rows, err := p.db.QueryContext(ctx, query)
@@ -1614,19 +1730,25 @@ func (p *PostgresDB) GetCountryLeaderboard(ctx context.Context) ([]*CountryStats
 
 func (p *PostgresDB) GetVersionStats(ctx context.Context) ([]*VersionStats, error) {
 	query := `
-		WITH latest_scans AS (
-			SELECT DISTINCT ON (e.id)
-				e.id,
+		WITH unique_servers AS (
+			SELECT DISTINCT ON (COALESCE(e.server_did, e.id::text))
+				e.id
+			FROM endpoints e
+			WHERE e.endpoint_type = 'pds'
+			  AND e.status = 1
+			ORDER BY COALESCE(e.server_did, e.id::text), e.discovered_at ASC
+		),
+		latest_scans AS (
+			SELECT DISTINCT ON (us.id)
+				us.id,
 				es.version,
 				es.user_count,
 				es.scanned_at
-			FROM endpoints e
-			JOIN endpoint_scans es ON e.id = es.endpoint_id
-			WHERE e.endpoint_type = 'pds'
-			  AND e.status = 1
-			  AND es.version IS NOT NULL
+			FROM unique_servers us
+			JOIN endpoint_scans es ON us.id = es.endpoint_id
+			WHERE es.version IS NOT NULL
 			  AND es.version != ''
-			ORDER BY e.id, es.scanned_at DESC
+			ORDER BY us.id, es.scanned_at DESC
 		),
 		version_groups AS (
 			SELECT 

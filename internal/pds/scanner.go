@@ -123,17 +123,6 @@ func (s *Scanner) workerWithProgress(ctx context.Context, workerID int, jobs <-c
 	}
 }
 
-func (s *Scanner) worker(ctx context.Context, jobs <-chan *storage.Endpoint) {
-	for server := range jobs {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			s.scanAndSaveEndpoint(ctx, server)
-		}
-	}
-}
-
 func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint) {
 	// STEP 1: Resolve IP (before any network call)
 	ip, err := ipinfo.ExtractIPFromEndpoint(ep.Endpoint)
@@ -150,7 +139,7 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 	s.db.UpdateEndpointIP(ctx, ep.ID, ip, time.Now().UTC())
 
 	// STEP 2: Health check
-	available, responseTime, version, err := s.client.CheckHealth(ctx, ep.Endpoint) // CHANGED: receive version
+	available, responseTime, version, err := s.client.CheckHealth(ctx, ep.Endpoint)
 	if err != nil || !available {
 		errMsg := "health check failed"
 		if err != nil {
@@ -168,6 +157,9 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 	desc, err := s.client.DescribeServer(ctx, ep.Endpoint)
 	if err != nil {
 		log.Verbose("Warning: failed to describe server %s: %v", stripansi.Strip(ep.Endpoint), err)
+	} else if desc != nil && desc.DID != "" {
+		// NEW: Update server DID
+		s.db.UpdateEndpointServerDID(ctx, ep.ID, desc.DID)
 	}
 
 	dids, err := s.client.ListRepos(ctx, ep.Endpoint)
@@ -182,7 +174,7 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 		ResponseTime: responseTime,
 		Description:  desc,
 		DIDs:         dids,
-		Version:      version, // CHANGED: Pass version
+		Version:      version,
 	})
 
 	// STEP 5: Fetch IP info if needed (async, with backoff)
