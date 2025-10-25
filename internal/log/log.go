@@ -41,6 +41,10 @@ func Info(format string, v ...interface{}) {
 	infoLog.Printf("%s [INFO] %s", timestamp(), fmt.Sprintf(format, v...))
 }
 
+func Warn(format string, v ...interface{}) {
+	infoLog.Printf("%s [WARN] %s", timestamp(), fmt.Sprintf(format, v...))
+}
+
 func Error(format string, v ...interface{}) {
 	errorLog.Printf("%s [ERROR] %s", timestamp(), fmt.Sprintf(format, v...))
 }
