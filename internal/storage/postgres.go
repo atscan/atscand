@@ -2058,7 +2058,9 @@ func (p *PostgresDB) UpsertPDSRepos(ctx context.Context, endpointID int64, repos
 
 		result, err := tx.Exec(ctx, `
 			INSERT INTO pds_repos (endpoint_id, did, head, rev, active, status, first_seen, last_seen)
-			SELECT $1, did, head, rev, active, status, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			SELECT $1, did, head, rev, active, status, 
+			       TIMEZONE('UTC', NOW()), 
+			       TIMEZONE('UTC', NOW())
 			FROM temp_new_repos
 		`, endpointID)
 		if err != nil {
@@ -2102,8 +2104,8 @@ func (p *PostgresDB) UpsertPDSRepos(ctx context.Context, endpointID int64, repos
 				rev = t.rev,
 				active = t.active,
 				status = t.status,
-				last_seen = CURRENT_TIMESTAMP,
-				updated_at = CURRENT_TIMESTAMP
+				last_seen = TIMEZONE('UTC', NOW()),
+				updated_at = TIMEZONE('UTC', NOW())
 			FROM temp_changed_repos t
 			WHERE pds_repos.endpoint_id = $1
 			  AND pds_repos.did = t.did
