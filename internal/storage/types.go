@@ -139,6 +139,16 @@ func (b *PLCBundle) OperationCount() int {
 	return 10000
 }
 
+type PLCHistoryPoint struct {
+	Date                   string `json:"date"`
+	BundleNumber           int    `json:"last_bundle_number"`
+	OperationCount         int    `json:"operations"`
+	UncompressedSize       int64  `json:"size_uncompressed"`
+	CompressedSize         int64  `json:"size_compressed"`
+	CumulativeUncompressed int64  `json:"cumulative_uncompressed"`
+	CumulativeCompressed   int64  `json:"cumulative_compressed"`
+}
+
 // MempoolOperation represents an operation waiting to be bundled
 type MempoolOperation struct {
 	ID        int64

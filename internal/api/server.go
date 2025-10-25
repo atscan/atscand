@@ -78,6 +78,9 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/plc/bundles/{number}/download", s.handleDownloadPLCBundle).Methods("GET")
 	api.HandleFunc("/plc/bundles/{bundleNumber}/verify", s.handleVerifyPLCBundle).Methods("POST")
 
+	// PLC history/metrics
+	api.HandleFunc("/plc/history", s.handleGetPLCHistory).Methods("GET")
+
 	// PLC Export endpoint (simulates PLC directory)
 	api.HandleFunc("/plc/export", s.handlePLCExport).Methods("GET")
 

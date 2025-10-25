@@ -1398,6 +1398,55 @@ func (s *Server) handleGetDuplicateEndpoints(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+func (s *Server) handleGetPLCHistory(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	limit := getQueryInt(r, "limit", 0)
+	fromBundle := getQueryInt(r, "from", 1)
+
+	history, err := s.db.GetPLCHistory(r.Context(), limit, fromBundle)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var totalOps int64
+	var totalUncompressed int64
+	var totalCompressed int64
+
+	for _, point := range history {
+		totalOps += int64(point.OperationCount)
+		totalUncompressed += point.UncompressedSize
+		totalCompressed += point.CompressedSize
+	}
+
+	result := map[string]interface{}{
+		"data": history,
+		"summary": map[string]interface{}{
+			"days":               len(history),
+			"total_operations":   totalOps,
+			"total_uncompressed": totalUncompressed,
+			"total_compressed":   totalCompressed,
+			"compression_ratio":  0.0,
+		},
+	}
+
+	if len(history) > 0 {
+		result["summary"].(map[string]interface{})["first_date"] = history[0].Date
+		result["summary"].(map[string]interface{})["last_date"] = history[len(history)-1].Date
+		result["summary"].(map[string]interface{})["time_span_days"] = len(history)
+
+		if totalCompressed > 0 {
+			result["summary"].(map[string]interface{})["compression_ratio"] = float64(totalUncompressed) / float64(totalCompressed)
+		}
+
+		result["summary"].(map[string]interface{})["avg_operations_per_day"] = totalOps / int64(len(history))
+		result["summary"].(map[string]interface{})["avg_size_per_day"] = totalUncompressed / int64(len(history))
+	}
+
+	resp.json(result)
+}
+
 // ===== UTILITY FUNCTIONS =====
 
 func computeOperationsHash(ops []plc.PLCOperation) string {

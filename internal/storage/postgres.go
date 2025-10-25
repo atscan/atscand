@@ -1332,6 +1332,69 @@ func (p *PostgresDB) GetBundleForTimestamp(ctx context.Context, afterTime time.T
 	return bundleNum, nil
 }
 
+func (p *PostgresDB) GetPLCHistory(ctx context.Context, limit int, fromBundle int) ([]*PLCHistoryPoint, error) {
+	query := `
+		WITH daily_stats AS (
+			SELECT 
+				DATE(start_time) as date,
+				MAX(bundle_number) as last_bundle,
+				COUNT(*) as bundle_count,
+				SUM(uncompressed_size) as total_uncompressed,
+				SUM(compressed_size) as total_compressed,
+				MAX(cumulative_uncompressed_size) as cumulative_uncompressed,
+				MAX(cumulative_compressed_size) as cumulative_compressed
+			FROM plc_bundles
+			WHERE bundle_number >= $1
+			GROUP BY DATE(start_time)
+		)
+		SELECT 
+			date::text,
+			last_bundle,
+			SUM(bundle_count * 10000) OVER (ORDER BY date) as cumulative_operations,
+			total_uncompressed,
+			total_compressed,
+			cumulative_uncompressed,
+			cumulative_compressed
+		FROM daily_stats
+		ORDER BY date ASC
+	`
+
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+
+	rows, err := p.db.QueryContext(ctx, query, fromBundle)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var history []*PLCHistoryPoint
+	for rows.Next() {
+		var point PLCHistoryPoint
+		var cumulativeOps int64
+
+		err := rows.Scan(
+			&point.Date,
+			&point.BundleNumber,
+			&cumulativeOps,
+			&point.UncompressedSize,
+			&point.CompressedSize,
+			&point.CumulativeUncompressed,
+			&point.CumulativeCompressed,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		point.OperationCount = int(cumulativeOps)
+
+		history = append(history, &point)
+	}
+
+	return history, rows.Err()
+}
+
 // ===== MEMPOOL OPERATIONS =====
 
 func (p *PostgresDB) AddToMempool(ctx context.Context, ops []MempoolOperation) error {

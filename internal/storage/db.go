@@ -56,6 +56,7 @@ type Database interface {
 	GetBundleStats(ctx context.Context) (count, compressedSize, uncompressedSize, lastBundle int64, err error)
 	GetLastBundleNumber(ctx context.Context) (int, error)
 	GetBundleForTimestamp(ctx context.Context, afterTime time.Time) (int, error)
+	GetPLCHistory(ctx context.Context, limit int, fromBundle int) ([]*PLCHistoryPoint, error)
 
 	// Mempool operations
 	AddToMempool(ctx context.Context, ops []MempoolOperation) error
