@@ -158,17 +158,23 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 	if err != nil {
 		log.Verbose("Warning: failed to describe server %s: %v", stripansi.Strip(ep.Endpoint), err)
 	} else if desc != nil && desc.DID != "" {
-		// NEW: Update server DID
 		s.db.UpdateEndpointServerDID(ctx, ep.ID, desc.DID)
 	}
 
-	dids, err := s.client.ListRepos(ctx, ep.Endpoint)
+	// Fetch repos with full info
+	repoList, err := s.client.ListRepos(ctx, ep.Endpoint)
 	if err != nil {
 		log.Verbose("Warning: failed to list repos for %s: %v", ep.Endpoint, err)
-		dids = []string{}
+		repoList = []Repo{}
 	}
 
-	// STEP 4: SAVE IMMEDIATELY
+	// Convert to DIDs for backward compatibility
+	dids := make([]string, len(repoList))
+	for i, repo := range repoList {
+		dids[i] = repo.DID
+	}
+
+	// STEP 4: SAVE scan result
 	s.saveScanResult(ctx, ep.ID, &ScanResult{
 		Status:       storage.EndpointStatusOnline,
 		ResponseTime: responseTime,
@@ -176,6 +182,49 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 		DIDs:         dids,
 		Version:      version,
 	})
+
+	// Save repos in batches (only tracks changes)
+	if len(repoList) > 0 {
+		batchSize := 10000
+
+		log.Verbose("Processing %d repos for %s (tracking changes only)", len(repoList), ep.Endpoint)
+
+		for i := 0; i < len(repoList); i += batchSize {
+			end := i + batchSize
+			if end > len(repoList) {
+				end = len(repoList)
+			}
+
+			batch := repoList[i:end]
+			repoData := make([]storage.PDSRepoData, len(batch))
+
+			for j, repo := range batch {
+				active := true
+				if repo.Active != nil {
+					active = *repo.Active
+				}
+
+				status := ""
+				if repo.Status != nil {
+					status = *repo.Status
+				}
+
+				repoData[j] = storage.PDSRepoData{
+					DID:    repo.DID,
+					Head:   repo.Head,
+					Rev:    repo.Rev,
+					Active: active,
+					Status: status,
+				}
+			}
+
+			if err := s.db.UpsertPDSRepos(ctx, ep.ID, repoData); err != nil {
+				log.Error("Failed to save repo batch for endpoint %d: %v", ep.ID, err)
+			}
+		}
+
+		log.Verbose("✓ Processed %d repos for %s", len(repoList), ep.Endpoint)
+	}
 
 	// STEP 5: Fetch IP info if needed (async, with backoff)
 	go s.updateIPInfoIfNeeded(ctx, ip)

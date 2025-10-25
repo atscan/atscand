@@ -38,6 +38,8 @@ type Database interface {
 	GetPDSList(ctx context.Context, filter *EndpointFilter) ([]*PDSListItem, error)
 	GetPDSDetail(ctx context.Context, endpoint string) (*PDSDetail, error)
 	GetPDSStats(ctx context.Context) (*PDSStats, error)
+	GetCountryLeaderboard(ctx context.Context) ([]*CountryStats, error)
+	GetVersionStats(ctx context.Context) ([]*VersionStats, error)
 
 	// IP operations (IP as primary key)
 	UpsertIPInfo(ctx context.Context, ip string, ipInfo map[string]interface{}) error
@@ -79,6 +81,9 @@ type Database interface {
 	AddBundleDIDs(ctx context.Context, bundleNum int, dids []string) error
 	GetTotalDIDCount(ctx context.Context) (int64, error)
 
-	GetCountryLeaderboard(ctx context.Context) ([]*CountryStats, error)
-	GetVersionStats(ctx context.Context) ([]*VersionStats, error)
+	// PDS Repo operations
+	UpsertPDSRepos(ctx context.Context, endpointID int64, repos []PDSRepoData) error
+	GetPDSRepos(ctx context.Context, endpointID int64, activeOnly bool, limit int, offset int) ([]*PDSRepo, error) // Updated
+	GetReposByDID(ctx context.Context, did string) ([]*PDSRepo, error)
+	GetPDSRepoStats(ctx context.Context, endpointID int64) (map[string]interface{}, error)
 }

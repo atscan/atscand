@@ -194,6 +194,29 @@ func (p *PostgresDB) Migrate() error {
 
     CREATE INDEX IF NOT EXISTS idx_dids_bundle_numbers ON dids USING gin(bundle_numbers);
     CREATE INDEX IF NOT EXISTS idx_dids_created_at ON dids(created_at);
+
+	-- PDS Repositories table
+    CREATE TABLE IF NOT EXISTS pds_repos (
+        id BIGSERIAL PRIMARY KEY,
+        endpoint_id BIGINT NOT NULL,
+        did TEXT NOT NULL,
+        head TEXT,
+        rev TEXT,
+        active BOOLEAN DEFAULT true,
+        status TEXT,
+        first_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (endpoint_id) REFERENCES endpoints(id) ON DELETE CASCADE,
+        UNIQUE(endpoint_id, did)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pds_repos_endpoint ON pds_repos(endpoint_id);
+	CREATE INDEX IF NOT EXISTS idx_pds_repos_endpoint_id_desc ON pds_repos(endpoint_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_pds_repos_did ON pds_repos(did);
+    CREATE INDEX IF NOT EXISTS idx_pds_repos_active ON pds_repos(active);
+    CREATE INDEX IF NOT EXISTS idx_pds_repos_status ON pds_repos(status);
+    CREATE INDEX IF NOT EXISTS idx_pds_repos_last_seen ON pds_repos(last_seen DESC);
     `
 
 	_, err := p.db.Exec(schema)
@@ -1915,4 +1938,317 @@ func formatPercentage(pct float64) string {
 		return fmt.Sprintf("%.6f%%", pct)
 	}
 	return "0%"
+}
+
+func (p *PostgresDB) UpsertPDSRepos(ctx context.Context, endpointID int64, repos []PDSRepoData) error {
+	if len(repos) == 0 {
+		return nil
+	}
+
+	// Step 1: Load all existing repos for this endpoint into memory
+	query := `
+		SELECT did, head, rev, active, status
+		FROM pds_repos
+		WHERE endpoint_id = $1
+	`
+
+	rows, err := p.db.QueryContext(ctx, query, endpointID)
+	if err != nil {
+		return err
+	}
+
+	existingRepos := make(map[string]*PDSRepo)
+	for rows.Next() {
+		var repo PDSRepo
+		var head, rev, status sql.NullString
+
+		err := rows.Scan(&repo.DID, &head, &rev, &repo.Active, &status)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+
+		if head.Valid {
+			repo.Head = head.String
+		}
+		if rev.Valid {
+			repo.Rev = rev.String
+		}
+		if status.Valid {
+			repo.Status = status.String
+		}
+
+		existingRepos[repo.DID] = &repo
+	}
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Step 2: Compare and collect changes
+	var newRepos []PDSRepoData
+	var changedRepos []PDSRepoData
+
+	for _, repo := range repos {
+		existing, exists := existingRepos[repo.DID]
+		if !exists {
+			// New repo
+			newRepos = append(newRepos, repo)
+		} else if existing.Head != repo.Head ||
+			existing.Rev != repo.Rev ||
+			existing.Active != repo.Active ||
+			existing.Status != repo.Status {
+			// Repo changed
+			changedRepos = append(changedRepos, repo)
+		}
+	}
+
+	// Log comparison results
+	log.Verbose("UpsertPDSRepos: endpoint_id=%d, total=%d, existing=%d, new=%d, changed=%d, unchanged=%d",
+		endpointID, len(repos), len(existingRepos), len(newRepos), len(changedRepos),
+		len(repos)-len(newRepos)-len(changedRepos))
+
+	// If nothing changed, return early
+	if len(newRepos) == 0 && len(changedRepos) == 0 {
+		log.Verbose("UpsertPDSRepos: endpoint_id=%d, no changes detected, skipping database operations", endpointID)
+		return nil
+	}
+
+	// Step 3: Execute batched operations
+	conn, err := p.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Insert new repos
+	if len(newRepos) > 0 {
+		_, err := tx.Exec(ctx, `
+			CREATE TEMP TABLE temp_new_repos (
+				did TEXT,
+				head TEXT,
+				rev TEXT,
+				active BOOLEAN,
+				status TEXT
+			) ON COMMIT DROP
+		`)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Conn().CopyFrom(
+			ctx,
+			pgx.Identifier{"temp_new_repos"},
+			[]string{"did", "head", "rev", "active", "status"},
+			pgx.CopyFromSlice(len(newRepos), func(i int) ([]interface{}, error) {
+				repo := newRepos[i]
+				return []interface{}{repo.DID, repo.Head, repo.Rev, repo.Active, repo.Status}, nil
+			}),
+		)
+		if err != nil {
+			return err
+		}
+
+		result, err := tx.Exec(ctx, `
+			INSERT INTO pds_repos (endpoint_id, did, head, rev, active, status, first_seen, last_seen)
+			SELECT $1, did, head, rev, active, status, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM temp_new_repos
+		`, endpointID)
+		if err != nil {
+			return err
+		}
+
+		log.Verbose("UpsertPDSRepos: endpoint_id=%d, inserted %d new repos", endpointID, result.RowsAffected())
+	}
+
+	// Update changed repos
+	if len(changedRepos) > 0 {
+		_, err := tx.Exec(ctx, `
+			CREATE TEMP TABLE temp_changed_repos (
+				did TEXT,
+				head TEXT,
+				rev TEXT,
+				active BOOLEAN,
+				status TEXT
+			) ON COMMIT DROP
+		`)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Conn().CopyFrom(
+			ctx,
+			pgx.Identifier{"temp_changed_repos"},
+			[]string{"did", "head", "rev", "active", "status"},
+			pgx.CopyFromSlice(len(changedRepos), func(i int) ([]interface{}, error) {
+				repo := changedRepos[i]
+				return []interface{}{repo.DID, repo.Head, repo.Rev, repo.Active, repo.Status}, nil
+			}),
+		)
+		if err != nil {
+			return err
+		}
+
+		result, err := tx.Exec(ctx, `
+			UPDATE pds_repos
+			SET head = t.head,
+				rev = t.rev,
+				active = t.active,
+				status = t.status,
+				last_seen = CURRENT_TIMESTAMP,
+				updated_at = CURRENT_TIMESTAMP
+			FROM temp_changed_repos t
+			WHERE pds_repos.endpoint_id = $1
+			  AND pds_repos.did = t.did
+		`, endpointID)
+		if err != nil {
+			return err
+		}
+
+		log.Verbose("UpsertPDSRepos: endpoint_id=%d, updated %d changed repos", endpointID, result.RowsAffected())
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	log.Verbose("UpsertPDSRepos: endpoint_id=%d, transaction committed successfully", endpointID)
+	return nil
+}
+
+func (p *PostgresDB) GetPDSRepos(ctx context.Context, endpointID int64, activeOnly bool, limit int, offset int) ([]*PDSRepo, error) {
+	query := `
+		SELECT id, endpoint_id, did, head, rev, active, status, first_seen, last_seen, updated_at
+		FROM pds_repos
+		WHERE endpoint_id = $1
+	`
+
+	args := []interface{}{endpointID}
+	argIdx := 2
+
+	if activeOnly {
+		query += " AND active = true"
+	}
+
+	// Order by id (primary key) - fastest
+	query += " ORDER BY id DESC"
+
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+		args = append(args, limit, offset)
+	}
+
+	rows, err := p.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var repos []*PDSRepo
+	for rows.Next() {
+		var repo PDSRepo
+		var head, rev, status sql.NullString
+
+		err := rows.Scan(
+			&repo.ID, &repo.EndpointID, &repo.DID, &head, &rev,
+			&repo.Active, &status, &repo.FirstSeen, &repo.LastSeen, &repo.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if head.Valid {
+			repo.Head = head.String
+		}
+		if rev.Valid {
+			repo.Rev = rev.String
+		}
+		if status.Valid {
+			repo.Status = status.String
+		}
+
+		repos = append(repos, &repo)
+	}
+
+	return repos, rows.Err()
+}
+
+func (p *PostgresDB) GetReposByDID(ctx context.Context, did string) ([]*PDSRepo, error) {
+	query := `
+		SELECT id, endpoint_id, did, head, rev, active, status, first_seen, last_seen, updated_at
+		FROM pds_repos
+		WHERE did = $1
+		ORDER BY last_seen DESC
+	`
+
+	rows, err := p.db.QueryContext(ctx, query, did)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var repos []*PDSRepo
+	for rows.Next() {
+		var repo PDSRepo
+		var head, rev, status sql.NullString
+
+		err := rows.Scan(
+			&repo.ID, &repo.EndpointID, &repo.DID, &head, &rev,
+			&repo.Active, &status, &repo.FirstSeen, &repo.LastSeen, &repo.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if head.Valid {
+			repo.Head = head.String
+		}
+		if rev.Valid {
+			repo.Rev = rev.String
+		}
+		if status.Valid {
+			repo.Status = status.String
+		}
+
+		repos = append(repos, &repo)
+	}
+
+	return repos, rows.Err()
+}
+
+func (p *PostgresDB) GetPDSRepoStats(ctx context.Context, endpointID int64) (map[string]interface{}, error) {
+	query := `
+		SELECT 
+			COUNT(*) as total_repos,
+			COUNT(*) FILTER (WHERE active = true) as active_repos,
+			COUNT(*) FILTER (WHERE active = false) as inactive_repos,
+			COUNT(*) FILTER (WHERE status IS NOT NULL AND status != '') as repos_with_status,
+			COUNT(*) FILTER (WHERE updated_at > CURRENT_TIMESTAMP - INTERVAL '1 hour') as recent_changes
+		FROM pds_repos
+		WHERE endpoint_id = $1
+	`
+
+	var totalRepos, activeRepos, inactiveRepos, reposWithStatus, recentChanges int64
+
+	err := p.db.QueryRowContext(ctx, query, endpointID).Scan(
+		&totalRepos, &activeRepos, &inactiveRepos, &reposWithStatus, &recentChanges,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"total_repos":       totalRepos,
+		"active_repos":      activeRepos,
+		"inactive_repos":    inactiveRepos,
+		"repos_with_status": reposWithStatus,
+		"recent_changes":    recentChanges,
+	}, nil
 }

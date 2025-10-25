@@ -252,3 +252,24 @@ type VersionStats struct {
 	FirstSeen       time.Time `json:"first_seen"`
 	LastSeen        time.Time `json:"last_seen"`
 }
+
+type PDSRepo struct {
+	ID         int64     `json:"id"`
+	EndpointID int64     `json:"endpoint_id"`
+	DID        string    `json:"did"`
+	Head       string    `json:"head,omitempty"`
+	Rev        string    `json:"rev,omitempty"`
+	Active     bool      `json:"active"`
+	Status     string    `json:"status,omitempty"`
+	FirstSeen  time.Time `json:"first_seen"`
+	LastSeen   time.Time `json:"last_seen"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type PDSRepoData struct {
+	DID    string
+	Head   string
+	Rev    string
+	Active bool
+	Status string
+}

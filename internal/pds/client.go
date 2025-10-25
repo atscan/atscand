@@ -28,14 +28,16 @@ type ListReposResponse struct {
 
 // Repo represents a repository in the list
 type Repo struct {
-	DID  string `json:"did"`
-	Head string `json:"head,omitempty"`
-	Rev  string `json:"rev,omitempty"`
+	DID    string  `json:"did"`
+	Head   string  `json:"head,omitempty"`
+	Rev    string  `json:"rev,omitempty"`
+	Active *bool   `json:"active,omitempty"`
+	Status *string `json:"status,omitempty"`
 }
 
 // ListRepos fetches all repositories from a PDS with pagination
-func (c *Client) ListRepos(ctx context.Context, endpoint string) ([]string, error) {
-	var allDIDs []string
+func (c *Client) ListRepos(ctx context.Context, endpoint string) ([]Repo, error) {
+	var allRepos []Repo
 	var cursor *string
 
 	for {
@@ -67,10 +69,8 @@ func (c *Client) ListRepos(ctx context.Context, endpoint string) ([]string, erro
 		}
 		resp.Body.Close()
 
-		// Collect DIDs
-		for _, repo := range result.Repos {
-			allDIDs = append(allDIDs, repo.DID)
-		}
+		// Collect repos
+		allRepos = append(allRepos, result.Repos...)
 
 		// Check if there are more pages
 		if result.Cursor == nil || *result.Cursor == "" {
@@ -79,7 +79,7 @@ func (c *Client) ListRepos(ctx context.Context, endpoint string) ([]string, erro
 		cursor = result.Cursor
 	}
 
-	return allDIDs, nil
+	return allRepos, nil
 }
 
 // DescribeServer fetches com.atproto.server.describeServer

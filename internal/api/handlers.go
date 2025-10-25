@@ -366,6 +366,90 @@ func formatScans(scans []*storage.EndpointScan) []map[string]interface{} {
 	return result
 }
 
+// Get repos for a specific PDS
+func (s *Server) handleGetPDSRepos(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	endpoint := "https://" + normalizeEndpoint(vars["endpoint"])
+
+	pds, err := s.db.GetPDSDetail(r.Context(), endpoint)
+	if err != nil {
+		resp.error("PDS not found", http.StatusNotFound)
+		return
+	}
+
+	// Parse query parameters
+	activeOnly := r.URL.Query().Get("active") == "true"
+	limit := getQueryInt(r, "limit", 100)
+	offset := getQueryInt(r, "offset", 0)
+
+	// Cap limit at 1000
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	repos, err := s.db.GetPDSRepos(r.Context(), pds.ID, activeOnly, limit, offset)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Get total from latest scan (same as user_count)
+	totalRepos := 0
+	if pds.LatestScan != nil {
+		totalRepos = pds.LatestScan.UserCount
+	}
+
+	resp.json(map[string]interface{}{
+		"endpoint":    pds.Endpoint,
+		"total_repos": totalRepos,
+		"returned":    len(repos),
+		"limit":       limit,
+		"offset":      offset,
+		"repos":       repos,
+	})
+}
+
+// Find which PDS hosts a specific DID
+func (s *Server) handleGetDIDRepos(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	did := vars["did"]
+
+	repos, err := s.db.GetReposByDID(r.Context(), did)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp.json(map[string]interface{}{
+		"did":        did,
+		"pds_count":  len(repos),
+		"hosting_on": repos,
+	})
+}
+
+// Add to internal/api/handlers.go
+func (s *Server) handleGetPDSRepoStats(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	endpoint := "https://" + normalizeEndpoint(vars["endpoint"])
+
+	pds, err := s.db.GetPDSDetail(r.Context(), endpoint)
+	if err != nil {
+		resp.error("PDS not found", http.StatusNotFound)
+		return
+	}
+
+	stats, err := s.db.GetPDSRepoStats(r.Context(), pds.ID)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp.json(stats)
+}
+
 // ===== DID HANDLERS =====
 
 func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {
