@@ -1,0 +1,22 @@
+database:
+  type: "postgres"  # or "sqlite"
+  path: "postgres://atscanner:YOUR_PASSWORD@localhost:5432/atscanner?sslmode=disable"
+  # For SQLite: path: "atscan.db"
+
+plc:
+  directory_url: "https://plc.directory"
+  scan_interval: "5s"
+  bundle_dir: "./plc_bundles"
+  use_cache: true
+  index_dids: true
+
+pds:
+  scan_interval: "30m"
+  timeout: "30s"
+  workers: 20
+  recheck_interval: "1.5h"
+  scan_retention: 20
+
+api:
+  host: "0.0.0.0"
+  port: 8080

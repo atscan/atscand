@@ -78,6 +78,7 @@ type Database interface {
 	// DID operations
 	UpsertDID(ctx context.Context, did string, bundleNum int) error
 	GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error)
+	GetGlobalDIDInfo(ctx context.Context, did string) (*GlobalDIDInfo, error)
 	AddBundleDIDs(ctx context.Context, bundleNum int, dids []string) error
 	GetTotalDIDCount(ctx context.Context) (int64, error)
 

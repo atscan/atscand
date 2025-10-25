@@ -450,6 +450,114 @@ func (s *Server) handleGetPDSRepoStats(w http.ResponseWriter, r *http.Request) {
 	resp.json(stats)
 }
 
+// ===== GLOBAL DID HANDLER =====
+
+// extractHandle safely extracts the handle from a PLC operation
+func extractHandle(op *plc.PLCOperation) string {
+	if op == nil || op.Operation == nil {
+		return ""
+	}
+
+	// Get "alsoKnownAs"
+	aka, ok := op.Operation["alsoKnownAs"].([]interface{})
+	if !ok {
+		return ""
+	}
+
+	// Find the handle (e.g., "at://handle.bsky.social")
+	for _, item := range aka {
+		if handle, ok := item.(string); ok {
+			if strings.HasPrefix(handle, "at://") {
+				return strings.TrimPrefix(handle, "at://")
+			}
+		}
+	}
+	return ""
+}
+
+// extractPDS safely extracts the PDS endpoint from a PLC operation
+func extractPDS(op *plc.PLCOperation) string {
+	if op == nil || op.Operation == nil {
+		return ""
+	}
+
+	// Get "services"
+	services, ok := op.Operation["services"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	// Get "atproto_pds"
+	pdsService, ok := services["atproto_pds"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	// Get "endpoint"
+	if endpoint, ok := pdsService["endpoint"].(string); ok {
+		return endpoint
+	}
+
+	return ""
+}
+
+// handleGetGlobalDID provides a consolidated view of a DID
+func (s *Server) handleGetGlobalDID(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	did := vars["did"]
+	ctx := r.Context()
+
+	// --- 1. Get Combined DID Info (from dids and pds_repos) ---
+	didInfo, err := s.db.GetGlobalDIDInfo(ctx, did)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// Check if DID indexing is disabled (from config)
+			if !s.plcIndexDIDs {
+				resp.error("DID not found. Note: DID indexing is disabled in configuration.", http.StatusNotFound)
+			} else {
+				resp.error("DID not found in PLC index.", http.StatusNotFound)
+			}
+		} else {
+			resp.error(err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// --- 2. Get Latest PLC Operation (from plc_bundles) ---
+	var latestOperation *plc.PLCOperation
+	if len(didInfo.BundleNumbers) > 0 {
+		lastBundleNum := didInfo.BundleNumbers[len(didInfo.BundleNumbers)-1]
+		ops, err := s.bundleManager.LoadBundleOperations(ctx, lastBundleNum)
+		if err != nil {
+			log.Error("Failed to load bundle %d for DID %s: %v", lastBundleNum, did, err)
+		} else {
+			// Find latest operation for this DID (in reverse)
+			for i := len(ops) - 1; i >= 0; i-- {
+				if ops[i].DID == did {
+					latestOperation = &ops[i]
+					break
+				}
+			}
+		}
+	}
+
+	// --- 3. Extract Handle and PDS from latest operation ---
+	currentHandle := extractHandle(latestOperation)
+	currentPDS := extractPDS(latestOperation)
+
+	// --- 4. Combine and Respond ---
+	resp.json(map[string]interface{}{
+		"did":                  didInfo.DID,
+		"handle":               currentHandle, // NEW
+		"current_pds":          currentPDS,    // NEW
+		"plc_index_created_at": didInfo.CreatedAt,
+		"plc_bundle_history":   didInfo.BundleNumbers,
+		"pds_hosting_on":       didInfo.HostingOn, // This is the historical list from pds_repos
+		"latest_plc_operation": latestOperation,
+	})
+}
+
 // ===== DID HANDLERS =====
 
 func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {

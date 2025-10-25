@@ -21,6 +21,7 @@ type Server struct {
 	plcClient     *plc.Client
 	plcBundleDir  string
 	bundleManager *plc.BundleManager
+	plcIndexDIDs  bool
 }
 
 func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCConfig) *Server {
@@ -32,6 +33,7 @@ func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCCo
 		plcClient:     plc.NewClient(plcCfg.DirectoryURL),
 		plcBundleDir:  plcCfg.BundleDir,
 		bundleManager: bundleManager,
+		plcIndexDIDs:  plcCfg.IndexDIDs,
 	}
 
 	s.setupRoutes()
@@ -72,6 +74,9 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/pds/{endpoint}/repos", s.handleGetPDSRepos).Methods("GET")
 	api.HandleFunc("/pds/{endpoint}/repos/stats", s.handleGetPDSRepoStats).Methods("GET")
 	api.HandleFunc("/pds/repos/{did}", s.handleGetDIDRepos).Methods("GET")
+
+	// Global DID route
+	api.HandleFunc("/did/{did}", s.handleGetGlobalDID).Methods("GET")
 
 	// PLC Bundle routes
 	api.HandleFunc("/plc/bundles", s.handleGetPLCBundles).Methods("GET")

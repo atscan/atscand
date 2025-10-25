@@ -256,6 +256,7 @@ type VersionStats struct {
 type PDSRepo struct {
 	ID         int64     `json:"id"`
 	EndpointID int64     `json:"endpoint_id"`
+	Endpoint   string    `json:"endpoint,omitempty"`
 	DID        string    `json:"did"`
 	Head       string    `json:"head,omitempty"`
 	Rev        string    `json:"rev,omitempty"`
@@ -272,4 +273,9 @@ type PDSRepoData struct {
 	Rev    string
 	Active bool
 	Status string
+}
+
+type GlobalDIDInfo struct {
+	DIDRecord
+	HostingOn []*PDSRepo `json:"hosting_on"`
 }

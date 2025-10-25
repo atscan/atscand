@@ -1674,6 +1674,89 @@ func (p *PostgresDB) GetDIDRecord(ctx context.Context, did string) (*DIDRecord, 
 	return &record, nil
 }
 
+// GetGlobalDIDInfo retrieves consolidated DID info from 'dids' and 'pds_repos'
+func (p *PostgresDB) GetGlobalDIDInfo(ctx context.Context, did string) (*GlobalDIDInfo, error) {
+	// This query now includes a CTE to find primary endpoints and filters
+	// the 'hosting_on' aggregation to only include repos from those endpoints.
+	query := `
+		WITH primary_endpoints AS (
+		  -- First, get the ID of every "primary" PDS.
+		  -- A primary PDS is the one with the earliest 'discovered_at' timestamp
+		  -- for a given 'server_did'.
+		  SELECT DISTINCT ON (COALESCE(server_did, id::text))
+			id
+		  FROM endpoints
+		  WHERE endpoint_type = 'pds'
+		  ORDER BY COALESCE(server_did, id::text), discovered_at ASC
+		)
+		SELECT
+		  d.did,
+		  d.bundle_numbers,
+		  d.created_at,
+		  COALESCE(
+			jsonb_agg(
+			  jsonb_build_object(
+				'id', pr.id,
+				'endpoint_id', pr.endpoint_id,
+				'endpoint', e.endpoint,
+				'did', pr.did,
+				'head', pr.head,
+				'rev', pr.rev,
+				'active', pr.active,
+				'status', pr.status,
+				'first_seen', pr.first_seen AT TIME ZONE 'UTC',
+				'last_seen', pr.last_seen AT TIME ZONE 'UTC',
+				'updated_at', pr.updated_at AT TIME ZONE 'UTC'
+			  )
+			ORDER BY pr.last_seen DESC
+			) FILTER (
+				-- This filter clause ensures we only aggregate repos
+				-- where the endpoint_id is in our list of primary endpoints.
+				WHERE pr.id IS NOT NULL AND pe.id IS NOT NULL
+			),
+			'[]'::jsonb
+		  ) AS hosting_on
+		FROM
+		  dids d
+		LEFT JOIN
+		  pds_repos pr ON d.did = pr.did
+		LEFT JOIN
+		  endpoints e ON pr.endpoint_id = e.id
+		LEFT JOIN
+		  -- We join the primary_endpoints CTE. 'pe.id' will be NON-NULL
+		  -- only if the repo's endpoint_id (pr.endpoint_id) is a primary one.
+		  primary_endpoints pe ON pr.endpoint_id = pe.id
+		WHERE
+		  d.did = $1
+		GROUP BY
+		  d.did, d.bundle_numbers, d.created_at
+	`
+
+	var info GlobalDIDInfo
+	var bundleNumbersJSON []byte
+	var hostingOnJSON []byte
+
+	err := p.db.QueryRowContext(ctx, query, did).Scan(
+		&info.DID,
+		&bundleNumbersJSON,
+		&info.CreatedAt,
+		&hostingOnJSON,
+	)
+	if err != nil {
+		return nil, err // This will correctly be sql.ErrNoRows if not in 'dids'
+	}
+
+	if err := json.Unmarshal(bundleNumbersJSON, &info.BundleNumbers); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal bundle_numbers: %w", err)
+	}
+
+	if err := json.Unmarshal(hostingOnJSON, &info.HostingOn); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal hosting_on: %w", err)
+	}
+
+	return &info, nil
+}
+
 func (p *PostgresDB) AddBundleDIDs(ctx context.Context, bundleNum int, dids []string) error {
 	if len(dids) == 0 {
 		return nil
