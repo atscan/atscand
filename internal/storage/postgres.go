@@ -2337,3 +2337,101 @@ func (p *PostgresDB) GetPDSRepoStats(ctx context.Context, endpointID int64) (map
 		"recent_changes":    recentChanges,
 	}, nil
 }
+
+// GetTableSizes fetches size information (in bytes) for all tables in the specified schema.
+func (p *PostgresDB) GetTableSizes(ctx context.Context, schema string) ([]TableSizeInfo, error) {
+	// Query now selects raw byte values directly
+	query := `
+		SELECT
+			c.relname AS table_name,
+			pg_total_relation_size(c.oid) AS total_bytes,
+			pg_relation_size(c.oid) AS table_heap_bytes,
+			pg_indexes_size(c.oid) AS indexes_bytes
+		FROM
+			pg_class c
+		LEFT JOIN
+			pg_namespace n ON n.oid = c.relnamespace
+		WHERE
+			c.relkind = 'r' -- 'r' = ordinary table
+			AND n.nspname = $1
+		ORDER BY
+			total_bytes DESC;
+	`
+	rows, err := p.db.QueryContext(ctx, query, schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query table sizes: %w", err)
+	}
+	defer rows.Close()
+
+	var results []TableSizeInfo
+	for rows.Next() {
+		var info TableSizeInfo
+		// Scan directly into int64 fields
+		if err := rows.Scan(
+			&info.TableName,
+			&info.TotalBytes,
+			&info.TableHeapBytes,
+			&info.IndexesBytes,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan table size row: %w", err)
+		}
+		results = append(results, info)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating table size rows: %w", err)
+	}
+
+	return results, nil
+}
+
+// GetIndexSizes fetches size information (in bytes) for all indexes in the specified schema.
+func (p *PostgresDB) GetIndexSizes(ctx context.Context, schema string) ([]IndexSizeInfo, error) {
+	// Query now selects raw byte values directly
+	query := `
+		SELECT
+			c.relname AS index_name,
+			COALESCE(i.indrelid::regclass::text, 'N/A') AS table_name,
+			pg_relation_size(c.oid) AS index_bytes
+		FROM
+			pg_class c
+		LEFT JOIN
+			pg_index i ON i.indexrelid = c.oid
+		LEFT JOIN
+			pg_namespace n ON n.oid = c.relnamespace
+		WHERE
+			c.relkind = 'i' -- 'i' = index
+			AND n.nspname = $1
+		ORDER BY
+			index_bytes DESC;
+	`
+	rows, err := p.db.QueryContext(ctx, query, schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query index sizes: %w", err)
+	}
+	defer rows.Close()
+
+	var results []IndexSizeInfo
+	for rows.Next() {
+		var info IndexSizeInfo
+		var tableName sql.NullString
+		// Scan directly into int64 field
+		if err := rows.Scan(
+			&info.IndexName,
+			&tableName,
+			&info.IndexBytes,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan index size row: %w", err)
+		}
+		if tableName.Valid {
+			info.TableName = tableName.String
+		} else {
+			info.TableName = "N/A"
+		}
+		results = append(results, info)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating index size rows: %w", err)
+	}
+
+	return results, nil
+}

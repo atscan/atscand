@@ -87,4 +87,8 @@ type Database interface {
 	GetPDSRepos(ctx context.Context, endpointID int64, activeOnly bool, limit int, offset int) ([]*PDSRepo, error) // Updated
 	GetReposByDID(ctx context.Context, did string) ([]*PDSRepo, error)
 	GetPDSRepoStats(ctx context.Context, endpointID int64) (map[string]interface{}, error)
+
+	// Internal
+	GetTableSizes(ctx context.Context, schema string) ([]TableSizeInfo, error)
+	GetIndexSizes(ctx context.Context, schema string) ([]IndexSizeInfo, error)
 }

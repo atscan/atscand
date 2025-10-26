@@ -105,7 +105,8 @@ func (s *Server) setupRoutes() {
 	// Metrics routes
 	api.HandleFunc("/metrics/plc", s.handleGetPLCMetrics).Methods("GET")
 
-	// Job status endpoint
+	// Debug Endpoints
+	api.HandleFunc("/debug/db/sizes", s.handleGetDBSizes).Methods("GET")
 	api.HandleFunc("/jobs", s.handleGetJobStatus).Methods("GET")
 
 	// Health check

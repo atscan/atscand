@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -170,8 +171,17 @@ type ScanCursor struct {
 // DIDRecord represents a DID entry in the database
 type DIDRecord struct {
 	DID           string    `json:"did"`
+	Handle        string    `json:"handle,omitempty"`
+	CurrentPDS    string    `json:"current_pds,omitempty"`
+	LastOpAt      time.Time `json:"last_op_at,omitempty"`
 	BundleNumbers []int     `json:"bundle_numbers"`
 	CreatedAt     time.Time `json:"created_at"`
+}
+
+// GlobalDIDInfo consolidates DID data from PLC and PDS tables
+type GlobalDIDInfo struct {
+	DIDRecord            // Embeds all fields: DID, Handle, CurrentPDS, etc.
+	HostingOn []*PDSRepo `json:"hosting_on"`
 }
 
 // IPInfo represents IP information (stored with IP as primary key)
@@ -275,7 +285,29 @@ type PDSRepoData struct {
 	Status string
 }
 
-type GlobalDIDInfo struct {
-	DIDRecord
-	HostingOn []*PDSRepo `json:"hosting_on"`
+type DIDBackfillInfo struct {
+	DID           string
+	LastBundleNum int
+}
+
+type DIDStateUpdateData struct {
+	DID    string
+	Handle sql.NullString // Use sql.NullString for potential NULLs
+	PDS    sql.NullString
+	OpTime time.Time
+}
+
+// TableSizeInfo holds size information for a database table.
+type TableSizeInfo struct {
+	TableName      string `json:"table_name"`
+	TotalBytes     int64  `json:"total_bytes"`      // Raw bytes
+	TableHeapBytes int64  `json:"table_heap_bytes"` // Raw bytes
+	IndexesBytes   int64  `json:"indexes_bytes"`    // Raw bytes
+}
+
+// IndexSizeInfo holds size information for a database index.
+type IndexSizeInfo struct {
+	IndexName  string `json:"index_name"`
+	TableName  string `json:"table_name"`
+	IndexBytes int64  `json:"index_bytes"` // Raw bytes
 }

@@ -333,6 +333,12 @@ func formatScans(scans []*storage.EndpointScan) []map[string]interface{} {
 			"scanned_at": scan.ScannedAt,
 		}
 
+		if scan.Status != storage.EndpointStatusOnline && scan.ScanData != nil && scan.ScanData.Metadata != nil {
+			if errorMsg, ok := scan.ScanData.Metadata["error"].(string); ok && errorMsg != "" {
+				scanMap["error"] = errorMsg
+			}
+		}
+
 		if scan.ResponseTime > 0 {
 			scanMap["response_time"] = scan.ResponseTime
 		}
@@ -1637,6 +1643,35 @@ func (s *Server) handleGetPLCHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp.json(result)
+}
+
+// ===== DEBUG HANDLERS =====
+
+func (s *Server) handleGetDBSizes(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	ctx := r.Context()
+	schema := "public" // Or make configurable if needed
+
+	tableSizes, err := s.db.GetTableSizes(ctx, schema)
+	if err != nil {
+		log.Error("Failed to get table sizes: %v", err)
+		resp.error("Failed to retrieve table sizes", http.StatusInternalServerError)
+		return
+	}
+
+	indexSizes, err := s.db.GetIndexSizes(ctx, schema)
+	if err != nil {
+		log.Error("Failed to get index sizes: %v", err)
+		resp.error("Failed to retrieve index sizes", http.StatusInternalServerError)
+		return
+	}
+
+	resp.json(map[string]interface{}{
+		"schema":      schema,
+		"tables":      tableSizes,
+		"indexes":     indexSizes,
+		"retrievedAt": time.Now().UTC(),
+	})
 }
 
 // ===== UTILITY FUNCTIONS =====
