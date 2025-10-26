@@ -185,15 +185,20 @@ func (p *PostgresDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_mempool_did ON plc_mempool(did);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_mempool_cid ON plc_mempool(cid);
 
-    -- Minimal dids table
-    CREATE TABLE IF NOT EXISTS dids (
-        did TEXT PRIMARY KEY,
-        bundle_numbers JSONB NOT NULL DEFAULT '[]'::jsonb,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
+	-- Minimal dids table
+	CREATE TABLE IF NOT EXISTS dids (
+		did TEXT PRIMARY KEY,
+		handle TEXT,
+		pds TEXT,
+		bundle_numbers JSONB NOT NULL DEFAULT '[]'::jsonb,
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
 
-    CREATE INDEX IF NOT EXISTS idx_dids_bundle_numbers ON dids USING gin(bundle_numbers);
-    CREATE INDEX IF NOT EXISTS idx_dids_created_at ON dids(created_at);
+	CREATE INDEX IF NOT EXISTS idx_dids_bundle_numbers ON dids USING gin(bundle_numbers);
+	CREATE INDEX IF NOT EXISTS idx_dids_created_at ON dids(created_at);
+	CREATE INDEX IF NOT EXISTS idx_dids_handle ON dids(handle);
+	CREATE INDEX IF NOT EXISTS idx_dids_pds ON dids(pds);
 
 	-- PDS Repositories table
     CREATE TABLE IF NOT EXISTS pds_repos (
@@ -1634,37 +1639,64 @@ func (p *PostgresDB) GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetric
 
 // ===== DID OPERATIONS =====
 
-func (p *PostgresDB) UpsertDID(ctx context.Context, did string, bundleNum int) error {
+func (p *PostgresDB) UpsertDID(ctx context.Context, did string, bundleNum int, handle, pds string) error {
 	query := `
-		INSERT INTO dids (did, bundle_numbers, created_at)
-		VALUES ($1, jsonb_build_array($2), CURRENT_TIMESTAMP)
+		INSERT INTO dids (did, handle, pds, bundle_numbers, created_at)
+		VALUES ($1, $2, $3, jsonb_build_array($4::integer), CURRENT_TIMESTAMP)
 		ON CONFLICT(did) DO UPDATE SET
+			handle = EXCLUDED.handle,
+			pds = EXCLUDED.pds,
 			bundle_numbers = CASE 
-				WHEN dids.bundle_numbers ? $2::text THEN dids.bundle_numbers
-				ELSE dids.bundle_numbers || jsonb_build_array($2)
-			END
+				WHEN dids.bundle_numbers @> jsonb_build_array($4::integer) THEN dids.bundle_numbers
+				ELSE dids.bundle_numbers || jsonb_build_array($4::integer)
+			END,
+			updated_at = CURRENT_TIMESTAMP
 	`
-	_, err := p.db.ExecContext(ctx, query, did, bundleNum)
+	_, err := p.db.ExecContext(ctx, query, did, handle, pds, bundleNum)
+	return err
+}
+
+// UpsertDIDFromMempool creates/updates DID record without adding to bundle_numbers
+func (p *PostgresDB) UpsertDIDFromMempool(ctx context.Context, did string, handle, pds string) error {
+	query := `
+		INSERT INTO dids (did, handle, pds, bundle_numbers, created_at)
+		VALUES ($1, $2, $3, '[]'::jsonb, CURRENT_TIMESTAMP)
+		ON CONFLICT(did) DO UPDATE SET
+			handle = EXCLUDED.handle,
+			pds = EXCLUDED.pds,
+			updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := p.db.ExecContext(ctx, query, did, handle, pds)
 	return err
 }
 
 func (p *PostgresDB) GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error) {
 	query := `
-		SELECT did, bundle_numbers, created_at
+		SELECT did, handle, pds, bundle_numbers, created_at
 		FROM dids
 		WHERE did = $1
 	`
 
 	var record DIDRecord
 	var bundleNumbersJSON []byte
+	var handle, pds sql.NullString
 
 	err := p.db.QueryRowContext(ctx, query, did).Scan(
 		&record.DID,
+		&handle,
+		&pds,
 		&bundleNumbersJSON,
 		&record.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	if handle.Valid {
+		record.Handle = handle.String
+	}
+	if pds.Valid {
+		record.CurrentPDS = pds.String
 	}
 
 	if err := json.Unmarshal(bundleNumbersJSON, &record.BundleNumbers); err != nil {
@@ -1676,13 +1708,8 @@ func (p *PostgresDB) GetDIDRecord(ctx context.Context, did string) (*DIDRecord, 
 
 // GetGlobalDIDInfo retrieves consolidated DID info from 'dids' and 'pds_repos'
 func (p *PostgresDB) GetGlobalDIDInfo(ctx context.Context, did string) (*GlobalDIDInfo, error) {
-	// This query now includes a CTE to find primary endpoints and filters
-	// the 'hosting_on' aggregation to only include repos from those endpoints.
 	query := `
 		WITH primary_endpoints AS (
-		  -- First, get the ID of every "primary" PDS.
-		  -- A primary PDS is the one with the earliest 'discovered_at' timestamp
-		  -- for a given 'server_did'.
 		  SELECT DISTINCT ON (COALESCE(server_did, id::text))
 			id
 		  FROM endpoints
@@ -1691,6 +1718,8 @@ func (p *PostgresDB) GetGlobalDIDInfo(ctx context.Context, did string) (*GlobalD
 		)
 		SELECT
 		  d.did,
+		  d.handle,
+		  d.pds,
 		  d.bundle_numbers,
 		  d.created_at,
 		  COALESCE(
@@ -1710,8 +1739,6 @@ func (p *PostgresDB) GetGlobalDIDInfo(ctx context.Context, did string) (*GlobalD
 			  )
 			ORDER BY pr.last_seen DESC
 			) FILTER (
-				-- This filter clause ensures we only aggregate repos
-				-- where the endpoint_id is in our list of primary endpoints.
 				WHERE pr.id IS NOT NULL AND pe.id IS NOT NULL
 			),
 			'[]'::jsonb
@@ -1723,27 +1750,35 @@ func (p *PostgresDB) GetGlobalDIDInfo(ctx context.Context, did string) (*GlobalD
 		LEFT JOIN
 		  endpoints e ON pr.endpoint_id = e.id
 		LEFT JOIN
-		  -- We join the primary_endpoints CTE. 'pe.id' will be NON-NULL
-		  -- only if the repo's endpoint_id (pr.endpoint_id) is a primary one.
 		  primary_endpoints pe ON pr.endpoint_id = pe.id
 		WHERE
 		  d.did = $1
 		GROUP BY
-		  d.did, d.bundle_numbers, d.created_at
+		  d.did, d.handle, d.pds, d.bundle_numbers, d.created_at
 	`
 
 	var info GlobalDIDInfo
 	var bundleNumbersJSON []byte
 	var hostingOnJSON []byte
+	var handle, pds sql.NullString
 
 	err := p.db.QueryRowContext(ctx, query, did).Scan(
 		&info.DID,
+		&handle,
+		&pds,
 		&bundleNumbersJSON,
 		&info.CreatedAt,
 		&hostingOnJSON,
 	)
 	if err != nil {
-		return nil, err // This will correctly be sql.ErrNoRows if not in 'dids'
+		return nil, err
+	}
+
+	if handle.Valid {
+		info.Handle = handle.String
+	}
+	if pds.Valid {
+		info.CurrentPDS = pds.String
 	}
 
 	if err := json.Unmarshal(bundleNumbersJSON, &info.BundleNumbers); err != nil {

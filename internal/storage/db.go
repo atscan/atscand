@@ -75,8 +75,9 @@ type Database interface {
 	GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetrics, error)
 	GetEndpointStats(ctx context.Context) (*EndpointStats, error)
 
-	// DID operations
-	UpsertDID(ctx context.Context, did string, bundleNum int) error
+	// DID operations - UPDATED SIGNATURES
+	UpsertDID(ctx context.Context, did string, bundleNum int, handle, pds string) error
+	UpsertDIDFromMempool(ctx context.Context, did string, handle, pds string) error
 	GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error)
 	GetGlobalDIDInfo(ctx context.Context, did string) (*GlobalDIDInfo, error)
 	AddBundleDIDs(ctx context.Context, bundleNum int, dids []string) error
@@ -84,7 +85,7 @@ type Database interface {
 
 	// PDS Repo operations
 	UpsertPDSRepos(ctx context.Context, endpointID int64, repos []PDSRepoData) error
-	GetPDSRepos(ctx context.Context, endpointID int64, activeOnly bool, limit int, offset int) ([]*PDSRepo, error) // Updated
+	GetPDSRepos(ctx context.Context, endpointID int64, activeOnly bool, limit int, offset int) ([]*PDSRepo, error)
 	GetReposByDID(ctx context.Context, did string) ([]*PDSRepo, error)
 	GetPDSRepoStats(ctx context.Context, endpointID int64) (map[string]interface{}, error)
 

@@ -332,6 +332,22 @@ func (s *Scanner) addToMempool(ctx context.Context, ops []PLCOperation, counts m
 		return err
 	}
 
+	// NEW: Create/update DID records immediately when adding to mempool
+	for _, op := range ops {
+		info := ExtractDIDInfo(&op)
+
+		// Validate handle length before saving
+		validHandle := ValidateHandle(info.Handle)
+		if info.Handle != "" && validHandle == "" {
+			log.Verbose("Skipping invalid handle for DID %s (length: %d)", op.DID, len(info.Handle))
+		}
+
+		if err := s.db.UpsertDIDFromMempool(ctx, op.DID, validHandle, info.PDS); err != nil {
+			log.Error("Failed to upsert DID %s in mempool: %v", op.DID, err)
+			// Don't fail the whole operation, just log
+		}
+	}
+
 	// Process for endpoint discovery
 	batchCounts, err := s.processBatch(ctx, ops)
 	s.mergeCounts(counts, batchCounts)

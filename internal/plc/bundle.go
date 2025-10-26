@@ -380,10 +380,24 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 	// NEW: Only index DIDs if enabled
 	if bm.indexDIDs {
 		start := time.Now()
+
+		// Extract handle and PDS for each DID using centralized helper
+		didInfoMap := ExtractDIDInfoMap(bf.operations)
+
 		if err := bm.db.AddBundleDIDs(ctx, bundleNum, dids); err != nil {
 			log.Error("Failed to index DIDs for bundle %06d: %v", bundleNum, err)
 			// Don't return error - bundle is already created
 		} else {
+			// Update handle and PDS for each DID
+			for did, info := range didInfoMap {
+				// Validate handle length before saving
+				validHandle := ValidateHandle(info.Handle)
+
+				if err := bm.db.UpsertDID(ctx, did, bundleNum, validHandle, info.PDS); err != nil {
+					log.Error("Failed to update DID %s metadata: %v", did, err)
+				}
+			}
+
 			elapsed := time.Since(start)
 			log.Verbose("✓ Indexed %d unique DIDs for bundle %06d in %v", len(dids), bundleNum, elapsed)
 		}
