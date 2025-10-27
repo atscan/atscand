@@ -1,9 +1,16 @@
 package plc
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // MaxHandleLength is the maximum allowed handle length for database storage
 const MaxHandleLength = 500
+
+// Handle validation regex per AT Protocol spec
+// Ensures proper domain format: alphanumeric labels separated by dots, TLD starts with letter
+var handleRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 
 // ExtractHandle safely extracts the handle from a PLC operation
 func ExtractHandle(op *PLCOperation) string {
@@ -29,11 +36,22 @@ func ExtractHandle(op *PLCOperation) string {
 }
 
 // ValidateHandle checks if a handle is valid for database storage
-// Returns empty string if handle is too long
+// Returns empty string if handle is invalid (too long or wrong format)
 func ValidateHandle(handle string) string {
+	if handle == "" {
+		return ""
+	}
+
+	// Check length first (faster)
 	if len(handle) > MaxHandleLength {
 		return ""
 	}
+
+	// Validate format using regex
+	if !handleRegex.MatchString(handle) {
+		return ""
+	}
+
 	return handle
 }
 

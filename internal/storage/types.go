@@ -217,11 +217,12 @@ type PDSListItem struct {
 	// From endpoints table
 	ID           int64
 	Endpoint     string
-	ServerDID    string // NEW: Add this
+	ServerDID    string
 	DiscoveredAt time.Time
 	LastChecked  time.Time
 	Status       int
 	IP           string
+	IPv6         string // NEW
 
 	// From latest endpoint_scans (via JOIN)
 	LatestScan *struct {

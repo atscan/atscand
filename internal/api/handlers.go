@@ -103,16 +103,15 @@ func formatEndpointResponse(ep *storage.Endpoint) map[string]interface{} {
 		"discovered_at": ep.DiscoveredAt,
 		"last_checked":  ep.LastChecked,
 		"status":        statusToString(ep.Status),
-		// REMOVED: "user_count": ep.UserCount,  // No longer exists
 	}
 
-	// Add IP if available
+	// Add IPs if available
 	if ep.IP != "" {
 		response["ip"] = ep.IP
 	}
-
-	// REMOVED: IP info extraction - no longer in Endpoint struct
-	// IPInfo is now in separate table, joined only in PDS handlers
+	if ep.IPv6 != "" {
+		response["ipv6"] = ep.IPv6
+	}
 
 	return response
 }
@@ -257,9 +256,12 @@ func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
 		}
 	}
 
-	// Add IP if available
+	// Add IPs if available
 	if pds.IP != "" {
 		response["ip"] = pds.IP
+	}
+	if pds.IPv6 != "" {
+		response["ipv6"] = pds.IPv6
 	}
 
 	// Add IP info (from ip_infos table via JOIN)

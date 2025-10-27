@@ -73,29 +73,29 @@ func (p *PostgresDB) Migrate() error {
 	log.Info("Running database migrations...")
 
 	schema := `
-	-- Endpoints table (NO user_count, NO ip_info)
-	CREATE TABLE IF NOT EXISTS endpoints (
-		id BIGSERIAL PRIMARY KEY,
-		endpoint_type TEXT NOT NULL DEFAULT 'pds',
-		endpoint TEXT NOT NULL,
-		server_did TEXT,
-		discovered_at TIMESTAMP NOT NULL,
-		last_checked TIMESTAMP,
-		status INTEGER DEFAULT 0,
-		ip TEXT,
-		ipv6 TEXT,
-		ip_resolved_at TIMESTAMP,
-		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		UNIQUE(endpoint_type, endpoint)
-	);
+    -- Endpoints table (with IPv6 support)
+    CREATE TABLE IF NOT EXISTS endpoints (
+        id BIGSERIAL PRIMARY KEY,
+        endpoint_type TEXT NOT NULL DEFAULT 'pds',
+        endpoint TEXT NOT NULL,
+        server_did TEXT,
+        discovered_at TIMESTAMP NOT NULL,
+        last_checked TIMESTAMP,
+        status INTEGER DEFAULT 0,
+        ip TEXT,
+        ipv6 TEXT,
+        ip_resolved_at TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(endpoint_type, endpoint)
+    );
 
-	CREATE INDEX IF NOT EXISTS idx_endpoints_type_endpoint ON endpoints(endpoint_type, endpoint);
-	CREATE INDEX IF NOT EXISTS idx_endpoints_status ON endpoints(status);
-	CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
-	CREATE INDEX IF NOT EXISTS idx_endpoints_ip ON endpoints(ip);
-	CREATE INDEX IF NOT EXISTS idx_endpoints_ipv6 ON endpoints(ipv6);
-	CREATE INDEX IF NOT EXISTS idx_endpoints_server_did ON endpoints(server_did);
-	CREATE INDEX IF NOT EXISTS idx_endpoints_server_did_type_discovered ON endpoints(server_did, endpoint_type, discovered_at);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_type_endpoint ON endpoints(endpoint_type, endpoint);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_status ON endpoints(status);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_ip ON endpoints(ip);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_ipv6 ON endpoints(ipv6);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_server_did ON endpoints(server_did);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_server_did_type_discovered ON endpoints(server_did, endpoint_type, discovered_at);
 
 	-- IP infos table (IP as PRIMARY KEY)
 	CREATE TABLE IF NOT EXISTS ip_infos (
@@ -590,13 +590,14 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 				discovered_at,
 				last_checked,
 				status,
-				ip
+				ip,
+				ipv6
 			FROM endpoints
 			WHERE endpoint_type = 'pds'
 			ORDER BY COALESCE(server_did, id::text), discovered_at ASC
 		)
 		SELECT 
-			e.id, e.endpoint, e.server_did, e.discovered_at, e.last_checked, e.status, e.ip,
+			e.id, e.endpoint, e.server_did, e.discovered_at, e.last_checked, e.status, e.ip, e.ipv6,
 			latest.user_count, latest.response_time, latest.version, latest.scanned_at,
 			i.city, i.country, i.country_code, i.asn, i.asn_org,
 			i.is_datacenter, i.is_vpn, i.is_crawler, i.is_tor, i.is_proxy,
@@ -657,7 +658,7 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 	var items []*PDSListItem
 	for rows.Next() {
 		item := &PDSListItem{}
-		var ip, serverDID, city, country, countryCode, asnOrg sql.NullString
+		var ip, ipv6, serverDID, city, country, countryCode, asnOrg sql.NullString
 		var asn sql.NullInt32
 		var isDatacenter, isVPN, isCrawler, isTor, isProxy sql.NullBool
 		var lat, lon sql.NullFloat64
@@ -667,7 +668,7 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 		var scannedAt sql.NullTime
 
 		err := rows.Scan(
-			&item.ID, &item.Endpoint, &serverDID, &item.DiscoveredAt, &item.LastChecked, &item.Status, &ip,
+			&item.ID, &item.Endpoint, &serverDID, &item.DiscoveredAt, &item.LastChecked, &item.Status, &ip, &ipv6,
 			&userCount, &responseTime, &version, &scannedAt,
 			&city, &country, &countryCode, &asn, &asnOrg,
 			&isDatacenter, &isVPN, &isCrawler, &isTor, &isProxy,
@@ -679,6 +680,9 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 
 		if ip.Valid {
 			item.IP = ip.String
+		}
+		if ipv6.Valid {
+			item.IPv6 = ipv6.String
 		}
 		if serverDID.Valid {
 			item.ServerDID = serverDID.String
@@ -734,7 +738,8 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 				e.discovered_at, 
 				e.last_checked, 
 				e.status, 
-				e.ip
+				e.ip,
+				e.ipv6
 			FROM endpoints e
 			WHERE e.endpoint = $1 AND e.endpoint_type = 'pds'
 		),
@@ -757,6 +762,7 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 			te.last_checked, 
 			te.status, 
 			te.ip,
+			te.ipv6,
 			latest.user_count,
 			latest.response_time,
 			latest.version,
@@ -781,7 +787,7 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 	`
 
 	detail := &PDSDetail{}
-	var ip, city, country, countryCode, asnOrg, serverDID sql.NullString
+	var ip, ipv6, city, country, countryCode, asnOrg, serverDID sql.NullString
 	var asn sql.NullInt32
 	var isDatacenter, isVPN, isCrawler, isTor, isProxy sql.NullBool
 	var lat, lon sql.NullFloat64
@@ -795,7 +801,7 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 	var firstDiscoveredAt sql.NullTime
 
 	err := p.db.QueryRowContext(ctx, query, endpoint).Scan(
-		&detail.ID, &detail.Endpoint, &serverDID, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip,
+		&detail.ID, &detail.Endpoint, &serverDID, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip, &ipv6,
 		&userCount, &responseTime, &version, &serverInfoJSON, &scannedAt,
 		&city, &country, &countryCode, &asn, &asnOrg,
 		&isDatacenter, &isVPN, &isCrawler, &isTor, &isProxy,
@@ -810,6 +816,9 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 
 	if ip.Valid {
 		detail.IP = ip.String
+	}
+	if ipv6.Valid {
+		detail.IPv6 = ipv6.String
 	}
 
 	if serverDID.Valid {
