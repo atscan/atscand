@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 )
@@ -112,25 +113,54 @@ func (c *Client) DescribeServer(ctx context.Context, endpoint string) (*ServerDe
 }
 
 // CheckHealth performs a basic health check, ensuring the endpoint returns JSON with a "version"
-func (c *Client) CheckHealth(ctx context.Context, endpoint string) (bool, time.Duration, string, error) {
+// Returns: available, responseTime, version, usedIP, error
+func (c *Client) CheckHealth(ctx context.Context, endpoint string) (bool, time.Duration, string, string, error) {
 	startTime := time.Now()
 
 	url := fmt.Sprintf("%s/xrpc/_health", endpoint)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return false, 0, "", err
+		return false, 0, "", "", err
 	}
 
-	resp, err := c.httpClient.Do(req)
+	// Create a custom dialer to track which IP was actually used
+	var usedIP string
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext(ctx, network, addr)
+
+			if err == nil && conn != nil {
+				if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
+					// Extract IP from "ip:port" format
+					if tcpAddr, ok := remoteAddr.(*net.TCPAddr); ok {
+						usedIP = tcpAddr.IP.String()
+					}
+				}
+			}
+
+			return conn, err
+		},
+	}
+
+	// Create a client with our custom transport
+	client := &http.Client{
+		Timeout:   c.httpClient.Timeout,
+		Transport: transport,
+	}
+
+	resp, err := client.Do(req)
 	duration := time.Since(startTime)
 
 	if err != nil {
-		return false, duration, "", err
+		return false, duration, "", usedIP, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return false, duration, "", fmt.Errorf("health check returned status %d", resp.StatusCode)
+		return false, duration, "", usedIP, fmt.Errorf("health check returned status %d", resp.StatusCode)
 	}
 
 	// Decode the JSON response and check for "version"
@@ -139,13 +169,13 @@ func (c *Client) CheckHealth(ctx context.Context, endpoint string) (bool, time.D
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&healthResponse); err != nil {
-		return false, duration, "", fmt.Errorf("failed to decode health JSON: %w", err)
+		return false, duration, "", usedIP, fmt.Errorf("failed to decode health JSON: %w", err)
 	}
 
 	if healthResponse.Version == "" {
-		return false, duration, "", fmt.Errorf("health JSON response missing 'version' field")
+		return false, duration, "", usedIP, fmt.Errorf("health JSON response missing 'version' field")
 	}
 
 	// All checks passed
-	return true, duration, healthResponse.Version, nil
+	return true, duration, healthResponse.Version, usedIP, nil
 }

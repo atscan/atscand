@@ -358,9 +358,12 @@ func formatScans(scans []*storage.EndpointScan) []map[string]interface{} {
 			scanMap["response_time"] = scan.ResponseTime
 		}
 
-		// NEW: Add version if available
 		if scan.Version != "" {
 			scanMap["version"] = scan.Version
+		}
+
+		if scan.UsedIP != "" {
+			scanMap["used_ip"] = scan.UsedIP
 		}
 
 		// Use the top-level UserCount field first

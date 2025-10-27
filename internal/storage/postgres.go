@@ -120,7 +120,7 @@ func (p *PostgresDB) Migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_ip_infos_country_code ON ip_infos(country_code);
 	CREATE INDEX IF NOT EXISTS idx_ip_infos_asn ON ip_infos(asn);
 
-    -- Endpoint scans (renamed from pds_scans)
+    -- Endpoint scans
 	CREATE TABLE IF NOT EXISTS endpoint_scans (
 		id BIGSERIAL PRIMARY KEY,
 		endpoint_id BIGINT NOT NULL,
@@ -128,6 +128,7 @@ func (p *PostgresDB) Migrate() error {
 		response_time DOUBLE PRECISION,
 		user_count BIGINT,
 		version TEXT,
+		used_ip TEXT,
 		scan_data JSONB,
 		scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (endpoint_id) REFERENCES endpoints(id) ON DELETE CASCADE
@@ -136,6 +137,8 @@ func (p *PostgresDB) Migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_endpoint_scans_endpoint_status_scanned ON endpoint_scans(endpoint_id, status, scanned_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_endpoint_scans_scanned_at ON endpoint_scans(scanned_at);
 	CREATE INDEX IF NOT EXISTS idx_endpoint_scans_user_count ON endpoint_scans(user_count DESC NULLS LAST);
+	CREATE INDEX IF NOT EXISTS idx_endpoint_scans_used_ip ON endpoint_scans(used_ip);
+
 
 	CREATE TABLE IF NOT EXISTS plc_metrics (
         id BIGSERIAL PRIMARY KEY,
@@ -490,10 +493,10 @@ func (p *PostgresDB) SaveEndpointScan(ctx context.Context, scan *EndpointScan) e
 	defer tx.Rollback()
 
 	query := `
-		INSERT INTO endpoint_scans (endpoint_id, status, response_time, user_count, version, scan_data, scanned_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO endpoint_scans (endpoint_id, status, response_time, user_count, version, used_ip, scan_data, scanned_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
-	_, err = tx.ExecContext(ctx, query, scan.EndpointID, scan.Status, scan.ResponseTime, scan.UserCount, scan.Version, scanDataJSON, scan.ScannedAt)
+	_, err = tx.ExecContext(ctx, query, scan.EndpointID, scan.Status, scan.ResponseTime, scan.UserCount, scan.Version, scan.UsedIP, scanDataJSON, scan.ScannedAt)
 	if err != nil {
 		return err
 	}
@@ -520,7 +523,7 @@ func (p *PostgresDB) SaveEndpointScan(ctx context.Context, scan *EndpointScan) e
 
 func (p *PostgresDB) GetEndpointScans(ctx context.Context, endpointID int64, limit int) ([]*EndpointScan, error) {
 	query := `
-        SELECT id, endpoint_id, status, response_time, user_count, version, scan_data, scanned_at
+        SELECT id, endpoint_id, status, response_time, user_count, version, used_ip, scan_data, scanned_at
         FROM endpoint_scans
         WHERE endpoint_id = $1
         ORDER BY scanned_at DESC
@@ -538,10 +541,10 @@ func (p *PostgresDB) GetEndpointScans(ctx context.Context, endpointID int64, lim
 		var scan EndpointScan
 		var responseTime sql.NullFloat64
 		var userCount sql.NullInt64
-		var version sql.NullString // NEW
+		var version, usedIP sql.NullString
 		var scanDataJSON []byte
 
-		err := rows.Scan(&scan.ID, &scan.EndpointID, &scan.Status, &responseTime, &userCount, &version, &scanDataJSON, &scan.ScannedAt)
+		err := rows.Scan(&scan.ID, &scan.EndpointID, &scan.Status, &responseTime, &userCount, &version, &usedIP, &scanDataJSON, &scan.ScannedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -554,8 +557,12 @@ func (p *PostgresDB) GetEndpointScans(ctx context.Context, endpointID int64, lim
 			scan.UserCount = userCount.Int64
 		}
 
-		if version.Valid { // NEW
+		if version.Valid {
 			scan.Version = version.String
+		}
+
+		if usedIP.Valid {
+			scan.UsedIP = usedIP.String
 		}
 
 		if len(scanDataJSON) > 0 {

@@ -146,8 +146,8 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 		go s.updateIPInfoIfNeeded(ctx, ips.IPv6)
 	}
 
-	// STEP 2: Health check (rest remains the same)
-	available, responseTime, version, err := s.client.CheckHealth(ctx, ep.Endpoint)
+	// STEP 2: Health check (now returns which IP was used)
+	available, responseTime, version, usedIP, err := s.client.CheckHealth(ctx, ep.Endpoint)
 	if err != nil || !available {
 		errMsg := "health check failed"
 		if err != nil {
@@ -157,6 +157,7 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 			Status:       storage.EndpointStatusOffline,
 			ResponseTime: responseTime,
 			ErrorMessage: errMsg,
+			UsedIP:       usedIP, // Save even if failed
 		})
 		return
 	}
@@ -189,6 +190,7 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 		Description:  desc,
 		DIDs:         dids,
 		Version:      version,
+		UsedIP:       usedIP, // NEW: Save which IP was used
 	})
 
 	// Save repos in batches (only tracks changes)
@@ -245,12 +247,12 @@ func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *
 		Metadata: make(map[string]interface{}),
 	}
 
-	var userCount int64 // NEW: Declare user count
+	var userCount int64
 
 	// Add PDS-specific metadata
 	if result.Status == storage.EndpointStatusOnline {
-		userCount = int64(len(result.DIDs))         // NEW: Get user count
-		scanData.Metadata["user_count"] = userCount // Keep in JSON for completeness
+		userCount = int64(len(result.DIDs))
+		scanData.Metadata["user_count"] = userCount
 		if result.Description != nil {
 			scanData.Metadata["server_info"] = result.Description
 		}
@@ -267,7 +269,8 @@ func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *
 		Status:       result.Status,
 		ResponseTime: result.ResponseTime.Seconds() * 1000, // Convert to ms
 		UserCount:    userCount,
-		Version:      result.Version, // NEW: Set the version field
+		Version:      result.Version,
+		UsedIP:       result.UsedIP, // NEW
 		ScanData:     scanData,
 		ScannedAt:    time.Now().UTC(),
 	}

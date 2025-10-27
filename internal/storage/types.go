@@ -54,7 +54,8 @@ type EndpointScan struct {
 	Status       int
 	ResponseTime float64
 	UserCount    int64
-	Version      string // NEW: Add this field
+	Version      string
+	UsedIP       string // NEW: Track which IP was actually used
 	ScanData     *EndpointScanData
 	ScannedAt    time.Time
 }
