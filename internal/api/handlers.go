@@ -515,6 +515,37 @@ func (s *Server) handleGetGlobalDID(w http.ResponseWriter, r *http.Request) {
 	resp.json(result)
 }
 
+// handleGetDIDByHandle resolves a handle to a DID
+func (s *Server) handleGetDIDByHandle(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+	vars := mux.Vars(r)
+	handle := vars["handle"]
+
+	// Normalize handle (remove @ prefix if present)
+	handle = strings.TrimPrefix(handle, "@")
+
+	// Look up DID by handle
+	didRecord, err := s.db.GetDIDByHandle(r.Context(), handle)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			if !s.plcIndexDIDs {
+				resp.error("Handle not found. Note: DID indexing is disabled in configuration.", http.StatusNotFound)
+			} else {
+				resp.error("Handle not found.", http.StatusNotFound)
+			}
+		} else {
+			resp.error(err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Return just the handle and DID
+	resp.json(map[string]string{
+		"handle": handle,
+		"did":    didRecord.DID,
+	})
+}
+
 // ===== DID HANDLERS =====
 
 func (s *Server) handleGetDID(w http.ResponseWriter, r *http.Request) {

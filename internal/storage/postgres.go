@@ -966,8 +966,18 @@ func (p *PostgresDB) UpsertIPInfo(ctx context.Context, ip string, ipInfo map[str
 	countryCode := extractString(ipInfo, "location", "country_code")
 	asn := extractInt(ipInfo, "asn", "asn")
 	asnOrg := extractString(ipInfo, "asn", "org")
-	isDatacenter := extractBool(ipInfo, "company", "type", "hosting")
-	isVPN := extractBool(ipInfo, "security", "vpn")
+
+	// Extract top-level boolean flags
+	isDatacenter := false
+	if val, ok := ipInfo["is_datacenter"].(bool); ok {
+		isDatacenter = val
+	}
+
+	isVPN := false
+	if val, ok := ipInfo["is_vpn"].(bool); ok {
+		isVPN = val
+	}
+
 	lat := extractFloat(ipInfo, "location", "latitude")
 	lon := extractFloat(ipInfo, "location", "longitude")
 
@@ -1694,6 +1704,42 @@ func (p *PostgresDB) GetDIDRecord(ctx context.Context, did string) (*DIDRecord, 
 
 	if handle.Valid {
 		record.Handle = handle.String
+	}
+	if pds.Valid {
+		record.CurrentPDS = pds.String
+	}
+
+	if err := json.Unmarshal(bundleNumbersJSON, &record.BundleNumbers); err != nil {
+		return nil, err
+	}
+
+	return &record, nil
+}
+
+func (p *PostgresDB) GetDIDByHandle(ctx context.Context, handle string) (*DIDRecord, error) {
+	query := `
+		SELECT did, handle, pds, bundle_numbers, created_at
+		FROM dids
+		WHERE handle = $1
+	`
+
+	var record DIDRecord
+	var bundleNumbersJSON []byte
+	var recordHandle, pds sql.NullString
+
+	err := p.db.QueryRowContext(ctx, query, handle).Scan(
+		&record.DID,
+		&recordHandle,
+		&pds,
+		&bundleNumbersJSON,
+		&record.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if recordHandle.Valid {
+		record.Handle = recordHandle.String
 	}
 	if pds.Valid {
 		record.CurrentPDS = pds.String

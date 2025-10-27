@@ -75,8 +75,9 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/pds/{endpoint}/repos/stats", s.handleGetPDSRepoStats).Methods("GET")
 	api.HandleFunc("/pds/repos/{did}", s.handleGetDIDRepos).Methods("GET")
 
-	// Global DID route
+	// Global DID routes
 	api.HandleFunc("/did/{did}", s.handleGetGlobalDID).Methods("GET")
+	api.HandleFunc("/handle/{handle}", s.handleGetDIDByHandle).Methods("GET") // NEW
 
 	// PLC Bundle routes
 	api.HandleFunc("/plc/bundles", s.handleGetPLCBundles).Methods("GET")
@@ -97,7 +98,7 @@ func (s *Server) setupRoutes() {
 	// DID routes
 	api.HandleFunc("/plc/did/{did}", s.handleGetDID).Methods("GET")
 	api.HandleFunc("/plc/did/{did}/history", s.handleGetDIDHistory).Methods("GET")
-	api.HandleFunc("/plc/dids/stats", s.handleGetDIDStats).Methods("GET") // NEW
+	api.HandleFunc("/plc/dids/stats", s.handleGetDIDStats).Methods("GET")
 
 	// Mempool routes
 	api.HandleFunc("/mempool/stats", s.handleGetMempoolStats).Methods("GET")

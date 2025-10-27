@@ -75,10 +75,11 @@ type Database interface {
 	GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetrics, error)
 	GetEndpointStats(ctx context.Context) (*EndpointStats, error)
 
-	// DID operations - UPDATED SIGNATURES
+	// DID operations
 	UpsertDID(ctx context.Context, did string, bundleNum int, handle, pds string) error
 	UpsertDIDFromMempool(ctx context.Context, did string, handle, pds string) error
 	GetDIDRecord(ctx context.Context, did string) (*DIDRecord, error)
+	GetDIDByHandle(ctx context.Context, handle string) (*DIDRecord, error) // NEW
 	GetGlobalDIDInfo(ctx context.Context, did string) (*GlobalDIDInfo, error)
 	AddBundleDIDs(ctx context.Context, bundleNum int, dids []string) error
 	GetTotalDIDCount(ctx context.Context) (int64, error)
