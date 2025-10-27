@@ -124,8 +124,8 @@ func (s *Scanner) workerWithProgress(ctx context.Context, workerID int, jobs <-c
 }
 
 func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint) {
-	// STEP 1: Resolve IP (before any network call)
-	ip, err := ipinfo.ExtractIPFromEndpoint(ep.Endpoint)
+	// STEP 1: Resolve IPs (both IPv4 and IPv6)
+	ips, err := ipinfo.ExtractIPsFromEndpoint(ep.Endpoint)
 	if err != nil {
 		// Mark as offline due to DNS failure
 		s.saveScanResult(ctx, ep.ID, &ScanResult{
@@ -135,13 +135,18 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 		return
 	}
 
-	// Update IP immediately
-	s.db.UpdateEndpointIP(ctx, ep.ID, ip, time.Now().UTC())
+	// Update IPs immediately
+	s.db.UpdateEndpointIPs(ctx, ep.ID, ips.IPv4, ips.IPv6, time.Now().UTC())
 
-	// STEP 1.5: Fetch IP info asynchronously ASAP (runs in parallel with scanning)
-	go s.updateIPInfoIfNeeded(ctx, ip)
+	// STEP 1.5: Fetch IP info asynchronously for both IPs
+	if ips.IPv4 != "" {
+		go s.updateIPInfoIfNeeded(ctx, ips.IPv4)
+	}
+	if ips.IPv6 != "" {
+		go s.updateIPInfoIfNeeded(ctx, ips.IPv6)
+	}
 
-	// STEP 2: Health check
+	// STEP 2: Health check (rest remains the same)
 	available, responseTime, version, err := s.client.CheckHealth(ctx, ep.Endpoint)
 	if err != nil || !available {
 		errMsg := "health check failed"

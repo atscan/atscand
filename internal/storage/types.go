@@ -26,6 +26,7 @@ type Endpoint struct {
 	LastChecked  time.Time
 	Status       int
 	IP           string
+	IPv6         string // NEW
 	IPResolvedAt time.Time
 	UpdatedAt    time.Time
 }
@@ -194,11 +195,20 @@ type IPInfo struct {
 	ASNOrg       string                 `json:"asn_org,omitempty"`
 	IsDatacenter bool                   `json:"is_datacenter"`
 	IsVPN        bool                   `json:"is_vpn"`
+	IsCrawler    bool                   `json:"is_crawler"`
+	IsTor        bool                   `json:"is_tor"`
+	IsProxy      bool                   `json:"is_proxy"`
 	Latitude     float32                `json:"latitude,omitempty"`
 	Longitude    float32                `json:"longitude,omitempty"`
 	RawData      map[string]interface{} `json:"raw_data,omitempty"`
 	FetchedAt    time.Time              `json:"fetched_at"`
 	UpdatedAt    time.Time              `json:"updated_at"`
+}
+
+// IsHome returns true if this is a residential/home IP
+// (not crawler, datacenter, tor, proxy, or vpn)
+func (i *IPInfo) IsHome() bool {
+	return !i.IsCrawler && !i.IsDatacenter && !i.IsTor && !i.IsProxy && !i.IsVPN
 }
 
 // PDSListItem is a virtual type created by JOIN for /pds endpoint

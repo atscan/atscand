@@ -27,7 +27,7 @@ type Database interface {
 	EndpointExists(ctx context.Context, endpoint string, endpointType string) (bool, error)
 	GetEndpointIDByEndpoint(ctx context.Context, endpoint string, endpointType string) (int64, error)
 	GetEndpointScans(ctx context.Context, endpointID int64, limit int) ([]*EndpointScan, error)
-	UpdateEndpointIP(ctx context.Context, endpointID int64, ip string, resolvedAt time.Time) error
+	UpdateEndpointIPs(ctx context.Context, endpointID int64, ipv4, ipv6 string, resolvedAt time.Time) error
 	SaveEndpointScan(ctx context.Context, scan *EndpointScan) error
 	SetScanRetention(retention int)
 	UpdateEndpointStatus(ctx context.Context, endpointID int64, update *EndpointUpdate) error

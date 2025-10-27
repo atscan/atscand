@@ -276,9 +276,16 @@ func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
 		if pds.IPInfo.ASN > 0 {
 			response["asn"] = pds.IPInfo.ASN
 		}
-		if pds.IPInfo.IsDatacenter {
-			response["is_datacenter"] = pds.IPInfo.IsDatacenter
-		}
+
+		// Add all network type flags
+		response["is_datacenter"] = pds.IPInfo.IsDatacenter
+		response["is_vpn"] = pds.IPInfo.IsVPN
+		response["is_crawler"] = pds.IPInfo.IsCrawler
+		response["is_tor"] = pds.IPInfo.IsTor
+		response["is_proxy"] = pds.IPInfo.IsProxy
+
+		// Add computed is_home field
+		response["is_home"] = pds.IPInfo.IsHome()
 	}
 
 	return response
@@ -316,9 +323,17 @@ func formatPDSDetail(pds *storage.PDSDetail) map[string]interface{} {
 		}
 	}
 
-	// Add full IP info
+	// Add full IP info with computed is_home field
 	if pds.IPInfo != nil {
-		response["ip_info"] = pds.IPInfo
+		// Convert IPInfo to map
+		ipInfoMap := make(map[string]interface{})
+		ipInfoJSON, _ := json.Marshal(pds.IPInfo)
+		json.Unmarshal(ipInfoJSON, &ipInfoMap)
+
+		// Add computed is_home field
+		ipInfoMap["is_home"] = pds.IPInfo.IsHome()
+
+		response["ip_info"] = ipInfoMap
 	}
 
 	return response

@@ -99,41 +99,64 @@ func (c *Client) GetIPInfo(ctx context.Context, ip string) (map[string]interface
 	return ipInfo, nil
 }
 
-// ExtractIPFromEndpoint extracts IP from endpoint URL
-func ExtractIPFromEndpoint(endpoint string) (string, error) {
+// IPAddresses holds both IPv4 and IPv6 addresses
+type IPAddresses struct {
+	IPv4 string
+	IPv6 string
+}
+
+// ExtractIPsFromEndpoint extracts both IPv4 and IPv6 from endpoint URL
+func ExtractIPsFromEndpoint(endpoint string) (*IPAddresses, error) {
 	// Parse URL
 	parsedURL, err := url.Parse(endpoint)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse endpoint URL: %w", err)
+		return nil, fmt.Errorf("failed to parse endpoint URL: %w", err)
 	}
 
 	host := parsedURL.Hostname()
 	if host == "" {
-		return "", fmt.Errorf("no hostname in endpoint")
+		return nil, fmt.Errorf("no hostname in endpoint")
 	}
+
+	result := &IPAddresses{}
 
 	// Check if host is already an IP
-	if net.ParseIP(host) != nil {
-		return host, nil
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			result.IPv4 = host
+		} else {
+			result.IPv6 = host
+		}
+		return result, nil
 	}
 
-	// Resolve hostname to IP
+	// Resolve hostname to IPs
 	ips, err := net.LookupIP(host)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve hostname: %w", err)
+		return nil, fmt.Errorf("failed to resolve hostname: %w", err)
 	}
 
 	if len(ips) == 0 {
-		return "", fmt.Errorf("no IPs found for hostname")
+		return nil, fmt.Errorf("no IPs found for hostname")
 	}
 
-	// Return first IPv4 address
+	// Extract both IPv4 and IPv6
 	for _, ip := range ips {
 		if ipv4 := ip.To4(); ipv4 != nil {
-			return ipv4.String(), nil
+			if result.IPv4 == "" {
+				result.IPv4 = ipv4.String()
+			}
+		} else {
+			if result.IPv6 == "" {
+				result.IPv6 = ip.String()
+			}
 		}
 	}
 
-	// Fallback to first IP (might be IPv6)
-	return ips[0].String(), nil
+	// Must have at least one IP
+	if result.IPv4 == "" && result.IPv6 == "" {
+		return nil, fmt.Errorf("no valid IPs found")
+	}
+
+	return result, nil
 }

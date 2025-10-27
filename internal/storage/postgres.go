@@ -73,47 +73,52 @@ func (p *PostgresDB) Migrate() error {
 	log.Info("Running database migrations...")
 
 	schema := `
-    -- Endpoints table (NO user_count, NO ip_info)
-    CREATE TABLE IF NOT EXISTS endpoints (
-        id BIGSERIAL PRIMARY KEY,
-        endpoint_type TEXT NOT NULL DEFAULT 'pds',
-        endpoint TEXT NOT NULL,
-        server_did TEXT,
-        discovered_at TIMESTAMP NOT NULL,
-        last_checked TIMESTAMP,
-        status INTEGER DEFAULT 0,
-        ip TEXT,
-        ip_resolved_at TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(endpoint_type, endpoint)
-    );
+	-- Endpoints table (NO user_count, NO ip_info)
+	CREATE TABLE IF NOT EXISTS endpoints (
+		id BIGSERIAL PRIMARY KEY,
+		endpoint_type TEXT NOT NULL DEFAULT 'pds',
+		endpoint TEXT NOT NULL,
+		server_did TEXT,
+		discovered_at TIMESTAMP NOT NULL,
+		last_checked TIMESTAMP,
+		status INTEGER DEFAULT 0,
+		ip TEXT,
+		ipv6 TEXT,
+		ip_resolved_at TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(endpoint_type, endpoint)
+	);
 
-    CREATE INDEX IF NOT EXISTS idx_endpoints_type_endpoint ON endpoints(endpoint_type, endpoint);
-    CREATE INDEX IF NOT EXISTS idx_endpoints_status ON endpoints(status);
-    CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
-    CREATE INDEX IF NOT EXISTS idx_endpoints_ip ON endpoints(ip);
-    CREATE INDEX IF NOT EXISTS idx_endpoints_server_did ON endpoints(server_did);
+	CREATE INDEX IF NOT EXISTS idx_endpoints_type_endpoint ON endpoints(endpoint_type, endpoint);
+	CREATE INDEX IF NOT EXISTS idx_endpoints_status ON endpoints(status);
+	CREATE INDEX IF NOT EXISTS idx_endpoints_type ON endpoints(endpoint_type);
+	CREATE INDEX IF NOT EXISTS idx_endpoints_ip ON endpoints(ip);
+	CREATE INDEX IF NOT EXISTS idx_endpoints_ipv6 ON endpoints(ipv6);
+	CREATE INDEX IF NOT EXISTS idx_endpoints_server_did ON endpoints(server_did);
 	CREATE INDEX IF NOT EXISTS idx_endpoints_server_did_type_discovered ON endpoints(server_did, endpoint_type, discovered_at);
 
-    -- IP infos table (IP as PRIMARY KEY)
-    CREATE TABLE IF NOT EXISTS ip_infos (
-        ip TEXT PRIMARY KEY,
-        city TEXT,
-        country TEXT,
-        country_code TEXT,
-        asn INTEGER,
-        asn_org TEXT,
-        is_datacenter BOOLEAN,
-        is_vpn BOOLEAN,
-        latitude REAL,
-        longitude REAL,
-        raw_data JSONB,
-        fetched_at TIMESTAMP NOT NULL,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+	-- IP infos table (IP as PRIMARY KEY)
+	CREATE TABLE IF NOT EXISTS ip_infos (
+		ip TEXT PRIMARY KEY,
+		city TEXT,
+		country TEXT,
+		country_code TEXT,
+		asn INTEGER,
+		asn_org TEXT,
+		is_datacenter BOOLEAN,
+		is_vpn BOOLEAN,
+		is_crawler BOOLEAN,
+		is_tor BOOLEAN,
+		is_proxy BOOLEAN,
+		latitude REAL,
+		longitude REAL,
+		raw_data JSONB,
+		fetched_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
 
-    CREATE INDEX IF NOT EXISTS idx_ip_infos_country_code ON ip_infos(country_code);
-    CREATE INDEX IF NOT EXISTS idx_ip_infos_asn ON ip_infos(asn);
+	CREATE INDEX IF NOT EXISTS idx_ip_infos_country_code ON ip_infos(country_code);
+	CREATE INDEX IF NOT EXISTS idx_ip_infos_asn ON ip_infos(asn);
 
     -- Endpoint scans (renamed from pds_scans)
 	CREATE TABLE IF NOT EXISTS endpoint_scans (
@@ -237,8 +242,8 @@ func (p *PostgresDB) Migrate() error {
 
 func (p *PostgresDB) UpsertEndpoint(ctx context.Context, endpoint *Endpoint) error {
 	query := `
-        INSERT INTO endpoints (endpoint_type, endpoint, discovered_at, last_checked, status, ip, ip_resolved_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO endpoints (endpoint_type, endpoint, discovered_at, last_checked, status, ip, ipv6, ip_resolved_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT(endpoint_type, endpoint) DO UPDATE SET
             last_checked = EXCLUDED.last_checked,
             status = EXCLUDED.status,
@@ -246,8 +251,12 @@ func (p *PostgresDB) UpsertEndpoint(ctx context.Context, endpoint *Endpoint) err
                 WHEN EXCLUDED.ip IS NOT NULL AND EXCLUDED.ip != '' THEN EXCLUDED.ip 
                 ELSE endpoints.ip 
             END,
+            ipv6 = CASE 
+                WHEN EXCLUDED.ipv6 IS NOT NULL AND EXCLUDED.ipv6 != '' THEN EXCLUDED.ipv6 
+                ELSE endpoints.ipv6 
+            END,
             ip_resolved_at = CASE
-                WHEN EXCLUDED.ip IS NOT NULL AND EXCLUDED.ip != '' THEN EXCLUDED.ip_resolved_at
+                WHEN (EXCLUDED.ip IS NOT NULL AND EXCLUDED.ip != '') OR (EXCLUDED.ipv6 IS NOT NULL AND EXCLUDED.ipv6 != '') THEN EXCLUDED.ip_resolved_at
                 ELSE endpoints.ip_resolved_at
             END,
             updated_at = CURRENT_TIMESTAMP
@@ -255,7 +264,7 @@ func (p *PostgresDB) UpsertEndpoint(ctx context.Context, endpoint *Endpoint) err
     `
 	err := p.db.QueryRowContext(ctx, query,
 		endpoint.EndpointType, endpoint.Endpoint, endpoint.DiscoveredAt,
-		endpoint.LastChecked, endpoint.Status, endpoint.IP, endpoint.IPResolvedAt).Scan(&endpoint.ID)
+		endpoint.LastChecked, endpoint.Status, endpoint.IP, endpoint.IPv6, endpoint.IPResolvedAt).Scan(&endpoint.ID)
 	return err
 }
 
@@ -276,18 +285,18 @@ func (p *PostgresDB) GetEndpointIDByEndpoint(ctx context.Context, endpoint strin
 func (p *PostgresDB) GetEndpoint(ctx context.Context, endpoint string, endpointType string) (*Endpoint, error) {
 	query := `
         SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, 
-               ip, ip_resolved_at, updated_at
+               ip, ipv6, ip_resolved_at, updated_at
         FROM endpoints 
         WHERE endpoint = $1 AND endpoint_type = $2
     `
 
 	var ep Endpoint
 	var lastChecked, ipResolvedAt sql.NullTime
-	var ip sql.NullString
+	var ip, ipv6 sql.NullString
 
 	err := p.db.QueryRowContext(ctx, query, endpoint, endpointType).Scan(
 		&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
-		&ep.Status, &ip, &ipResolvedAt, &ep.UpdatedAt,
+		&ep.Status, &ip, &ipv6, &ipResolvedAt, &ep.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -299,6 +308,9 @@ func (p *PostgresDB) GetEndpoint(ctx context.Context, endpoint string, endpointT
 	if ip.Valid {
 		ep.IP = ip.String
 	}
+	if ipv6.Valid {
+		ep.IPv6 = ipv6.String
+	}
 	if ipResolvedAt.Valid {
 		ep.IPResolvedAt = ipResolvedAt.Time
 	}
@@ -308,11 +320,11 @@ func (p *PostgresDB) GetEndpoint(ctx context.Context, endpoint string, endpointT
 
 func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) ([]*Endpoint, error) {
 	query := `
-		SELECT DISTINCT ON (COALESCE(server_did, id::text))
-			id, endpoint_type, endpoint, server_did, discovered_at, last_checked, status, 
-			ip, ip_resolved_at, updated_at
-		FROM endpoints
-		WHERE 1=1
+	SELECT DISTINCT ON (COALESCE(server_did, id::text))
+		id, endpoint_type, endpoint, server_did, discovered_at, last_checked, status, 
+		ip, ipv6, ip_resolved_at, updated_at
+	FROM endpoints
+	WHERE 1=1
 	`
 	args := []interface{}{}
 	argIdx := 1
@@ -363,11 +375,11 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 	for rows.Next() {
 		var ep Endpoint
 		var lastChecked, ipResolvedAt sql.NullTime
-		var ip, serverDID sql.NullString
+		var ip, ipv6, serverDID sql.NullString
 
 		err := rows.Scan(
 			&ep.ID, &ep.EndpointType, &ep.Endpoint, &serverDID, &ep.DiscoveredAt, &lastChecked,
-			&ep.Status, &ip, &ipResolvedAt, &ep.UpdatedAt,
+			&ep.Status, &ip, &ipv6, &ipResolvedAt, &ep.UpdatedAt,
 		)
 		if err != nil {
 			return nil, err
@@ -381,6 +393,9 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 		}
 		if ip.Valid {
 			ep.IP = ip.String
+		}
+		if ipv6.Valid {
+			ep.IPv6 = ipv6.String
 		}
 		if ipResolvedAt.Valid {
 			ep.IPResolvedAt = ipResolvedAt.Time
@@ -402,13 +417,13 @@ func (p *PostgresDB) UpdateEndpointStatus(ctx context.Context, endpointID int64,
 	return err
 }
 
-func (p *PostgresDB) UpdateEndpointIP(ctx context.Context, endpointID int64, ip string, resolvedAt time.Time) error {
+func (p *PostgresDB) UpdateEndpointIPs(ctx context.Context, endpointID int64, ipv4, ipv6 string, resolvedAt time.Time) error {
 	query := `
         UPDATE endpoints 
-        SET ip = $1, ip_resolved_at = $2, updated_at = $3
-        WHERE id = $4
+        SET ip = $1, ipv6 = $2, ip_resolved_at = $3, updated_at = $4
+        WHERE id = $5
     `
-	_, err := p.db.ExecContext(ctx, query, ip, resolvedAt, time.Now().UTC(), endpointID)
+	_, err := p.db.ExecContext(ctx, query, ipv4, ipv6, resolvedAt, time.Now().UTC(), endpointID)
 	return err
 }
 
@@ -577,7 +592,8 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 			e.id, e.endpoint, e.server_did, e.discovered_at, e.last_checked, e.status, e.ip,
 			latest.user_count, latest.response_time, latest.version, latest.scanned_at,
 			i.city, i.country, i.country_code, i.asn, i.asn_org,
-			i.is_datacenter, i.is_vpn, i.latitude, i.longitude
+			i.is_datacenter, i.is_vpn, i.is_crawler, i.is_tor, i.is_proxy,
+			i.latitude, i.longitude
 		FROM unique_servers e
 		LEFT JOIN LATERAL (
 			SELECT 
@@ -636,7 +652,7 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 		item := &PDSListItem{}
 		var ip, serverDID, city, country, countryCode, asnOrg sql.NullString
 		var asn sql.NullInt32
-		var isDatacenter, isVPN sql.NullBool
+		var isDatacenter, isVPN, isCrawler, isTor, isProxy sql.NullBool
 		var lat, lon sql.NullFloat64
 		var userCount sql.NullInt32
 		var responseTime sql.NullFloat64
@@ -647,7 +663,8 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 			&item.ID, &item.Endpoint, &serverDID, &item.DiscoveredAt, &item.LastChecked, &item.Status, &ip,
 			&userCount, &responseTime, &version, &scannedAt,
 			&city, &country, &countryCode, &asn, &asnOrg,
-			&isDatacenter, &isVPN, &lat, &lon,
+			&isDatacenter, &isVPN, &isCrawler, &isTor, &isProxy,
+			&lat, &lon,
 		)
 		if err != nil {
 			return nil, err
@@ -686,6 +703,9 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 				ASNOrg:       asnOrg.String,
 				IsDatacenter: isDatacenter.Bool,
 				IsVPN:        isVPN.Bool,
+				IsCrawler:    isCrawler.Bool,
+				IsTor:        isTor.Bool,
+				IsProxy:      isProxy.Bool,
 				Latitude:     float32(lat.Float64),
 				Longitude:    float32(lon.Float64),
 			}
@@ -736,7 +756,8 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 			latest.scan_data->'metadata'->'server_info' as server_info,
 			latest.scanned_at,
 			i.city, i.country, i.country_code, i.asn, i.asn_org,
-			i.is_datacenter, i.is_vpn, i.latitude, i.longitude,
+			i.is_datacenter, i.is_vpn, i.is_crawler, i.is_tor, i.is_proxy,
+			i.latitude, i.longitude,
 			i.raw_data,
 			COALESCE(aa.aliases, ARRAY[]::text[]) as aliases,
 			aa.first_discovered_at
@@ -755,7 +776,7 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 	detail := &PDSDetail{}
 	var ip, city, country, countryCode, asnOrg, serverDID sql.NullString
 	var asn sql.NullInt32
-	var isDatacenter, isVPN sql.NullBool
+	var isDatacenter, isVPN, isCrawler, isTor, isProxy sql.NullBool
 	var lat, lon sql.NullFloat64
 	var userCount sql.NullInt32
 	var responseTime sql.NullFloat64
@@ -770,7 +791,8 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 		&detail.ID, &detail.Endpoint, &serverDID, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip,
 		&userCount, &responseTime, &version, &serverInfoJSON, &scannedAt,
 		&city, &country, &countryCode, &asn, &asnOrg,
-		&isDatacenter, &isVPN, &lat, &lon,
+		&isDatacenter, &isVPN, &isCrawler, &isTor, &isProxy,
+		&lat, &lon,
 		&rawDataJSON,
 		pq.Array(&aliases),
 		&firstDiscoveredAt,
@@ -820,7 +842,7 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 		}
 	}
 
-	// Parse IP info
+	// Parse IP info with all fields
 	if city.Valid || country.Valid {
 		detail.IPInfo = &IPInfo{
 			IP:           ip.String,
@@ -831,6 +853,9 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 			ASNOrg:       asnOrg.String,
 			IsDatacenter: isDatacenter.Bool,
 			IsVPN:        isVPN.Bool,
+			IsCrawler:    isCrawler.Bool,
+			IsTor:        isTor.Bool,
+			IsProxy:      isProxy.Bool,
 			Latitude:     float32(lat.Float64),
 			Longitude:    float32(lon.Float64),
 		}
@@ -978,12 +1003,27 @@ func (p *PostgresDB) UpsertIPInfo(ctx context.Context, ip string, ipInfo map[str
 		isVPN = val
 	}
 
+	isCrawler := false
+	if val, ok := ipInfo["is_crawler"].(bool); ok {
+		isCrawler = val
+	}
+
+	isTor := false
+	if val, ok := ipInfo["is_tor"].(bool); ok {
+		isTor = val
+	}
+
+	isProxy := false
+	if val, ok := ipInfo["is_proxy"].(bool); ok {
+		isProxy = val
+	}
+
 	lat := extractFloat(ipInfo, "location", "latitude")
 	lon := extractFloat(ipInfo, "location", "longitude")
 
 	query := `
-        INSERT INTO ip_infos (ip, city, country, country_code, asn, asn_org, is_datacenter, is_vpn, latitude, longitude, raw_data, fetched_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        INSERT INTO ip_infos (ip, city, country, country_code, asn, asn_org, is_datacenter, is_vpn, is_crawler, is_tor, is_proxy, latitude, longitude, raw_data, fetched_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         ON CONFLICT(ip) DO UPDATE SET
             city = EXCLUDED.city,
             country = EXCLUDED.country,
@@ -992,19 +1032,22 @@ func (p *PostgresDB) UpsertIPInfo(ctx context.Context, ip string, ipInfo map[str
             asn_org = EXCLUDED.asn_org,
             is_datacenter = EXCLUDED.is_datacenter,
             is_vpn = EXCLUDED.is_vpn,
+            is_crawler = EXCLUDED.is_crawler,
+            is_tor = EXCLUDED.is_tor,
+            is_proxy = EXCLUDED.is_proxy,
             latitude = EXCLUDED.latitude,
             longitude = EXCLUDED.longitude,
             raw_data = EXCLUDED.raw_data,
             fetched_at = EXCLUDED.fetched_at,
             updated_at = CURRENT_TIMESTAMP
     `
-	_, err := p.db.ExecContext(ctx, query, ip, city, country, countryCode, asn, asnOrg, isDatacenter, isVPN, lat, lon, rawDataJSON, time.Now().UTC())
+	_, err := p.db.ExecContext(ctx, query, ip, city, country, countryCode, asn, asnOrg, isDatacenter, isVPN, isCrawler, isTor, isProxy, lat, lon, rawDataJSON, time.Now().UTC())
 	return err
 }
 
 func (p *PostgresDB) GetIPInfo(ctx context.Context, ip string) (*IPInfo, error) {
 	query := `
-        SELECT ip, city, country, country_code, asn, asn_org, is_datacenter, is_vpn, 
+        SELECT ip, city, country, country_code, asn, asn_org, is_datacenter, is_vpn, is_crawler, is_tor, is_proxy,
                latitude, longitude, raw_data, fetched_at, updated_at
         FROM ip_infos
         WHERE ip = $1
@@ -1015,7 +1058,8 @@ func (p *PostgresDB) GetIPInfo(ctx context.Context, ip string) (*IPInfo, error) 
 
 	err := p.db.QueryRowContext(ctx, query, ip).Scan(
 		&info.IP, &info.City, &info.Country, &info.CountryCode, &info.ASN, &info.ASNOrg,
-		&info.IsDatacenter, &info.IsVPN, &info.Latitude, &info.Longitude,
+		&info.IsDatacenter, &info.IsVPN, &info.IsCrawler, &info.IsTor, &info.IsProxy,
+		&info.Latitude, &info.Longitude,
 		&rawDataJSON, &info.FetchedAt, &info.UpdatedAt,
 	)
 	if err != nil {
@@ -1103,30 +1147,6 @@ func extractFloat(data map[string]interface{}, keys ...string) float32 {
 		}
 	}
 	return 0
-}
-
-func extractBool(data map[string]interface{}, keys ...string) bool {
-	current := data
-	for i, key := range keys {
-		if i == len(keys)-1 {
-			if val, ok := current[key].(bool); ok {
-				return val
-			}
-			// Check if it's a string that matches (for type="hosting")
-			if val, ok := current[key].(string); ok {
-				// For cases like company.type == "hosting"
-				expectedValue := keys[len(keys)-1]
-				return val == expectedValue
-			}
-			return false
-		}
-		if nested, ok := current[key].(map[string]interface{}); ok {
-			current = nested
-		} else {
-			return false
-		}
-	}
-	return false
 }
 
 // ===== BUNDLE OPERATIONS =====
