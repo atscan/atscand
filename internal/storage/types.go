@@ -119,7 +119,7 @@ type PLCBundle struct {
 	StartTime                  time.Time
 	EndTime                    time.Time
 	BoundaryCIDs               []string
-	DIDs                       []string
+	DIDCount                   int // Changed from DIDs []string
 	Hash                       string
 	CompressedHash             string
 	CompressedSize             int64

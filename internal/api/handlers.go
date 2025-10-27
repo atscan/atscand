@@ -47,7 +47,7 @@ func (r *response) bundleHeaders(bundle *storage.PLCBundle) {
 	r.w.Header().Set("X-Bundle-Start-Time", bundle.StartTime.Format(time.RFC3339Nano))
 	r.w.Header().Set("X-Bundle-End-Time", bundle.EndTime.Format(time.RFC3339Nano))
 	r.w.Header().Set("X-Bundle-Operation-Count", fmt.Sprintf("%d", plc.BUNDLE_SIZE))
-	r.w.Header().Set("X-Bundle-DID-Count", fmt.Sprintf("%d", len(bundle.DIDs)))
+	r.w.Header().Set("X-Bundle-DID-Count", fmt.Sprintf("%d", bundle.DIDCount))
 }
 
 // ===== REQUEST HELPERS =====
@@ -83,7 +83,7 @@ func formatBundleResponse(bundle *storage.PLCBundle) map[string]interface{} {
 		"start_time":        bundle.StartTime,
 		"end_time":          bundle.EndTime,
 		"operation_count":   plc.BUNDLE_SIZE,
-		"did_count":         len(bundle.DIDs),
+		"did_count":         bundle.DIDCount, // Use DIDCount instead of len(DIDs)
 		"hash":              bundle.Hash,
 		"compressed_hash":   bundle.CompressedHash,
 		"compressed_size":   bundle.CompressedSize,
@@ -809,8 +809,8 @@ func (s *Server) createUpcomingBundlePreview(ctx context.Context, r *http.Reques
 		"progress_percent":          float64(mempoolCount) / float64(plc.BUNDLE_SIZE) * 100,
 		"operations_needed":         operationsNeeded,
 		"did_count":                 uniqueDIDCount,
-		"start_time":                firstOp.CreatedAt, // This is FIXED once first op exists
-		"current_end_time":          lastOp.CreatedAt,  // This will change as more ops arrive
+		"start_time":                firstOp.CreatedAt,
+		"current_end_time":          lastOp.CreatedAt,
 		"uncompressed_size":         uncompressedSize,
 		"estimated_compressed_size": estimatedCompressedSize,
 		"compression_ratio":         float64(uncompressedSize) / float64(estimatedCompressedSize),
@@ -823,7 +823,7 @@ func (s *Server) createUpcomingBundlePreview(ctx context.Context, r *http.Reques
 		result["current_rate_per_second"] = currentRate
 	}
 
-	// Get actual mempool operations if requested
+	// Get actual mempool operations if requested (for DIDs list)
 	if r.URL.Query().Get("include_dids") == "true" {
 		ops, err := s.db.GetMempoolOperations(ctx, plc.BUNDLE_SIZE)
 		if err == nil {
@@ -858,10 +858,17 @@ func (s *Server) handleGetPLCBundleDIDs(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Query DIDs from dids table instead
+	dids, err := s.db.GetDIDsForBundle(r.Context(), bundleNum)
+	if err != nil {
+		resp.error(fmt.Sprintf("failed to get DIDs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
 	resp.json(map[string]interface{}{
 		"plc_bundle_number": bundle.BundleNumber,
-		"did_count":         len(bundle.DIDs),
-		"dids":              bundle.DIDs,
+		"did_count":         bundle.DIDCount,
+		"dids":              dids,
 	})
 }
 

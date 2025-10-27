@@ -157,28 +157,27 @@ func (p *PostgresDB) Migrate() error {
         records_processed BIGINT DEFAULT 0
     );
 
-    CREATE TABLE IF NOT EXISTS plc_bundles (
-        bundle_number INTEGER PRIMARY KEY,
-        start_time TIMESTAMP NOT NULL,
-        end_time TIMESTAMP NOT NULL,
-        dids JSONB NOT NULL,
-        hash TEXT NOT NULL,
-        compressed_hash TEXT NOT NULL,
-        compressed_size BIGINT NOT NULL,
-        uncompressed_size BIGINT NOT NULL,
-        cumulative_compressed_size BIGINT NOT NULL,
-        cumulative_uncompressed_size BIGINT NOT NULL,
-        cursor TEXT,
-        prev_bundle_hash TEXT,
-        compressed BOOLEAN DEFAULT true,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+	CREATE TABLE IF NOT EXISTS plc_bundles (
+		bundle_number INTEGER PRIMARY KEY,
+		start_time TIMESTAMP NOT NULL,
+		end_time TIMESTAMP NOT NULL,
+		did_count INTEGER NOT NULL DEFAULT 0,
+		hash TEXT NOT NULL,
+		compressed_hash TEXT NOT NULL,
+		compressed_size BIGINT NOT NULL,
+		uncompressed_size BIGINT NOT NULL,
+		cumulative_compressed_size BIGINT NOT NULL,
+		cumulative_uncompressed_size BIGINT NOT NULL,
+		cursor TEXT,
+		prev_bundle_hash TEXT,
+		compressed BOOLEAN DEFAULT true,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
 
-    CREATE INDEX IF NOT EXISTS idx_plc_bundles_time ON plc_bundles(start_time, end_time);
-    CREATE INDEX IF NOT EXISTS idx_plc_bundles_hash ON plc_bundles(hash);
-    CREATE INDEX IF NOT EXISTS idx_plc_bundles_prev ON plc_bundles(prev_bundle_hash);
-    CREATE INDEX IF NOT EXISTS idx_plc_bundles_number_desc ON plc_bundles(bundle_number DESC);
-    CREATE INDEX IF NOT EXISTS idx_plc_bundles_dids ON plc_bundles USING gin(dids);
+	CREATE INDEX IF NOT EXISTS idx_plc_bundles_time ON plc_bundles(start_time, end_time);
+	CREATE INDEX IF NOT EXISTS idx_plc_bundles_hash ON plc_bundles(hash);
+	CREATE INDEX IF NOT EXISTS idx_plc_bundles_prev ON plc_bundles(prev_bundle_hash);
+	CREATE INDEX IF NOT EXISTS idx_plc_bundles_number_desc ON plc_bundles(bundle_number DESC);
 
     CREATE TABLE IF NOT EXISTS plc_mempool (
         id BIGSERIAL PRIMARY KEY,
@@ -1168,11 +1167,6 @@ func extractFloat(data map[string]interface{}, keys ...string) float32 {
 // ===== BUNDLE OPERATIONS =====
 
 func (p *PostgresDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error {
-	didsJSON, err := json.Marshal(bundle.DIDs)
-	if err != nil {
-		return err
-	}
-
 	// Calculate cumulative sizes from previous bundle
 	if bundle.BundleNumber > 1 {
 		prevBundle, err := p.GetBundleByNumber(ctx, bundle.BundleNumber-1)
@@ -1190,7 +1184,7 @@ func (p *PostgresDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error 
 
 	query := `
         INSERT INTO plc_bundles (
-            bundle_number, start_time, end_time, dids, 
+            bundle_number, start_time, end_time, did_count, 
             hash, compressed_hash, compressed_size, uncompressed_size, 
             cumulative_compressed_size, cumulative_uncompressed_size,
             cursor, prev_bundle_hash, compressed
@@ -1199,7 +1193,7 @@ func (p *PostgresDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error 
         ON CONFLICT(bundle_number) DO UPDATE SET
             start_time = EXCLUDED.start_time,
             end_time = EXCLUDED.end_time,
-            dids = EXCLUDED.dids,
+            did_count = EXCLUDED.did_count,
             hash = EXCLUDED.hash,
             compressed_hash = EXCLUDED.compressed_hash,
             compressed_size = EXCLUDED.compressed_size,
@@ -1210,9 +1204,9 @@ func (p *PostgresDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error 
             prev_bundle_hash = EXCLUDED.prev_bundle_hash,
             compressed = EXCLUDED.compressed
     `
-	_, err = p.db.ExecContext(ctx, query,
+	_, err := p.db.ExecContext(ctx, query,
 		bundle.BundleNumber, bundle.StartTime, bundle.EndTime,
-		didsJSON, bundle.Hash, bundle.CompressedHash,
+		bundle.DIDCount, bundle.Hash, bundle.CompressedHash,
 		bundle.CompressedSize, bundle.UncompressedSize,
 		bundle.CumulativeCompressedSize, bundle.CumulativeUncompressedSize,
 		bundle.Cursor, bundle.PrevBundleHash, bundle.Compressed,
@@ -1223,7 +1217,7 @@ func (p *PostgresDB) CreateBundle(ctx context.Context, bundle *PLCBundle) error 
 
 func (p *PostgresDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*PLCBundle, error) {
 	query := `
-        SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, 
+        SELECT bundle_number, start_time, end_time, did_count, hash, compressed_hash, 
                compressed_size, uncompressed_size, cumulative_compressed_size, 
                cumulative_uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
         FROM plc_bundles
@@ -1231,13 +1225,12 @@ func (p *PostgresDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*
     `
 
 	var bundle PLCBundle
-	var didsJSON []byte
 	var prevHash sql.NullString
 	var cursor sql.NullString
 
 	err := p.db.QueryRowContext(ctx, query, bundleNumber).Scan(
 		&bundle.BundleNumber, &bundle.StartTime, &bundle.EndTime,
-		&didsJSON, &bundle.Hash, &bundle.CompressedHash,
+		&bundle.DIDCount, &bundle.Hash, &bundle.CompressedHash,
 		&bundle.CompressedSize, &bundle.UncompressedSize,
 		&bundle.CumulativeCompressedSize, &bundle.CumulativeUncompressedSize,
 		&cursor, &prevHash, &bundle.Compressed, &bundle.CreatedAt,
@@ -1253,13 +1246,12 @@ func (p *PostgresDB) GetBundleByNumber(ctx context.Context, bundleNumber int) (*
 		bundle.Cursor = cursor.String
 	}
 
-	json.Unmarshal(didsJSON, &bundle.DIDs)
 	return &bundle, nil
 }
 
 func (p *PostgresDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error) {
 	query := `
-        SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, 
+        SELECT bundle_number, start_time, end_time, did_count, hash, compressed_hash, 
                compressed_size, uncompressed_size, cumulative_compressed_size, 
                cumulative_uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
         FROM plc_bundles
@@ -1277,16 +1269,46 @@ func (p *PostgresDB) GetBundles(ctx context.Context, limit int) ([]*PLCBundle, e
 }
 
 func (p *PostgresDB) GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error) {
-	query := `
-        SELECT bundle_number, start_time, end_time, dids, hash, compressed_hash, 
+	// Get bundle numbers from dids table
+	var bundleNumbersJSON []byte
+	err := p.db.QueryRowContext(ctx, `
+		SELECT bundle_numbers FROM dids WHERE did = $1
+	`, did).Scan(&bundleNumbersJSON)
+
+	if err == sql.ErrNoRows {
+		return []*PLCBundle{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var bundleNumbers []int
+	if err := json.Unmarshal(bundleNumbersJSON, &bundleNumbers); err != nil {
+		return nil, err
+	}
+
+	if len(bundleNumbers) == 0 {
+		return []*PLCBundle{}, nil
+	}
+
+	// Build query with IN clause
+	placeholders := make([]string, len(bundleNumbers))
+	args := make([]interface{}, len(bundleNumbers))
+	for i, num := range bundleNumbers {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = num
+	}
+
+	query := fmt.Sprintf(`
+        SELECT bundle_number, start_time, end_time, did_count, hash, compressed_hash, 
                compressed_size, uncompressed_size, cumulative_compressed_size, 
                cumulative_uncompressed_size, cursor, prev_bundle_hash, compressed, created_at
         FROM plc_bundles
-        WHERE dids ? $1
+        WHERE bundle_number IN (%s)
         ORDER BY bundle_number ASC
-    `
+    `, strings.Join(placeholders, ","))
 
-	rows, err := p.db.QueryContext(ctx, query, did)
+	rows, err := p.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1295,12 +1317,37 @@ func (p *PostgresDB) GetBundlesForDID(ctx context.Context, did string) ([]*PLCBu
 	return p.scanBundles(rows)
 }
 
+func (p *PostgresDB) GetDIDsForBundle(ctx context.Context, bundleNum int) ([]string, error) {
+	query := `
+		SELECT did 
+		FROM dids 
+		WHERE bundle_numbers @> $1::jsonb
+		ORDER BY did
+	`
+
+	rows, err := p.db.QueryContext(ctx, query, fmt.Sprintf("[%d]", bundleNum))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var dids []string
+	for rows.Next() {
+		var did string
+		if err := rows.Scan(&did); err != nil {
+			return nil, err
+		}
+		dids = append(dids, did)
+	}
+
+	return dids, rows.Err()
+}
+
 func (p *PostgresDB) scanBundles(rows *sql.Rows) ([]*PLCBundle, error) {
 	var bundles []*PLCBundle
 
 	for rows.Next() {
 		var bundle PLCBundle
-		var didsJSON []byte
 		var prevHash sql.NullString
 		var cursor sql.NullString
 
@@ -1308,7 +1355,7 @@ func (p *PostgresDB) scanBundles(rows *sql.Rows) ([]*PLCBundle, error) {
 			&bundle.BundleNumber,
 			&bundle.StartTime,
 			&bundle.EndTime,
-			&didsJSON,
+			&bundle.DIDCount,
 			&bundle.Hash,
 			&bundle.CompressedHash,
 			&bundle.CompressedSize,
@@ -1330,7 +1377,6 @@ func (p *PostgresDB) scanBundles(rows *sql.Rows) ([]*PLCBundle, error) {
 			bundle.Cursor = cursor.String
 		}
 
-		json.Unmarshal(didsJSON, &bundle.DIDs)
 		bundles = append(bundles, &bundle)
 	}
 

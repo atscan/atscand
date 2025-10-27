@@ -32,6 +32,7 @@ type BundleManager struct {
 
 func NewBundleManager(dir string, enabled bool, db storage.Database, indexDIDs bool) (*BundleManager, error) {
 	if !enabled {
+		log.Verbose("BundleManager disabled (enabled=false)")
 		return &BundleManager{enabled: false}, nil
 	}
 
@@ -49,13 +50,15 @@ func NewBundleManager(dir string, enabled bool, db storage.Database, indexDIDs b
 		return nil, err
 	}
 
+	log.Verbose("BundleManager initialized: enabled=%v, indexDIDs=%v, dir=%s", enabled, indexDIDs, dir)
+
 	return &BundleManager{
 		dir:       dir,
 		enabled:   enabled,
 		encoder:   encoder,
 		decoder:   decoder,
 		db:        db,
-		indexDIDs: indexDIDs, // NEW
+		indexDIDs: indexDIDs,
 	}, nil
 }
 
@@ -337,6 +340,8 @@ func (bm *BundleManager) getBoundaryInfo(ctx context.Context, bundleNum int) (st
 // ===== BUNDLE INDEXING =====
 
 func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bundleFile, cursor string) error {
+	log.Verbose("indexBundle called for bundle %06d: indexDIDs=%v", bundleNum, bm.indexDIDs)
+
 	prevHash := ""
 	if bundleNum > 1 {
 		if prev, err := bm.db.GetBundleByNumber(ctx, bundleNum-1); err == nil {
@@ -345,12 +350,14 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 	}
 
 	dids := bm.extractUniqueDIDs(bf.operations)
+	log.Verbose("Extracted %d unique DIDs from bundle %06d", len(dids), bundleNum)
+
 	compressedFileSize := bm.getFileSize(bf.path)
 
 	// Calculate uncompressed size
 	uncompressedSize := int64(0)
 	for _, op := range bf.operations {
-		uncompressedSize += int64(len(op.RawJSON)) + 1 // +1 for newline
+		uncompressedSize += int64(len(op.RawJSON)) + 1
 	}
 
 	// Get time range from operations
@@ -361,7 +368,7 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 		BundleNumber:     bundleNum,
 		StartTime:        firstSeenAt,
 		EndTime:          lastSeenAt,
-		DIDs:             dids,
+		DIDCount:         len(dids),
 		Hash:             bf.uncompressedHash,
 		CompressedHash:   bf.compressedHash,
 		CompressedSize:   compressedFileSize,
@@ -372,35 +379,48 @@ func (bm *BundleManager) indexBundle(ctx context.Context, bundleNum int, bf *bun
 		CreatedAt:        time.Now().UTC(),
 	}
 
+	log.Verbose("About to create bundle %06d in database (DIDCount=%d)", bundleNum, bundle.DIDCount)
+
 	// Create bundle first
 	if err := bm.db.CreateBundle(ctx, bundle); err != nil {
+		log.Error("Failed to create bundle %06d in database: %v", bundleNum, err)
 		return err
 	}
 
-	// NEW: Only index DIDs if enabled
+	log.Verbose("Bundle %06d created successfully in database", bundleNum)
+
+	// Index DIDs if enabled
 	if bm.indexDIDs {
 		start := time.Now()
+		log.Verbose("Starting DID indexing for bundle %06d: %d unique DIDs", bundleNum, len(dids))
 
-		// Extract handle and PDS for each DID using centralized helper
+		// Extract handle and PDS for each DID
 		didInfoMap := ExtractDIDInfoMap(bf.operations)
+		log.Verbose("Extracted info for %d DIDs from operations", len(didInfoMap))
 
-		if err := bm.db.AddBundleDIDs(ctx, bundleNum, dids); err != nil {
-			log.Error("Failed to index DIDs for bundle %06d: %v", bundleNum, err)
-			// Don't return error - bundle is already created
-		} else {
-			// Update handle and PDS for each DID
-			for did, info := range didInfoMap {
-				// Validate handle length before saving
-				validHandle := ValidateHandle(info.Handle)
+		successCount := 0
+		errorCount := 0
+		invalidHandleCount := 0
 
-				if err := bm.db.UpsertDID(ctx, did, bundleNum, validHandle, info.PDS); err != nil {
-					log.Error("Failed to update DID %s metadata: %v", did, err)
-				}
+		// Upsert each DID with handle, pds, and bundle number
+		for did, info := range didInfoMap {
+			validHandle := ValidateHandle(info.Handle)
+			if info.Handle != "" && validHandle == "" {
+				//log.Verbose("Bundle %06d: Skipping invalid handle for DID %s (length: %d)", bundleNum, did, len(info.Handle))
+				invalidHandleCount++
 			}
 
-			elapsed := time.Since(start)
-			log.Verbose("✓ Indexed %d unique DIDs for bundle %06d in %v", len(dids), bundleNum, elapsed)
+			if err := bm.db.UpsertDID(ctx, did, bundleNum, validHandle, info.PDS); err != nil {
+				log.Error("Failed to index DID %s for bundle %06d: %v", did, bundleNum, err)
+				errorCount++
+			} else {
+				successCount++
+			}
 		}
+
+		elapsed := time.Since(start)
+		log.Info("✓ Indexed bundle %06d: %d DIDs succeeded, %d errors, %d invalid handles in %v",
+			bundleNum, successCount, errorCount, invalidHandleCount, elapsed)
 	} else {
 		log.Verbose("⊘ Skipped DID indexing for bundle %06d (disabled in config)", bundleNum)
 	}
