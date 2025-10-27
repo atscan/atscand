@@ -25,12 +25,14 @@ type Server struct {
 }
 
 func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCConfig) *Server {
-	bundleManager, _ := plc.NewBundleManager(plcCfg.BundleDir, plcCfg.UseCache, db, plcCfg.IndexDIDs)
+	bundleManager, err := plc.NewBundleManager(plcCfg.BundleDir, plcCfg.DirectoryURL, db, plcCfg.IndexDIDs)
+	if err != nil {
+		log.Fatal("Failed to create bundle manager: %v", err)
+	}
 
 	s := &Server{
 		router:        mux.NewRouter(),
 		db:            db,
-		plcClient:     plc.NewClient(plcCfg.DirectoryURL),
 		plcBundleDir:  plcCfg.BundleDir,
 		bundleManager: bundleManager,
 		plcIndexDIDs:  plcCfg.IndexDIDs,
