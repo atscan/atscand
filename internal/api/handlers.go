@@ -164,6 +164,42 @@ func (s *Server) handleGetEndpointStats(w http.ResponseWriter, r *http.Request) 
 	resp.json(stats)
 }
 
+// handleGetRandomEndpoint returns a random endpoint of specified type
+func (s *Server) handleGetRandomEndpoint(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	// Get required type parameter
+	endpointType := r.URL.Query().Get("type")
+	if endpointType == "" {
+		resp.error("type parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	// Get optional status parameter
+	status := r.URL.Query().Get("status")
+
+	filter := &storage.EndpointFilter{
+		Type:   endpointType,
+		Status: status,
+		Random: true,
+		Limit:  1,
+		Offset: 0,
+	}
+
+	endpoints, err := s.db.GetEndpoints(r.Context(), filter)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if len(endpoints) == 0 {
+		resp.error("no endpoints found matching criteria", http.StatusNotFound)
+		return
+	}
+
+	resp.json(formatEndpointResponse(endpoints[0]))
+}
+
 // ===== PDS HANDLERS =====
 
 func (s *Server) handleGetPDSList(w http.ResponseWriter, r *http.Request) {

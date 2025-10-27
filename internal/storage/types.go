@@ -79,8 +79,9 @@ type EndpointFilter struct {
 	Type            string // "pds", "labeler", etc.
 	Status          string
 	MinUserCount    int64
-	OnlyStale       bool          // NEW: Only return endpoints that need re-checking
-	RecheckInterval time.Duration // NEW: How long before an endpoint is considered stale
+	OnlyStale       bool
+	RecheckInterval time.Duration
+	Random          bool // NEW: Return results in random order
 	Limit           int
 	Offset          int
 }

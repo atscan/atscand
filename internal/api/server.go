@@ -61,6 +61,7 @@ func (s *Server) setupRoutes() {
 	// Generic endpoints (keep as-is)
 	api.HandleFunc("/endpoints", s.handleGetEndpoints).Methods("GET")
 	api.HandleFunc("/endpoints/stats", s.handleGetEndpointStats).Methods("GET")
+	api.HandleFunc("/endpoints/random", s.handleGetRandomEndpoint).Methods("GET")
 
 	//PDS-specific endpoints (virtual, created via JOINs)
 	api.HandleFunc("/pds", s.handleGetPDSList).Methods("GET")

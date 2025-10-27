@@ -359,8 +359,20 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 		}
 	}
 
-	// NEW: Order by server_did and discovered_at to get primary endpoints
-	query += " ORDER BY COALESCE(server_did, id::text), discovered_at ASC"
+	// NEW: Choose ordering strategy
+	if filter != nil && filter.Random {
+		// For random selection, we need to wrap in a subquery
+		query = fmt.Sprintf(`
+			WITH filtered_endpoints AS (
+				%s
+			)
+			SELECT * FROM filtered_endpoints
+			ORDER BY RANDOM()
+		`, query)
+	} else {
+		// Original ordering for non-random queries
+		query += " ORDER BY COALESCE(server_did, id::text), discovered_at ASC"
+	}
 
 	if filter != nil && filter.Limit > 0 {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
