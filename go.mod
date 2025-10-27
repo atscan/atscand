@@ -12,12 +12,12 @@ require github.com/klauspost/compress v1.18.1 // indirect
 
 require (
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d
+	github.com/atscan/plcbundle v0.0.0-20251027220105-866aef8771a7
 	github.com/gorilla/handlers v1.5.2
 	github.com/jackc/pgx/v5 v5.7.6
 )
 
 require (
-	github.com/atscan/plcbundle v0.0.0-20251027193653-3678d57c1dee // indirect
 	github.com/felixge/httpsnoop v1.0.3 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect

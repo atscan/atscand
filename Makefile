@@ -6,3 +6,6 @@ run:
 clean-db:
 	dropdb -U atscanner atscanner
 	createdb atscanner -O atscanner
+
+update-plcbundle:
+	GOPROXY=direct go get -u github.com/atscan/plcbundle@latest

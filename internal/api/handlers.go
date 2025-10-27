@@ -2,14 +2,11 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +15,7 @@ import (
 	"github.com/atscan/atscanner/internal/monitor"
 	"github.com/atscan/atscanner/internal/plc"
 	"github.com/atscan/atscanner/internal/storage"
+	"github.com/atscan/plcbundle"
 	"github.com/gorilla/mux"
 )
 
@@ -40,7 +38,7 @@ func (r *response) error(msg string, code int) {
 	http.Error(r.w, msg, code)
 }
 
-func (r *response) bundleHeaders(bundle *storage.PLCBundle) {
+func (r *response) bundleHeaders(bundle *plcbundle.BundleMetadata) {
 	r.w.Header().Set("X-Bundle-Number", fmt.Sprintf("%d", bundle.BundleNumber))
 	r.w.Header().Set("X-Bundle-Hash", bundle.Hash)
 	r.w.Header().Set("X-Bundle-Compressed-Hash", bundle.CompressedHash)
@@ -77,7 +75,7 @@ func getQueryInt64(r *http.Request, key string, defaultVal int64) int64 {
 
 // ===== FORMATTING HELPERS =====
 
-func formatBundleResponse(bundle *storage.PLCBundle) map[string]interface{} {
+func formatBundleResponse(bundle *plcbundle.BundleMetadata) map[string]interface{} {
 	return map[string]interface{}{
 		"plc_bundle_number": bundle.BundleNumber,
 		"start_time":        bundle.StartTime,
@@ -703,12 +701,7 @@ func (s *Server) handleGetDIDStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lastBundle, err := s.db.GetLastBundleNumber(ctx)
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
-
+	lastBundle := s.bundleManager.GetLastBundleNumber()
 	resp.json(map[string]interface{}{
 		"total_unique_dids": totalDIDs,
 		"last_bundle":       lastBundle,
@@ -719,51 +712,59 @@ func (s *Server) handleGetDIDStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetPLCBundle(w http.ResponseWriter, r *http.Request) {
 	resp := newResponse(w)
-
 	bundleNum, err := getBundleNumber(r)
 	if err != nil {
 		resp.error("invalid bundle number", http.StatusBadRequest)
 		return
 	}
 
-	// Try to get existing bundle
-	bundle, err := s.db.GetBundleByNumber(r.Context(), bundleNum)
-	if err == nil {
-		// Bundle exists, return it normally
-		resp.json(formatBundleResponse(bundle))
-		return
-	}
-
-	// Bundle not found - check if it's the next upcoming bundle
-	lastBundle, err := s.db.GetLastBundleNumber(r.Context())
+	// Get from library's index
+	index := s.bundleManager.GetIndex()
+	bundleMeta, err := index.GetBundle(bundleNum)
 	if err != nil {
+		// Check if it's upcoming bundle
+		lastBundle := index.GetLastBundle()
+		if lastBundle != nil && bundleNum == lastBundle.BundleNumber+1 {
+			upcomingBundle, err := s.createUpcomingBundlePreview(bundleNum)
+			if err != nil {
+				resp.error(err.Error(), http.StatusInternalServerError)
+				return
+			}
+			resp.json(upcomingBundle)
+			return
+		}
 		resp.error("bundle not found", http.StatusNotFound)
 		return
 	}
 
-	if bundleNum == lastBundle+1 {
-		// This is the upcoming bundle - return preview based on mempool
-		upcomingBundle, err := s.createUpcomingBundlePreview(r.Context(), r, bundleNum)
-		if err != nil {
-			resp.error(fmt.Sprintf("failed to create upcoming bundle preview: %v", err), http.StatusInternalServerError)
-			return
-		}
-		resp.json(upcomingBundle)
-		return
-	}
-
-	// Not an upcoming bundle, just not found
-	resp.error("bundle not found", http.StatusNotFound)
+	resp.json(formatBundleMetadata(bundleMeta))
 }
 
-func (s *Server) createUpcomingBundlePreview(ctx context.Context, r *http.Request, bundleNum int) (map[string]interface{}, error) {
-	// Get mempool stats
-	mempoolCount, err := s.db.GetMempoolCount(ctx)
-	if err != nil {
-		return nil, err
+// Helper to format library's BundleMetadata
+func formatBundleMetadata(meta *plcbundle.BundleMetadata) map[string]interface{} {
+	return map[string]interface{}{
+		"plc_bundle_number": meta.BundleNumber,
+		"start_time":        meta.StartTime,
+		"end_time":          meta.EndTime,
+		"operation_count":   meta.OperationCount,
+		"did_count":         meta.DIDCount,
+		"hash":              meta.Hash,
+		"compressed_hash":   meta.CompressedHash,
+		"compressed_size":   meta.CompressedSize,
+		"uncompressed_size": meta.UncompressedSize,
+		"compression_ratio": float64(meta.UncompressedSize) / float64(meta.CompressedSize),
+		"cursor":            meta.Cursor,
+		"prev_bundle_hash":  meta.PrevBundleHash,
+		"created_at":        meta.CreatedAt,
 	}
+}
 
-	if mempoolCount == 0 {
+func (s *Server) createUpcomingBundlePreview(bundleNum int) (map[string]interface{}, error) {
+	// Get mempool stats from library via wrapper
+	stats := s.bundleManager.GetMempoolStats()
+
+	count, ok := stats["count"].(int)
+	if !ok || count == 0 {
 		return map[string]interface{}{
 			"plc_bundle_number": bundleNum,
 			"is_upcoming":       true,
@@ -773,106 +774,40 @@ func (s *Server) createUpcomingBundlePreview(ctx context.Context, r *http.Reques
 		}, nil
 	}
 
-	// Get first and last operations for time range
-	firstOp, err := s.db.GetFirstMempoolOperation(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	lastOp, err := s.db.GetLastMempoolOperation(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get unique DID count
-	uniqueDIDCount, err := s.db.GetMempoolUniqueDIDCount(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get uncompressed size estimate
-	uncompressedSize, err := s.db.GetMempoolUncompressedSize(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// Estimate compressed size (typical ratio is ~0.1-0.15 for PLC data)
-	estimatedCompressedSize := int64(float64(uncompressedSize) * 0.12)
-
-	// Calculate completion estimate
-	var estimatedCompletionTime *time.Time
-	var operationsNeeded int
-	var currentRate float64
-
-	operationsNeeded = plc.BUNDLE_SIZE - mempoolCount
-
-	if mempoolCount < plc.BUNDLE_SIZE && mempoolCount > 0 {
-		timeSpan := lastOp.CreatedAt.Sub(firstOp.CreatedAt).Seconds()
-		if timeSpan > 0 {
-			currentRate = float64(mempoolCount) / timeSpan
-			if currentRate > 0 {
-				secondsNeeded := float64(operationsNeeded) / currentRate
-				completionTime := time.Now().Add(time.Duration(secondsNeeded) * time.Second)
-				estimatedCompletionTime = &completionTime
-			}
-		}
-	}
-
-	// Get previous bundle for cursor context
-	var prevBundleHash string
-	var cursor string
-	if bundleNum > 1 {
-		prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNum-1)
-		if err == nil {
-			prevBundleHash = prevBundle.Hash
-			cursor = prevBundle.EndTime.Format(time.RFC3339Nano)
-		}
-	}
-
-	// Determine bundle status
-	status := "filling"
-	if mempoolCount >= plc.BUNDLE_SIZE {
-		status = "ready"
-	}
-
-	// Build upcoming bundle response
+	// Build response
 	result := map[string]interface{}{
-		"plc_bundle_number":         bundleNum,
-		"is_upcoming":               true,
-		"status":                    status,
-		"operation_count":           mempoolCount,
-		"target_operation_count":    plc.BUNDLE_SIZE,
-		"progress_percent":          float64(mempoolCount) / float64(plc.BUNDLE_SIZE) * 100,
-		"operations_needed":         operationsNeeded,
-		"did_count":                 uniqueDIDCount,
-		"start_time":                firstOp.CreatedAt,
-		"current_end_time":          lastOp.CreatedAt,
-		"uncompressed_size":         uncompressedSize,
-		"estimated_compressed_size": estimatedCompressedSize,
-		"compression_ratio":         float64(uncompressedSize) / float64(estimatedCompressedSize),
-		"prev_bundle_hash":          prevBundleHash,
-		"cursor":                    cursor,
+		"plc_bundle_number":      bundleNum,
+		"is_upcoming":            true,
+		"status":                 "filling",
+		"operation_count":        count,
+		"target_operation_count": 10000,
+		"progress_percent":       float64(count) / 100.0,
+		"operations_needed":      10000 - count,
 	}
 
-	if estimatedCompletionTime != nil {
-		result["estimated_completion_time"] = *estimatedCompletionTime
-		result["current_rate_per_second"] = currentRate
+	if count >= 10000 {
+		result["status"] = "ready"
 	}
 
-	// Get actual mempool operations if requested (for DIDs list)
-	if r.URL.Query().Get("include_dids") == "true" {
-		ops, err := s.db.GetMempoolOperations(ctx, plc.BUNDLE_SIZE)
-		if err == nil {
-			// Extract unique DIDs
-			didSet := make(map[string]bool)
-			for _, op := range ops {
-				didSet[op.DID] = true
-			}
-			dids := make([]string, 0, len(didSet))
-			for did := range didSet {
-				dids = append(dids, did)
-			}
-			result["dids"] = dids
+	// Add time range if available
+	if firstTime, ok := stats["first_time"]; ok {
+		result["start_time"] = firstTime
+	}
+	if lastTime, ok := stats["last_time"]; ok {
+		result["current_end_time"] = lastTime
+	}
+
+	// Add size info if available
+	if sizeBytes, ok := stats["size_bytes"]; ok {
+		result["uncompressed_size"] = sizeBytes
+		result["estimated_compressed_size"] = int64(float64(sizeBytes.(int)) * 0.12)
+	}
+
+	// Get previous bundle info
+	if bundleNum > 1 {
+		if prevBundle, err := s.bundleManager.GetBundleMetadata(bundleNum - 1); err == nil {
+			result["prev_bundle_hash"] = prevBundle.Hash
+			result["cursor"] = prevBundle.EndTime.Format(time.RFC3339Nano)
 		}
 	}
 
@@ -888,22 +823,16 @@ func (s *Server) handleGetPLCBundleDIDs(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	bundle, err := s.db.GetBundleByNumber(r.Context(), bundleNum)
+	// Get from library
+	dids, didCount, err := s.bundleManager.GetDIDsForBundle(r.Context(), bundleNum)
 	if err != nil {
 		resp.error("bundle not found", http.StatusNotFound)
 		return
 	}
 
-	// Query DIDs from dids table instead
-	dids, err := s.db.GetDIDsForBundle(r.Context(), bundleNum)
-	if err != nil {
-		resp.error(fmt.Sprintf("failed to get DIDs: %v", err), http.StatusInternalServerError)
-		return
-	}
-
 	resp.json(map[string]interface{}{
-		"plc_bundle_number": bundle.BundleNumber,
-		"did_count":         bundle.DIDCount,
+		"plc_bundle_number": bundleNum,
+		"did_count":         didCount,
 		"dids":              dids,
 	})
 }
@@ -919,7 +848,7 @@ func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request)
 
 	compressed := r.URL.Query().Get("compressed") != "false"
 
-	bundle, err := s.db.GetBundleByNumber(r.Context(), bundleNum)
+	bundle, err := s.bundleManager.GetBundleMetadata(bundleNum)
 	if err == nil {
 		// Bundle exists, serve it normally
 		resp.bundleHeaders(bundle)
@@ -933,15 +862,10 @@ func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Bundle not found - check if it's the upcoming bundle
-	lastBundle, err := s.db.GetLastBundleNumber(r.Context())
-	if err != nil {
-		resp.error("bundle not found", http.StatusNotFound)
-		return
-	}
-
+	lastBundle := s.bundleManager.GetLastBundleNumber()
 	if bundleNum == lastBundle+1 {
 		// This is the upcoming bundle - serve from mempool
-		s.serveUpcomingBundle(w, r, bundleNum)
+		s.serveUpcomingBundle(w, bundleNum)
 		return
 	}
 
@@ -949,60 +873,51 @@ func (s *Server) handleDownloadPLCBundle(w http.ResponseWriter, r *http.Request)
 	resp.error("bundle not found", http.StatusNotFound)
 }
 
-func (s *Server) serveUpcomingBundle(w http.ResponseWriter, r *http.Request, bundleNum int) {
-	ctx := r.Context()
+func (s *Server) serveUpcomingBundle(w http.ResponseWriter, bundleNum int) {
+	// Get mempool stats
+	stats := s.bundleManager.GetMempoolStats()
+	count, ok := stats["count"].(int)
 
-	// Get mempool count
-	mempoolCount, err := s.db.GetMempoolCount(ctx)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to get mempool count: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	if mempoolCount == 0 {
+	if !ok || count == 0 {
 		http.Error(w, "upcoming bundle is empty (no operations in mempool)", http.StatusNotFound)
 		return
 	}
 
-	// Get mempool operations (up to BUNDLE_SIZE)
-	mempoolOps, err := s.db.GetMempoolOperations(ctx, plc.BUNDLE_SIZE)
+	// Get operations from mempool
+	ops, err := s.bundleManager.GetMempoolOperations()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to get mempool operations: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	if len(mempoolOps) == 0 {
-		http.Error(w, "upcoming bundle is empty", http.StatusNotFound)
+	if len(ops) == 0 {
+		http.Error(w, "no operations in mempool", http.StatusNotFound)
 		return
 	}
 
-	// Get time range
-	firstOp := mempoolOps[0]
-	lastOp := mempoolOps[len(mempoolOps)-1]
+	// Calculate times
+	firstOp := ops[0]
+	lastOp := ops[len(ops)-1]
 
 	// Extract unique DIDs
 	didSet := make(map[string]bool)
-	for _, op := range mempoolOps {
+	for _, op := range ops {
 		didSet[op.DID] = true
+	}
+
+	// Calculate uncompressed size
+	uncompressedSize := int64(0)
+	for _, op := range ops {
+		uncompressedSize += int64(len(op.RawJSON)) + 1 // +1 for newline
 	}
 
 	// Get previous bundle hash
 	prevBundleHash := ""
 	if bundleNum > 1 {
-		if prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNum-1); err == nil {
+		if prevBundle, err := s.bundleManager.GetBundleMetadata(bundleNum - 1); err == nil {
 			prevBundleHash = prevBundle.Hash
 		}
 	}
-
-	// Serialize operations to JSONL
-	var buf []byte
-	for _, mop := range mempoolOps {
-		buf = append(buf, []byte(mop.Operation)...)
-		buf = append(buf, '\n')
-	}
-
-	// Calculate size
-	uncompressedSize := int64(len(buf))
 
 	// Set headers
 	w.Header().Set("X-Bundle-Number", fmt.Sprintf("%d", bundleNum))
@@ -1010,86 +925,83 @@ func (s *Server) serveUpcomingBundle(w http.ResponseWriter, r *http.Request, bun
 	w.Header().Set("X-Bundle-Status", "preview")
 	w.Header().Set("X-Bundle-Start-Time", firstOp.CreatedAt.Format(time.RFC3339Nano))
 	w.Header().Set("X-Bundle-Current-End-Time", lastOp.CreatedAt.Format(time.RFC3339Nano))
-	w.Header().Set("X-Bundle-Operation-Count", fmt.Sprintf("%d", len(mempoolOps)))
-	w.Header().Set("X-Bundle-Target-Count", fmt.Sprintf("%d", plc.BUNDLE_SIZE))
-	w.Header().Set("X-Bundle-Progress-Percent", fmt.Sprintf("%.2f", float64(len(mempoolOps))/float64(plc.BUNDLE_SIZE)*100))
+	w.Header().Set("X-Bundle-Operation-Count", fmt.Sprintf("%d", len(ops)))
+	w.Header().Set("X-Bundle-Target-Count", "10000")
+	w.Header().Set("X-Bundle-Progress-Percent", fmt.Sprintf("%.2f", float64(len(ops))/100.0))
 	w.Header().Set("X-Bundle-DID-Count", fmt.Sprintf("%d", len(didSet)))
 	w.Header().Set("X-Bundle-Prev-Hash", prevBundleHash)
+	w.Header().Set("X-Uncompressed-Size", fmt.Sprintf("%d", uncompressedSize))
 
 	w.Header().Set("Content-Type", "application/jsonl")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d-upcoming.jsonl", bundleNum))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", uncompressedSize))
-	w.Header().Set("X-Uncompressed-Size", fmt.Sprintf("%d", uncompressedSize))
 
+	// Stream operations as JSONL
 	w.WriteHeader(http.StatusOK)
-	w.Write(buf)
+
+	for _, op := range ops {
+		// Use RawJSON if available (preserves exact format)
+		if len(op.RawJSON) > 0 {
+			w.Write(op.RawJSON)
+		} else {
+			// Fallback to marshaling
+			data, _ := json.Marshal(op)
+			w.Write(data)
+		}
+		w.Write([]byte("\n"))
+	}
 }
 
-func (s *Server) serveCompressedBundle(w http.ResponseWriter, r *http.Request, bundle *storage.PLCBundle) {
+func (s *Server) serveCompressedBundle(w http.ResponseWriter, r *http.Request, bundle *plcbundle.BundleMetadata) {
 	resp := newResponse(w)
-	path := bundle.GetFilePath(s.plcBundleDir)
 
-	file, err := os.Open(path)
+	// Use the new streaming API for compressed data
+	reader, err := s.bundleManager.StreamRaw(r.Context(), bundle.BundleNumber)
 	if err != nil {
-		resp.error("bundle file not found on disk", http.StatusNotFound)
+		resp.error(fmt.Sprintf("error streaming compressed bundle: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer file.Close()
-
-	fileInfo, _ := file.Stat()
+	defer reader.Close()
 
 	w.Header().Set("Content-Type", "application/zstd")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl.zst", bundle.BundleNumber))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
-	w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", fileInfo.Size()))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", bundle.CompressedSize))
+	w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", bundle.CompressedSize))
 
-	http.ServeContent(w, r, filepath.Base(path), bundle.CreatedAt, file)
+	// Stream the data directly to the response
+	w.WriteHeader(http.StatusOK)
+	io.Copy(w, reader)
 }
 
-func (s *Server) serveUncompressedBundle(w http.ResponseWriter, r *http.Request, bundle *storage.PLCBundle) {
+func (s *Server) serveUncompressedBundle(w http.ResponseWriter, r *http.Request, bundle *plcbundle.BundleMetadata) {
 	resp := newResponse(w)
 
-	ops, err := s.bundleManager.LoadBundleOperations(r.Context(), bundle.BundleNumber)
+	// Use the new streaming API for decompressed data
+	reader, err := s.bundleManager.StreamDecompressed(r.Context(), bundle.BundleNumber)
 	if err != nil {
-		resp.error(fmt.Sprintf("error loading bundle: %v", err), http.StatusInternalServerError)
+		resp.error(fmt.Sprintf("error streaming decompressed bundle: %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	// Serialize to JSONL
-	var buf []byte
-	for _, op := range ops {
-		buf = append(buf, op.RawJSON...)
-		buf = append(buf, '\n')
-	}
-
-	fileInfo, _ := os.Stat(bundle.GetFilePath(s.plcBundleDir))
-	compressedSize := int64(0)
-	if fileInfo != nil {
-		compressedSize = fileInfo.Size()
-	}
+	defer reader.Close()
 
 	w.Header().Set("Content-Type", "application/jsonl")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%06d.jsonl", bundle.BundleNumber))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(buf)))
-	w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", compressedSize))
-	w.Header().Set("X-Uncompressed-Size", fmt.Sprintf("%d", len(buf)))
-	if compressedSize > 0 {
-		w.Header().Set("X-Compression-Ratio", fmt.Sprintf("%.2f", float64(len(buf))/float64(compressedSize)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", bundle.UncompressedSize))
+	w.Header().Set("X-Compressed-Size", fmt.Sprintf("%d", bundle.CompressedSize))
+	w.Header().Set("X-Uncompressed-Size", fmt.Sprintf("%d", bundle.UncompressedSize))
+	if bundle.CompressedSize > 0 {
+		w.Header().Set("X-Compression-Ratio", fmt.Sprintf("%.2f", float64(bundle.UncompressedSize)/float64(bundle.CompressedSize)))
 	}
 
+	// Stream the data directly to the response
 	w.WriteHeader(http.StatusOK)
-	w.Write(buf)
+	io.Copy(w, reader)
 }
 
 func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 	resp := newResponse(w)
 	limit := getQueryInt(r, "limit", 50)
 
-	bundles, err := s.db.GetBundles(r.Context(), limit)
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
+	bundles := s.bundleManager.GetBundles(limit)
 
 	response := make([]map[string]interface{}, len(bundles))
 	for i, bundle := range bundles {
@@ -1102,22 +1014,23 @@ func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request) {
 	resp := newResponse(w)
 
-	count, compressedSize, uncompressedSize, lastBundle, err := s.db.GetBundleStats(r.Context())
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
+	stats := s.bundleManager.GetBundleStats()
+
+	bundleCount := stats["bundle_count"].(int64)
+	totalSize := stats["total_size"].(int64)
+	totalUncompressedSize := stats["total_uncompressed_size"].(int64)
+	lastBundle := stats["last_bundle"].(int64)
 
 	resp.json(map[string]interface{}{
-		"plc_bundle_count":           count,
+		"plc_bundle_count":           bundleCount,
 		"last_bundle_number":         lastBundle,
-		"total_compressed_size":      compressedSize,
-		"total_compressed_size_mb":   float64(compressedSize) / 1024 / 1024,
-		"total_compressed_size_gb":   float64(compressedSize) / 1024 / 1024 / 1024,
-		"total_uncompressed_size":    uncompressedSize,
-		"total_uncompressed_size_mb": float64(uncompressedSize) / 1024 / 1024,
-		"total_uncompressed_size_gb": float64(uncompressedSize) / 1024 / 1024 / 1024,
-		"compression_ratio":          float64(uncompressedSize) / float64(compressedSize),
+		"total_compressed_size":      totalSize,
+		"total_compressed_size_mb":   float64(totalSize) / 1024 / 1024,
+		"total_compressed_size_gb":   float64(totalSize) / 1024 / 1024 / 1024,
+		"total_uncompressed_size":    totalUncompressedSize,
+		"total_uncompressed_size_mb": float64(totalUncompressedSize) / 1024 / 1024,
+		"total_uncompressed_size_gb": float64(totalUncompressedSize) / 1024 / 1024 / 1024,
+		"overall_compression_ratio":  float64(totalUncompressedSize) / float64(totalSize),
 	})
 }
 
@@ -1125,58 +1038,55 @@ func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleGetMempoolStats(w http.ResponseWriter, r *http.Request) {
 	resp := newResponse(w)
-	ctx := r.Context()
 
-	count, err := s.db.GetMempoolCount(ctx)
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
+	// Get stats from library's mempool via wrapper method
+	stats := s.bundleManager.GetMempoolStats()
 
-	uniqueDIDCount, err := s.db.GetMempoolUniqueDIDCount(ctx)
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	uncompressedSize, err := s.db.GetMempoolUncompressedSize(ctx)
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
-
+	// Convert to API response format
 	result := map[string]interface{}{
-		"operation_count":      count,
-		"unique_did_count":     uniqueDIDCount,
-		"uncompressed_size":    uncompressedSize,
-		"uncompressed_size_mb": float64(uncompressedSize) / 1024 / 1024,
-		"can_create_bundle":    count >= plc.BUNDLE_SIZE,
+		"operation_count":   stats["count"],
+		"can_create_bundle": stats["can_create_bundle"],
 	}
 
-	if count > 0 {
-		if firstOp, err := s.db.GetFirstMempoolOperation(ctx); err == nil && firstOp != nil {
-			result["mempool_start_time"] = firstOp.CreatedAt
+	// Add size information
+	if sizeBytes, ok := stats["size_bytes"]; ok {
+		result["uncompressed_size"] = sizeBytes
+		result["uncompressed_size_mb"] = float64(sizeBytes.(int)) / 1024 / 1024
+	}
 
-			if count < plc.BUNDLE_SIZE {
-				if lastOp, err := s.db.GetLastMempoolOperation(ctx); err == nil && lastOp != nil {
-					timeSpan := lastOp.CreatedAt.Sub(firstOp.CreatedAt).Seconds()
+	// Add time range and calculate estimated completion
+	if count, ok := stats["count"].(int); ok && count > 0 {
+		if firstTime, ok := stats["first_time"].(time.Time); ok {
+			result["mempool_start_time"] = firstTime
+
+			if lastTime, ok := stats["last_time"].(time.Time); ok {
+				result["mempool_end_time"] = lastTime
+
+				// Calculate estimated next bundle time if not complete
+				if count < 10000 {
+					timeSpan := lastTime.Sub(firstTime).Seconds()
 					if timeSpan > 0 {
 						opsPerSecond := float64(count) / timeSpan
 						if opsPerSecond > 0 {
-							remainingOps := plc.BUNDLE_SIZE - count
+							remainingOps := 10000 - count
 							secondsNeeded := float64(remainingOps) / opsPerSecond
-							result["estimated_next_bundle_time"] = time.Now().Add(time.Duration(secondsNeeded) * time.Second)
-							result["operations_needed"] = remainingOps
+							estimatedTime := time.Now().Add(time.Duration(secondsNeeded) * time.Second)
+
+							result["estimated_next_bundle_time"] = estimatedTime
 							result["current_rate_per_second"] = opsPerSecond
+							result["operations_needed"] = remainingOps
 						}
 					}
+					result["progress_percent"] = float64(count) / 100.0
+				} else {
+					// Ready to create bundle
+					result["estimated_next_bundle_time"] = time.Now()
+					result["operations_needed"] = 0
 				}
-			} else {
-				result["estimated_next_bundle_time"] = time.Now()
-				result["operations_needed"] = 0
 			}
 		}
 	} else {
+		// Empty mempool
 		result["mempool_start_time"] = nil
 		result["estimated_next_bundle_time"] = nil
 	}
@@ -1201,119 +1111,10 @@ func (s *Server) handleGetPLCMetrics(w http.ResponseWriter, r *http.Request) {
 
 // ===== VERIFICATION HANDLERS =====
 
-func (s *Server) handleVerifyPLCBundle(w http.ResponseWriter, r *http.Request) {
-	resp := newResponse(w)
-	vars := mux.Vars(r)
-
-	bundleNumber, err := strconv.Atoi(vars["bundleNumber"])
-	if err != nil {
-		resp.error("Invalid bundle number", http.StatusBadRequest)
-		return
-	}
-
-	bundle, err := s.db.GetBundleByNumber(r.Context(), bundleNumber)
-	if err != nil {
-		resp.error("Bundle not found", http.StatusNotFound)
-		return
-	}
-
-	// Fetch from PLC and verify
-	remoteOps, prevCIDs, err := s.fetchRemoteBundleOps(r.Context(), bundleNumber)
-	if err != nil {
-		resp.error(fmt.Sprintf("Failed to fetch from PLC directory: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	remoteHash := computeOperationsHash(remoteOps)
-	verified := bundle.Hash == remoteHash
-
-	resp.json(map[string]interface{}{
-		"bundle_number":      bundleNumber,
-		"verified":           verified,
-		"local_hash":         bundle.Hash,
-		"remote_hash":        remoteHash,
-		"local_op_count":     plc.BUNDLE_SIZE,
-		"remote_op_count":    len(remoteOps),
-		"boundary_cids_used": len(prevCIDs),
-	})
-}
-
-func (s *Server) fetchRemoteBundleOps(ctx context.Context, bundleNum int) ([]plc.PLCOperation, map[string]bool, error) {
-	var after string
-	var prevBoundaryCIDs map[string]bool
-
-	if bundleNum > 1 {
-		prevBundle, err := s.db.GetBundleByNumber(ctx, bundleNum-1)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to get previous bundle: %w", err)
-		}
-
-		after = prevBundle.EndTime.Format("2006-01-02T15:04:05.000Z")
-
-		if len(prevBundle.BoundaryCIDs) > 0 {
-			prevBoundaryCIDs = make(map[string]bool)
-			for _, cid := range prevBundle.BoundaryCIDs {
-				prevBoundaryCIDs[cid] = true
-			}
-		}
-	}
-
-	var allRemoteOps []plc.PLCOperation
-	seenCIDs := make(map[string]bool)
-
-	for cid := range prevBoundaryCIDs {
-		seenCIDs[cid] = true
-	}
-
-	currentAfter := after
-	maxFetches := 20
-
-	for fetchNum := 0; fetchNum < maxFetches && len(allRemoteOps) < plc.BUNDLE_SIZE; fetchNum++ {
-		batch, err := s.plcClient.Export(ctx, plc.ExportOptions{
-			Count: 1000,
-			After: currentAfter,
-		})
-		if err != nil || len(batch) == 0 {
-			break
-		}
-
-		for _, op := range batch {
-			if !seenCIDs[op.CID] {
-				seenCIDs[op.CID] = true
-				allRemoteOps = append(allRemoteOps, op)
-				if len(allRemoteOps) >= plc.BUNDLE_SIZE {
-					break
-				}
-			}
-		}
-
-		if len(batch) > 0 {
-			lastOp := batch[len(batch)-1]
-			currentAfter = lastOp.CreatedAt.Format("2006-01-02T15:04:05.000Z")
-		}
-
-		if len(batch) < 1000 {
-			break
-		}
-	}
-
-	if len(allRemoteOps) > plc.BUNDLE_SIZE {
-		allRemoteOps = allRemoteOps[:plc.BUNDLE_SIZE]
-	}
-
-	return allRemoteOps, prevBoundaryCIDs, nil
-}
-
 func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
 	resp := newResponse(w)
-	ctx := r.Context()
 
-	lastBundle, err := s.db.GetLastBundleNumber(ctx)
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
-
+	lastBundle := s.bundleManager.GetLastBundleNumber()
 	if lastBundle == 0 {
 		resp.json(map[string]interface{}{
 			"status":  "empty",
@@ -1327,7 +1128,7 @@ func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
 	var errorMsg string
 
 	for i := 1; i <= lastBundle; i++ {
-		bundle, err := s.db.GetBundleByNumber(ctx, i)
+		bundle, err := s.bundleManager.GetBundleMetadata(i)
 		if err != nil {
 			valid = false
 			brokenAt = i
@@ -1336,7 +1137,7 @@ func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if i > 1 {
-			prevBundle, err := s.db.GetBundleByNumber(ctx, i-1)
+			prevBundle, err := s.bundleManager.GetBundleMetadata(i - 1)
 			if err != nil {
 				valid = false
 				brokenAt = i
@@ -1368,14 +1169,8 @@ func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 	resp := newResponse(w)
-	ctx := r.Context()
 
-	lastBundle, err := s.db.GetLastBundleNumber(ctx)
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
-
+	lastBundle := s.bundleManager.GetLastBundleNumber()
 	if lastBundle == 0 {
 		resp.json(map[string]interface{}{
 			"chain_length": 0,
@@ -1384,29 +1179,20 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	firstBundle, _ := s.db.GetBundleByNumber(ctx, 1)
-	lastBundleData, _ := s.db.GetBundleByNumber(ctx, lastBundle)
-
-	// Updated to receive 5 values instead of 3
-	count, compressedSize, uncompressedSize, _, err := s.db.GetBundleStats(ctx)
-	if err != nil {
-		resp.error(err.Error(), http.StatusInternalServerError)
-		return
-	}
+	firstBundle, _ := s.bundleManager.GetBundleMetadata(1)
+	lastBundleData, _ := s.bundleManager.GetBundleMetadata(lastBundle)
+	stats := s.bundleManager.GetBundleStats()
 
 	resp.json(map[string]interface{}{
-		"chain_length":               lastBundle,
-		"total_bundles":              count,
-		"total_compressed_size":      compressedSize,
-		"total_compressed_size_mb":   float64(compressedSize) / 1024 / 1024,
-		"total_uncompressed_size":    uncompressedSize,
-		"total_uncompressed_size_mb": float64(uncompressedSize) / 1024 / 1024,
-		"compression_ratio":          float64(uncompressedSize) / float64(compressedSize),
-		"chain_start_time":           firstBundle.StartTime,
-		"chain_end_time":             lastBundleData.EndTime,
-		"chain_head_hash":            lastBundleData.Hash,
-		"first_prev_hash":            firstBundle.PrevBundleHash,
-		"last_prev_hash":             lastBundleData.PrevBundleHash,
+		"chain_length":             lastBundle,
+		"total_bundles":            stats["bundle_count"],
+		"total_compressed_size":    stats["total_size"],
+		"total_compressed_size_mb": float64(stats["total_size"].(int64)) / 1024 / 1024,
+		"chain_start_time":         firstBundle.StartTime,
+		"chain_end_time":           lastBundleData.EndTime,
+		"chain_head_hash":          lastBundleData.Hash,
+		"first_prev_hash":          firstBundle.PrevBundleHash,
+		"last_prev_hash":           lastBundleData.PrevBundleHash,
 	})
 }
 
@@ -1427,7 +1213,7 @@ func (s *Server) handlePLCExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	startBundle := s.findStartBundle(ctx, afterTime)
+	startBundle := s.findStartBundle(afterTime)
 	ops := s.collectOperations(ctx, startBundle, afterTime, count)
 
 	w.Header().Set("Content-Type", "application/jsonl")
@@ -1467,16 +1253,12 @@ func parseAfterParam(afterStr string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid timestamp format")
 }
 
-func (s *Server) findStartBundle(ctx context.Context, afterTime time.Time) int {
+func (s *Server) findStartBundle(afterTime time.Time) int {
 	if afterTime.IsZero() {
 		return 1
 	}
 
-	foundBundle, err := s.db.GetBundleForTimestamp(ctx, afterTime)
-	if err != nil {
-		return 1
-	}
-
+	foundBundle := s.bundleManager.FindBundleForTimestamp(afterTime)
 	if foundBundle > 1 {
 		return foundBundle - 1
 	}
@@ -1487,7 +1269,7 @@ func (s *Server) collectOperations(ctx context.Context, startBundle int, afterTi
 	var allOps []plc.PLCOperation
 	seenCIDs := make(map[string]bool)
 
-	lastBundle, _ := s.db.GetLastBundleNumber(ctx)
+	lastBundle := s.bundleManager.GetLastBundleNumber()
 
 	for bundleNum := startBundle; bundleNum <= lastBundle && len(allOps) < count; bundleNum++ {
 		ops, err := s.bundleManager.LoadBundleOperations(ctx, bundleNum)
@@ -1647,7 +1429,8 @@ func (s *Server) handleGetPLCHistory(w http.ResponseWriter, r *http.Request) {
 	limit := getQueryInt(r, "limit", 0)
 	fromBundle := getQueryInt(r, "from", 1)
 
-	history, err := s.db.GetPLCHistory(r.Context(), limit, fromBundle)
+	// Use BundleManager instead of database
+	history, err := s.bundleManager.GetPLCHistory(r.Context(), limit, fromBundle)
 	if err != nil {
 		resp.error(err.Error(), http.StatusInternalServerError)
 		return
@@ -1720,16 +1503,6 @@ func (s *Server) handleGetDBSizes(w http.ResponseWriter, r *http.Request) {
 }
 
 // ===== UTILITY FUNCTIONS =====
-
-func computeOperationsHash(ops []plc.PLCOperation) string {
-	var jsonlData []byte
-	for _, op := range ops {
-		jsonlData = append(jsonlData, op.RawJSON...)
-		jsonlData = append(jsonlData, '\n')
-	}
-	hash := sha256.Sum256(jsonlData)
-	return hex.EncodeToString(hash[:])
-}
 
 func normalizeEndpoint(endpoint string) string {
 	endpoint = strings.TrimPrefix(endpoint, "https://")

@@ -153,16 +153,6 @@ type PLCHistoryPoint struct {
 	CumulativeCompressed   int64  `json:"cumulative_compressed"`
 }
 
-// MempoolOperation represents an operation waiting to be bundled
-type MempoolOperation struct {
-	ID        int64
-	DID       string
-	Operation string
-	CID       string
-	CreatedAt time.Time
-	AddedAt   time.Time
-}
-
 // ScanCursor stores scanning progress
 type ScanCursor struct {
 	Source           string

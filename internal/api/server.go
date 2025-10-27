@@ -18,23 +18,17 @@ type Server struct {
 	router        *mux.Router
 	server        *http.Server
 	db            storage.Database
-	plcClient     *plc.Client
 	plcBundleDir  string
 	bundleManager *plc.BundleManager
 	plcIndexDIDs  bool
 }
 
-func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCConfig) *Server {
-	bundleManager, err := plc.NewBundleManager(plcCfg.BundleDir, plcCfg.DirectoryURL, db, plcCfg.IndexDIDs)
-	if err != nil {
-		log.Fatal("Failed to create bundle manager: %v", err)
-	}
-
+func NewServer(db storage.Database, apiCfg config.APIConfig, plcCfg config.PLCConfig, bundleManager *plc.BundleManager) *Server {
 	s := &Server{
 		router:        mux.NewRouter(),
 		db:            db,
 		plcBundleDir:  plcCfg.BundleDir,
-		bundleManager: bundleManager,
+		bundleManager: bundleManager, // Use provided shared instance
 		plcIndexDIDs:  plcCfg.IndexDIDs,
 	}
 
@@ -90,7 +84,6 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/plc/bundles/{number}", s.handleGetPLCBundle).Methods("GET")
 	api.HandleFunc("/plc/bundles/{number}/dids", s.handleGetPLCBundleDIDs).Methods("GET")
 	api.HandleFunc("/plc/bundles/{number}/download", s.handleDownloadPLCBundle).Methods("GET")
-	api.HandleFunc("/plc/bundles/{bundleNumber}/verify", s.handleVerifyPLCBundle).Methods("POST")
 
 	// PLC history/metrics
 	api.HandleFunc("/plc/history", s.handleGetPLCHistory).Methods("GET")

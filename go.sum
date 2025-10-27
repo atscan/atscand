@@ -1,9 +1,7 @@
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpHMqeKTCYkitsPqHNxTmd4SNR5r94FGM8=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d/go.mod h1:asat636LX7Bqt5lYEZ27JNDcqxfjdBQuJ/MM4CN/Lzo=
-github.com/atscan/plcbundle v0.0.0-20251027192009-9350d30fd185 h1:E/fQ1jsaydY6x5JRv+gBiMZVHxKEGD4cK+JxZUZuskU=
-github.com/atscan/plcbundle v0.0.0-20251027192009-9350d30fd185/go.mod h1:vqyqs+zyaxFYtIp6I4+zSQD76oiylnGenzD7ZeA4cxs=
-github.com/atscan/plcbundle v0.0.0-20251027193653-3678d57c1dee h1:wepjgNZxBJGuWmVpplG2BTcoICGafaHALiQoXJV1Iwk=
-github.com/atscan/plcbundle v0.0.0-20251027193653-3678d57c1dee/go.mod h1:vqyqs+zyaxFYtIp6I4+zSQD76oiylnGenzD7ZeA4cxs=
+github.com/atscan/plcbundle v0.0.0-20251027220105-866aef8771a7 h1:u5mCzLGQPSThUPjQnAn64xs3ZWuPltKpua1M+bMxtww=
+github.com/atscan/plcbundle v0.0.0-20251027220105-866aef8771a7/go.mod h1:vqyqs+zyaxFYtIp6I4+zSQD76oiylnGenzD7ZeA4cxs=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

@@ -17,26 +17,18 @@ type Scanner struct {
 	config        config.PLCConfig
 }
 
-func NewScanner(db storage.Database, cfg config.PLCConfig) *Scanner {
+func NewScanner(db storage.Database, cfg config.PLCConfig, bundleManager *BundleManager) *Scanner {
 	log.Verbose("NewScanner: IndexDIDs config = %v", cfg.IndexDIDs)
 
-	bundleManager, err := NewBundleManager(cfg.BundleDir, cfg.DirectoryURL, db, cfg.IndexDIDs)
-	if err != nil {
-		log.Error("Failed to initialize bundle manager: %v", err)
-		return nil
-	}
-
 	return &Scanner{
-		bundleManager: bundleManager,
+		bundleManager: bundleManager, // Use provided instance
 		db:            db,
 		config:        cfg,
 	}
 }
 
 func (s *Scanner) Close() {
-	if s.bundleManager != nil {
-		s.bundleManager.Close()
-	}
+	// Don't close bundleManager here - it's shared
 }
 
 func (s *Scanner) Scan(ctx context.Context) error {
@@ -237,7 +229,6 @@ func isInsufficientOpsError(err error) bool {
 
 // ScanMetrics tracks scan progress
 type ScanMetrics struct {
-	totalFetched   int64
 	totalProcessed int64
 	newEndpoints   int64
 	endpointCounts map[string]int64

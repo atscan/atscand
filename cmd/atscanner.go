@@ -87,7 +87,14 @@ func main() {
 	// Initialize workers
 	log.Info("Initializing scanners...")
 
-	plcScanner := plc.NewScanner(db, cfg.PLC)
+	bundleManager, err := plc.NewBundleManager(cfg.PLC.BundleDir, cfg.PLC.DirectoryURL, db, cfg.PLC.IndexDIDs)
+	if err != nil {
+		log.Fatal("Failed to create bundle manager: %v", err)
+	}
+	defer bundleManager.Close()
+	log.Verbose("✓ Bundle manager initialized (shared)")
+
+	plcScanner := plc.NewScanner(db, cfg.PLC, bundleManager)
 	defer plcScanner.Close()
 	log.Verbose("✓ PLC scanner initialized")
 
@@ -114,7 +121,7 @@ func main() {
 
 	// Start API server
 	log.Info("Starting API server on %s:%d...", cfg.API.Host, cfg.API.Port)
-	apiServer := api.NewServer(db, cfg.API, cfg.PLC)
+	apiServer := api.NewServer(db, cfg.API, cfg.PLC, bundleManager)
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			log.Fatal("API server error: %v", err)

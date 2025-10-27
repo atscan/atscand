@@ -50,27 +50,6 @@ type Database interface {
 	GetScanCursor(ctx context.Context, source string) (*ScanCursor, error)
 	UpdateScanCursor(ctx context.Context, cursor *ScanCursor) error
 
-	// Bundle operations
-	CreateBundle(ctx context.Context, bundle *PLCBundle) error
-	GetBundleByNumber(ctx context.Context, bundleNumber int) (*PLCBundle, error)
-	GetBundles(ctx context.Context, limit int) ([]*PLCBundle, error)
-	GetBundlesForDID(ctx context.Context, did string) ([]*PLCBundle, error)
-	GetDIDsForBundle(ctx context.Context, bundleNum int) ([]string, error)
-	GetBundleStats(ctx context.Context) (count, compressedSize, uncompressedSize, lastBundle int64, err error)
-	GetLastBundleNumber(ctx context.Context) (int, error)
-	GetBundleForTimestamp(ctx context.Context, afterTime time.Time) (int, error)
-	GetPLCHistory(ctx context.Context, limit int, fromBundle int) ([]*PLCHistoryPoint, error)
-
-	// Mempool operations
-	AddToMempool(ctx context.Context, ops []MempoolOperation) error
-	GetMempoolCount(ctx context.Context) (int, error)
-	GetMempoolOperations(ctx context.Context, limit int) ([]MempoolOperation, error)
-	DeleteFromMempool(ctx context.Context, ids []int64) error
-	GetFirstMempoolOperation(ctx context.Context) (*MempoolOperation, error)
-	GetLastMempoolOperation(ctx context.Context) (*MempoolOperation, error)
-	GetMempoolUniqueDIDCount(ctx context.Context) (int, error)
-	GetMempoolUncompressedSize(ctx context.Context) (int64, error)
-
 	// Metrics
 	StorePLCMetrics(ctx context.Context, metrics *PLCMetrics) error
 	GetPLCMetrics(ctx context.Context, limit int) ([]*PLCMetrics, error)
