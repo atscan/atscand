@@ -6,4 +6,4 @@ atscanner
 plc_cache\.tmp/*
 plc_bundles*
 config.yaml
-atscand
+./atscand
