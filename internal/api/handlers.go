@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atscan/atscanner/internal/log"
-	"github.com/atscan/atscanner/internal/monitor"
-	"github.com/atscan/atscanner/internal/plc"
-	"github.com/atscan/atscanner/internal/storage"
+	"github.com/atscan/atscand/internal/log"
+	"github.com/atscan/atscand/internal/monitor"
+	"github.com/atscan/atscand/internal/plc"
+	"github.com/atscan/atscand/internal/storage"
 	"github.com/atscan/plcbundle"
 	"github.com/gorilla/mux"
 )

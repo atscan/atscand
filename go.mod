@@ -1,4 +1,4 @@
-module github.com/atscan/atscanner
+module github.com/atscan/atscand
 
 go 1.23.0
 

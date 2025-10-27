@@ -4,8 +4,8 @@
 # Configuration (edit these)
 DB_HOST="localhost"
 DB_PORT="5432"
-DB_NAME="atscanner"
-DB_USER="atscanner"
+DB_NAME="atscand"
+DB_USER="atscand"
 DB_PASSWORD="Noor1kooz5eeFai9leZagh5ua5eihai4"
 
 # Colors for output

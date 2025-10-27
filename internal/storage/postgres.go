@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/atscan/atscanner/internal/log"
+	"github.com/atscan/atscand/internal/log"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"

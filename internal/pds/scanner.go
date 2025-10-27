@@ -9,11 +9,11 @@ import (
 	"time"
 
 	"github.com/acarl005/stripansi"
-	"github.com/atscan/atscanner/internal/config"
-	"github.com/atscan/atscanner/internal/ipinfo"
-	"github.com/atscan/atscanner/internal/log"
-	"github.com/atscan/atscanner/internal/monitor"
-	"github.com/atscan/atscanner/internal/storage"
+	"github.com/atscan/atscand/internal/config"
+	"github.com/atscan/atscand/internal/ipinfo"
+	"github.com/atscan/atscand/internal/log"
+	"github.com/atscan/atscand/internal/monitor"
+	"github.com/atscan/atscand/internal/storage"
 )
 
 type Scanner struct {

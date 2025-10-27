@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atscan/atscanner/internal/config"
-	"github.com/atscan/atscanner/internal/log"
-	"github.com/atscan/atscanner/internal/storage"
+	"github.com/atscan/atscand/internal/config"
+	"github.com/atscan/atscand/internal/log"
+	"github.com/atscan/atscand/internal/storage"
 )
 
 type Scanner struct {
