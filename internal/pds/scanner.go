@@ -138,6 +138,9 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 	// Update IP immediately
 	s.db.UpdateEndpointIP(ctx, ep.ID, ip, time.Now().UTC())
 
+	// STEP 1.5: Fetch IP info asynchronously ASAP (runs in parallel with scanning)
+	go s.updateIPInfoIfNeeded(ctx, ip)
+
 	// STEP 2: Health check
 	available, responseTime, version, err := s.client.CheckHealth(ctx, ep.Endpoint)
 	if err != nil || !available {
@@ -226,8 +229,8 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 		log.Verbose("✓ Processed %d repos for %s", len(repoList), ep.Endpoint)
 	}
 
-	// STEP 5: Fetch IP info if needed (async, with backoff)
-	go s.updateIPInfoIfNeeded(ctx, ip)
+	// IP info fetch already started at the beginning (step 1.5)
+	// It will complete in the background
 }
 
 func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *ScanResult) {
