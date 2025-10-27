@@ -195,7 +195,7 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 
 	// Save repos in batches (only tracks changes)
 	if len(repoList) > 0 {
-		batchSize := 10000
+		batchSize := 200000
 
 		log.Verbose("Processing %d repos for %s (tracking changes only)", len(repoList), ep.Endpoint)
 

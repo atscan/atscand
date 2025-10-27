@@ -741,7 +741,7 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 
 func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDetail, error) {
 	query := `
-		WITH target_endpoint AS (
+		WITH target_endpoint AS MATERIALIZED (  -- MATERIALIZED fence for optimization
 			SELECT 
 				e.id, 
 				e.endpoint, 
@@ -752,18 +752,9 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 				e.ip,
 				e.ipv6
 			FROM endpoints e
-			WHERE e.endpoint = $1 AND e.endpoint_type = 'pds'
-		),
-		aliases_agg AS (
-			SELECT 
-				te.server_did,
-				array_agg(e.endpoint ORDER BY e.discovered_at) FILTER (WHERE e.endpoint != te.endpoint) as aliases,
-				MIN(e.discovered_at) as first_discovered_at
-			FROM target_endpoint te
-			LEFT JOIN endpoints e ON te.server_did = e.server_did 
-				AND e.endpoint_type = 'pds'
-				AND te.server_did IS NOT NULL
-			GROUP BY te.server_did
+			WHERE e.endpoint = $1 
+			AND e.endpoint_type = 'pds'
+			LIMIT 1  -- Early termination since we expect exactly 1 row
 		)
 		SELECT 
 			te.id, 
@@ -783,18 +774,43 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 			i.is_datacenter, i.is_vpn, i.is_crawler, i.is_tor, i.is_proxy,
 			i.latitude, i.longitude,
 			i.raw_data,
-			COALESCE(aa.aliases, ARRAY[]::text[]) as aliases,
-			aa.first_discovered_at
+			-- Inline aliases aggregation (avoid second CTE)
+			COALESCE(
+				ARRAY(
+					SELECT e2.endpoint 
+					FROM endpoints e2
+					WHERE e2.server_did = te.server_did
+					AND e2.endpoint_type = 'pds'
+					AND e2.endpoint != te.endpoint
+					AND te.server_did IS NOT NULL
+					ORDER BY e2.discovered_at
+				), 
+				ARRAY[]::text[]
+			) as aliases,
+			-- Inline first_discovered_at (avoid aggregation)
+			CASE 
+				WHEN te.server_did IS NOT NULL THEN (
+					SELECT MIN(e3.discovered_at)
+					FROM endpoints e3
+					WHERE e3.server_did = te.server_did
+					AND e3.endpoint_type = 'pds'
+				)
+				ELSE NULL
+			END as first_discovered_at
 		FROM target_endpoint te
-		LEFT JOIN aliases_agg aa ON te.server_did = aa.server_did
 		LEFT JOIN LATERAL (
-			SELECT scan_data, response_time, version, scanned_at, user_count
-			FROM endpoint_scans
-			WHERE endpoint_id = te.id
-			ORDER BY scanned_at DESC
+			SELECT 
+				es.scan_data, 
+				es.response_time, 
+				es.version, 
+				es.scanned_at, 
+				es.user_count
+			FROM endpoint_scans es
+			WHERE es.endpoint_id = te.id
+			ORDER BY es.scanned_at DESC
 			LIMIT 1
 		) latest ON true
-		LEFT JOIN ip_infos i ON te.ip = i.ip
+		LEFT JOIN ip_infos i ON te.ip = i.ip;
 	`
 
 	detail := &PDSDetail{}

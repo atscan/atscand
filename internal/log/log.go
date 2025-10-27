@@ -28,9 +28,9 @@ func Init(verbose bool) {
 	errorLog = log.New(os.Stderr, "", 0)
 }
 
-// timestamp returns current time in ISO 8601 format
+// timestamp returns current time with milliseconds (local time, no timezone)
 func timestamp() string {
-	return time.Now().Format(time.RFC3339)
+	return time.Now().Format("2006-01-02T15:04:05.000")
 }
 
 func Verbose(format string, v ...interface{}) {
