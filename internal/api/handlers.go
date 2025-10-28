@@ -75,24 +75,6 @@ func getQueryInt64(r *http.Request, key string, defaultVal int64) int64 {
 
 // ===== FORMATTING HELPERS =====
 
-func formatBundleResponse(bundle *plcbundle.BundleMetadata) map[string]interface{} {
-	return map[string]interface{}{
-		"plc_bundle_number": bundle.BundleNumber,
-		"start_time":        bundle.StartTime,
-		"end_time":          bundle.EndTime,
-		"operation_count":   plc.BUNDLE_SIZE,
-		"did_count":         bundle.DIDCount, // Use DIDCount instead of len(DIDs)
-		"hash":              bundle.Hash,
-		"compressed_hash":   bundle.CompressedHash,
-		"compressed_size":   bundle.CompressedSize,
-		"uncompressed_size": bundle.UncompressedSize,
-		"compression_ratio": float64(bundle.UncompressedSize) / float64(bundle.CompressedSize),
-		"cursor":            bundle.Cursor,
-		"prev_bundle_hash":  bundle.PrevBundleHash,
-		"created_at":        bundle.CreatedAt,
-	}
-}
-
 func formatEndpointResponse(ep *storage.Endpoint) map[string]interface{} {
 	response := map[string]interface{}{
 		"id":            ep.ID,
@@ -748,13 +730,14 @@ func formatBundleMetadata(meta *plcbundle.BundleMetadata) map[string]interface{}
 		"end_time":          meta.EndTime,
 		"operation_count":   meta.OperationCount,
 		"did_count":         meta.DIDCount,
-		"hash":              meta.Hash,
+		"hash":              meta.Hash,        // Chain hash (primary)
+		"content_hash":      meta.ContentHash, // Content hash
+		"parent":            meta.Parent,      // Parent chain hash
 		"compressed_hash":   meta.CompressedHash,
 		"compressed_size":   meta.CompressedSize,
 		"uncompressed_size": meta.UncompressedSize,
 		"compression_ratio": float64(meta.UncompressedSize) / float64(meta.CompressedSize),
 		"cursor":            meta.Cursor,
-		"prev_bundle_hash":  meta.PrevBundleHash,
 		"created_at":        meta.CreatedAt,
 	}
 }
@@ -780,6 +763,7 @@ func (s *Server) createUpcomingBundlePreview(bundleNum int) (map[string]interfac
 		"is_upcoming":            true,
 		"status":                 "filling",
 		"operation_count":        count,
+		"did_count":              stats["did_count"],
 		"target_operation_count": 10000,
 		"progress_percent":       float64(count) / 100.0,
 		"operations_needed":      10000 - count,
@@ -806,7 +790,7 @@ func (s *Server) createUpcomingBundlePreview(bundleNum int) (map[string]interfac
 	// Get previous bundle info
 	if bundleNum > 1 {
 		if prevBundle, err := s.bundleManager.GetBundleMetadata(bundleNum - 1); err == nil {
-			result["prev_bundle_hash"] = prevBundle.Hash
+			result["parent"] = prevBundle.Hash // Parent chain hash
 			result["cursor"] = prevBundle.EndTime.Format(time.RFC3339Nano)
 		}
 	}
@@ -1005,7 +989,7 @@ func (s *Server) handleGetPLCBundles(w http.ResponseWriter, r *http.Request) {
 
 	response := make([]map[string]interface{}, len(bundles))
 	for i, bundle := range bundles {
-		response[i] = formatBundleResponse(bundle)
+		response[i] = formatBundleMetadata(bundle)
 	}
 
 	resp.json(response)
@@ -1022,15 +1006,11 @@ func (s *Server) handleGetPLCBundleStats(w http.ResponseWriter, r *http.Request)
 	lastBundle := stats["last_bundle"].(int64)
 
 	resp.json(map[string]interface{}{
-		"plc_bundle_count":           bundleCount,
-		"last_bundle_number":         lastBundle,
-		"total_compressed_size":      totalSize,
-		"total_compressed_size_mb":   float64(totalSize) / 1024 / 1024,
-		"total_compressed_size_gb":   float64(totalSize) / 1024 / 1024 / 1024,
-		"total_uncompressed_size":    totalUncompressedSize,
-		"total_uncompressed_size_mb": float64(totalUncompressedSize) / 1024 / 1024,
-		"total_uncompressed_size_gb": float64(totalUncompressedSize) / 1024 / 1024 / 1024,
-		"overall_compression_ratio":  float64(totalUncompressedSize) / float64(totalSize),
+		"plc_bundle_count":          bundleCount,
+		"last_bundle_number":        lastBundle,
+		"total_compressed_size":     totalSize,
+		"total_uncompressed_size":   totalUncompressedSize,
+		"overall_compression_ratio": float64(totalUncompressedSize) / float64(totalSize),
 	})
 }
 
@@ -1145,10 +1125,10 @@ func (s *Server) handleVerifyChain(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
-			if bundle.PrevBundleHash != prevBundle.Hash {
+			if bundle.Parent != prevBundle.Hash {
 				valid = false
 				brokenAt = i
-				errorMsg = fmt.Sprintf("Chain broken: bundle %06d prev_hash doesn't match bundle %06d hash", i, i-1)
+				errorMsg = fmt.Sprintf("Chain broken: bundle %06d parent doesn't match bundle %06d hash", i, i-1)
 				break
 			}
 		}
@@ -1191,8 +1171,8 @@ func (s *Server) handleGetChainInfo(w http.ResponseWriter, r *http.Request) {
 		"chain_start_time":         firstBundle.StartTime,
 		"chain_end_time":           lastBundleData.EndTime,
 		"chain_head_hash":          lastBundleData.Hash,
-		"first_prev_hash":          firstBundle.PrevBundleHash,
-		"last_prev_hash":           lastBundleData.PrevBundleHash,
+		"first_parent":             firstBundle.Parent,
+		"last_parent":              lastBundleData.Parent,
 	})
 }
 
