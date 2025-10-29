@@ -1,7 +1,7 @@
 package plc
 
 import (
-	plclib "github.com/atscan/plcbundle/plc"
+	plclib "tangled.org/atscan.net/plcbundle/plc"
 )
 
 // Re-export library types

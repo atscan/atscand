@@ -32,7 +32,7 @@ run:
 	$(GORUN) cmd/atscand/main.go -verbose
 
 update-plcbundle:
-	GOPROXY=direct go get -u github.com/atscan/plcbundle@latest
+	GOPROXY=direct go get -u tangled.org/atscan.net/plcbundle@latest
 
 # Show help
 help:

@@ -15,8 +15,8 @@ import (
 	"github.com/atscan/atscand/internal/monitor"
 	"github.com/atscan/atscand/internal/plc"
 	"github.com/atscan/atscand/internal/storage"
-	"github.com/atscan/plcbundle"
 	"github.com/gorilla/mux"
+	"tangled.org/atscan.net/plcbundle"
 )
 
 // ===== RESPONSE HELPERS =====

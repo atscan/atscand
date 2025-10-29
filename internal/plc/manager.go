@@ -9,7 +9,7 @@ import (
 
 	"github.com/atscan/atscand/internal/log"
 	"github.com/atscan/atscand/internal/storage"
-	plcbundle "github.com/atscan/plcbundle"
+	plcbundle "tangled.org/atscan.net/plcbundle"
 )
 
 // BundleManager wraps the library's manager with database integration

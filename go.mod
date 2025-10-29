@@ -12,9 +12,9 @@ require github.com/klauspost/compress v1.18.1 // indirect
 
 require (
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d
-	github.com/atscan/plcbundle v0.3.3
 	github.com/gorilla/handlers v1.5.2
 	github.com/jackc/pgx/v5 v5.7.6
+	tangled.org/atscan.net/plcbundle v0.3.6
 )
 
 require (
