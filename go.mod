@@ -8,7 +8,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require github.com/klauspost/compress v1.18.1 // indirect
+require github.com/klauspost/compress v1.18.1
 
 require (
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d

@@ -2,13 +2,19 @@ package plc
 
 import (
 	"context"
+	"encoding/csv"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/atscan/atscand/internal/log"
 	"github.com/atscan/atscand/internal/storage"
+	"github.com/klauspost/compress/zstd"
 	plcbundle "tangled.org/atscan.net/plcbundle"
 )
 
@@ -384,4 +390,133 @@ func (bm *BundleManager) GetPLCHistory(ctx context.Context, limit int, fromBundl
 	}
 
 	return history, nil
+}
+
+// GetBundleLabels reads labels from a compressed CSV file for a specific bundle
+func (bm *BundleManager) GetBundleLabels(ctx context.Context, bundleNum int) ([]*PLCOpLabel, error) {
+	// Define the path to the labels file
+	labelsDir := filepath.Join(bm.bundleDir, "labels")
+	labelsFile := filepath.Join(labelsDir, fmt.Sprintf("%06d.csv.zst", bundleNum))
+
+	// Check if file exists
+	if _, err := os.Stat(labelsFile); os.IsNotExist(err) {
+		log.Verbose("No labels file found for bundle %d at %s", bundleNum, labelsFile)
+		// Return empty, not an error
+		return []*PLCOpLabel{}, nil
+	}
+
+	// Open the Zstd-compressed file
+	file, err := os.Open(labelsFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open labels file: %w", err)
+	}
+	defer file.Close()
+
+	// Create a Zstd reader
+	zstdReader, err := zstd.NewReader(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zstd reader: %w", err)
+	}
+	defer zstdReader.Close()
+
+	// Create a CSV reader
+	csvReader := csv.NewReader(zstdReader)
+	// We skipped the header, so no header read needed
+	// Set FieldsPerRecord to 7 for validation
+	//csvReader.FieldsPerRecord = 7
+
+	var labels []*PLCOpLabel
+
+	// Read all records
+	for {
+		// Check for context cancellation
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break // End of file
+		}
+		if err != nil {
+			log.Error("Error reading CSV record in %s: %v", labelsFile, err)
+			continue // Skip bad line
+		}
+
+		// Parse the CSV record (which is []string)
+		label, err := parseLabelRecord(record)
+		if err != nil {
+			log.Error("Error parsing CSV data for bundle %d: %v", bundleNum, err)
+			continue // Skip bad data
+		}
+
+		labels = append(labels, label)
+	}
+
+	return labels, nil
+}
+
+// parseLabelRecord converts a new format CSV record into a PLCOpLabel struct
+func parseLabelRecord(record []string) (*PLCOpLabel, error) {
+	// New format: 0:bundle, 1:position, 2:cid(short), 3:size, 4:confidence, 5:labels
+	if len(record) != 6 {
+		err := fmt.Errorf("invalid record length: expected 6, got %d", len(record))
+		// --- ADDED LOG ---
+		log.Warn("Skipping malformed CSV line: %v (data: %s)", err, strings.Join(record, ","))
+		// ---
+		return nil, err
+	}
+
+	// 0:bundle
+	bundle, err := strconv.Atoi(record[0])
+	if err != nil {
+		// --- ADDED LOG ---
+		log.Warn("Skipping malformed CSV line: 'bundle' column: %v (data: %s)", err, strings.Join(record, ","))
+		// ---
+		return nil, fmt.Errorf("parsing 'bundle': %w", err)
+	}
+
+	// 1:position
+	position, err := strconv.Atoi(record[1])
+	if err != nil {
+		// --- ADDED LOG ---
+		log.Warn("Skipping malformed CSV line: 'position' column: %v (data: %s)", err, strings.Join(record, ","))
+		// ---
+		return nil, fmt.Errorf("parsing 'position': %w", err)
+	}
+
+	// 2:cid(short)
+	shortCID := record[2]
+
+	// 3:size
+	size, err := strconv.Atoi(record[3])
+	if err != nil {
+		// --- ADDED LOG ---
+		log.Warn("Skipping malformed CSV line: 'size' column: %v (data: %s)", err, strings.Join(record, ","))
+		// ---
+		return nil, fmt.Errorf("parsing 'size': %w", err)
+	}
+
+	// 4:confidence
+	confidence, err := strconv.ParseFloat(record[4], 64)
+	if err != nil {
+		// --- ADDED LOG ---
+		log.Warn("Skipping malformed CSV line: 'confidence' column: %v (data: %s)", err, strings.Join(record, ","))
+		// ---
+		return nil, fmt.Errorf("parsing 'confidence': %w", err)
+	}
+
+	// 5:labels
+	detectors := strings.Split(record[5], ";")
+
+	label := &PLCOpLabel{
+		Bundle:     bundle,
+		Position:   position,
+		CID:        shortCID,
+		Size:       size,
+		Confidence: confidence,
+		Detectors:  detectors,
+	}
+
+	return label, nil
 }

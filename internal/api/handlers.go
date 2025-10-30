@@ -1482,6 +1482,28 @@ func (s *Server) handleGetDBSizes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleGetBundleLabels(w http.ResponseWriter, r *http.Request) {
+	resp := newResponse(w)
+
+	bundleNum, err := getBundleNumber(r)
+	if err != nil {
+		resp.error("invalid bundle number", http.StatusBadRequest)
+		return
+	}
+
+	labels, err := s.bundleManager.GetBundleLabels(r.Context(), bundleNum)
+	if err != nil {
+		resp.error(err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp.json(map[string]interface{}{
+		"bundle": bundleNum,
+		"count":  len(labels),
+		"labels": labels,
+	})
+}
+
 // ===== UTILITY FUNCTIONS =====
 
 func normalizeEndpoint(endpoint string) string {

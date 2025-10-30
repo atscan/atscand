@@ -84,6 +84,7 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/plc/bundles/{number}", s.handleGetPLCBundle).Methods("GET")
 	api.HandleFunc("/plc/bundles/{number}/dids", s.handleGetPLCBundleDIDs).Methods("GET")
 	api.HandleFunc("/plc/bundles/{number}/download", s.handleDownloadPLCBundle).Methods("GET")
+	api.HandleFunc("/plc/bundles/{number}/labels", s.handleGetBundleLabels).Methods("GET")
 
 	// PLC history/metrics
 	api.HandleFunc("/plc/history", s.handleGetPLCHistory).Methods("GET")

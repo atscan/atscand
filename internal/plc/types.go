@@ -28,3 +28,13 @@ type EndpointInfo struct {
 	Type     string
 	Endpoint string
 }
+
+// PLCOpLabel holds metadata from the label CSV file
+type PLCOpLabel struct {
+	Bundle     int      `json:"bundle"`
+	Position   int      `json:"position"`
+	CID        string   `json:"cid"`
+	Size       int      `json:"size"`
+	Confidence float64  `json:"confidence"`
+	Detectors  []string `json:"detectors"`
+}
