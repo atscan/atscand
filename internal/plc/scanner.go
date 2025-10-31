@@ -190,12 +190,14 @@ func (s *Scanner) extractServiceEndpoint(services map[string]interface{}, servic
 }
 
 func (s *Scanner) storeEndpoint(ctx context.Context, epType, endpoint string, discoveredAt time.Time) error {
+	valid := validateEndpoint(endpoint)
 	return s.db.UpsertEndpoint(ctx, &storage.Endpoint{
 		EndpointType: epType,
 		Endpoint:     endpoint,
 		DiscoveredAt: discoveredAt,
 		LastChecked:  time.Time{},
 		Status:       storage.EndpointStatusUnknown,
+		Valid:        valid,
 	})
 }
 

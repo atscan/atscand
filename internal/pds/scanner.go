@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/acarl005/stripansi"
 	"github.com/atscan/atscand/internal/config"
 	"github.com/atscan/atscand/internal/ipinfo"
 	"github.com/atscan/atscand/internal/log"
@@ -40,6 +39,7 @@ func (s *Scanner) ScanAll(ctx context.Context) error {
 	servers, err := s.db.GetEndpoints(ctx, &storage.EndpointFilter{
 		Type:            "pds",
 		OnlyStale:       true,
+		OnlyValid:       true,
 		RecheckInterval: s.config.RecheckInterval,
 	})
 	if err != nil {
@@ -127,7 +127,6 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 	// STEP 1: Resolve IPs (both IPv4 and IPv6)
 	ips, err := ipinfo.ExtractIPsFromEndpoint(ep.Endpoint)
 	if err != nil {
-		// Mark as offline due to DNS failure
 		s.saveScanResult(ctx, ep.ID, &ScanResult{
 			Status:       storage.EndpointStatusOffline,
 			ErrorMessage: fmt.Sprintf("DNS resolution failed: %v", err),
@@ -146,54 +145,62 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 		go s.updateIPInfoIfNeeded(ctx, ips.IPv6)
 	}
 
-	// STEP 2: Health check (now returns which IP was used)
-	available, responseTime, version, usedIP, err := s.client.CheckHealth(ctx, ep.Endpoint)
-	if err != nil || !available {
-		errMsg := "health check failed"
-		if err != nil {
-			errMsg = err.Error()
-		}
+	// STEP 2: Call describeServer (primary health check + metadata)
+	desc, descResponseTime, usedIP, err := s.client.DescribeServer(ctx, ep.Endpoint)
+	if err != nil {
 		s.saveScanResult(ctx, ep.ID, &ScanResult{
 			Status:       storage.EndpointStatusOffline,
-			ResponseTime: responseTime,
-			ErrorMessage: errMsg,
-			UsedIP:       usedIP, // Save even if failed
+			ResponseTime: descResponseTime,
+			ErrorMessage: fmt.Sprintf("describeServer failed: %v", err),
+			UsedIP:       usedIP,
 		})
 		return
 	}
 
-	// STEP 3: Fetch PDS-specific data
-	desc, err := s.client.DescribeServer(ctx, ep.Endpoint)
-	if err != nil {
-		log.Verbose("Warning: failed to describe server %s: %v", stripansi.Strip(ep.Endpoint), err)
-	} else if desc != nil && desc.DID != "" {
+	// Update server DID immediately
+	if desc.DID != "" {
 		s.db.UpdateEndpointServerDID(ctx, ep.ID, desc.DID)
 	}
 
-	// Fetch repos with full info
+	// STEP 3: Call _health to get version
+	available, healthResponseTime, version, err := s.client.CheckHealth(ctx, ep.Endpoint)
+	if err != nil || !available {
+		log.Verbose("Warning: _health check failed for %s: %v", ep.Endpoint, err)
+		// Server is online (describeServer worked) but _health failed
+		// Continue with empty version
+		version = ""
+	}
+
+	// Calculate average response time from both calls
+	avgResponseTime := descResponseTime
+	if available {
+		avgResponseTime = (descResponseTime + healthResponseTime) / 2
+	}
+
+	// STEP 4: Fetch repos
 	repoList, err := s.client.ListRepos(ctx, ep.Endpoint)
 	if err != nil {
 		log.Verbose("Warning: failed to list repos for %s: %v", ep.Endpoint, err)
 		repoList = []Repo{}
 	}
 
-	// Convert to DIDs for backward compatibility
+	// Convert to DIDs
 	dids := make([]string, len(repoList))
 	for i, repo := range repoList {
 		dids[i] = repo.DID
 	}
 
-	// STEP 4: SAVE scan result
+	// STEP 5: SAVE scan result
 	s.saveScanResult(ctx, ep.ID, &ScanResult{
 		Status:       storage.EndpointStatusOnline,
-		ResponseTime: responseTime,
+		ResponseTime: avgResponseTime,
 		Description:  desc,
 		DIDs:         dids,
 		Version:      version,
-		UsedIP:       usedIP, // NEW: Save which IP was used
+		UsedIP:       usedIP, // Only from describeServer
 	})
 
-	// Save repos in batches (only tracks changes)
+	// STEP 6: Save repos in batches (only tracks changes)
 	if len(repoList) > 0 {
 		batchSize := 100_000
 
@@ -235,9 +242,6 @@ func (s *Scanner) scanAndSaveEndpoint(ctx context.Context, ep *storage.Endpoint)
 
 		log.Verbose("✓ Processed %d repos for %s", len(repoList), ep.Endpoint)
 	}
-
-	// IP info fetch already started at the beginning (step 1.5)
-	// It will complete in the background
 }
 
 func (s *Scanner) saveScanResult(ctx context.Context, endpointID int64, result *ScanResult) {

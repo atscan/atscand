@@ -248,6 +248,7 @@ func formatPDSListItem(pds *storage.PDSListItem) map[string]interface{} {
 		"endpoint":      pds.Endpoint,
 		"discovered_at": pds.DiscoveredAt,
 		"status":        statusToString(pds.Status),
+		"valid":         pds.Valid, // NEW
 	}
 
 	// Add server_did if available

@@ -26,8 +26,9 @@ type Endpoint struct {
 	LastChecked  time.Time
 	Status       int
 	IP           string
-	IPv6         string // NEW
+	IPv6         string
 	IPResolvedAt time.Time
+	Valid        bool
 	UpdatedAt    time.Time
 }
 
@@ -76,12 +77,13 @@ const (
 
 // EndpointFilter for querying endpoints
 type EndpointFilter struct {
-	Type            string // "pds", "labeler", etc.
+	Type            string
 	Status          string
 	MinUserCount    int64
 	OnlyStale       bool
+	OnlyValid       bool
 	RecheckInterval time.Duration
-	Random          bool // NEW: Return results in random order
+	Random          bool
 	Limit           int
 	Offset          int
 }
@@ -213,7 +215,8 @@ type PDSListItem struct {
 	LastChecked  time.Time
 	Status       int
 	IP           string
-	IPv6         string // NEW
+	IPv6         string
+	Valid        bool // NEW
 
 	// From latest endpoint_scans (via JOIN)
 	LatestScan *struct {

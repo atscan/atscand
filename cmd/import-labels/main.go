@@ -143,7 +143,7 @@ func main() {
 		if lineCount%100000 == 0 {
 			elapsed := time.Since(startTime).Seconds()
 			rate := float64(lineCount) / elapsed
-			fmt.Printf("  ... processed %,d lines (%.0f lines/sec)\n", lineCount, rate)
+			fmt.Printf("  ... processed %d lines (%.0f lines/sec)\n", lineCount, rate)
 		}
 	}
 
@@ -164,5 +164,5 @@ func main() {
 	fmt.Println("Import Summary")
 	fmt.Println("========================================")
 	fmt.Printf("✓ Import completed in %v\n", totalTime)
-	fmt.Printf("Total lines processed: %,d\n", lineCount)
+	fmt.Printf("Total lines processed: %d\n", lineCount)
 }

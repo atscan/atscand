@@ -84,6 +84,7 @@ func (p *PostgresDB) Migrate() error {
         ip TEXT,
         ipv6 TEXT,
         ip_resolved_at TIMESTAMP,
+		valid BOOLEAN DEFAULT true,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(endpoint_type, endpoint)
     );
@@ -95,6 +96,7 @@ func (p *PostgresDB) Migrate() error {
     CREATE INDEX IF NOT EXISTS idx_endpoints_ipv6 ON endpoints(ipv6);
     CREATE INDEX IF NOT EXISTS idx_endpoints_server_did ON endpoints(server_did);
     CREATE INDEX IF NOT EXISTS idx_endpoints_server_did_type_discovered ON endpoints(server_did, endpoint_type, discovered_at);
+	CREATE INDEX IF NOT EXISTS idx_endpoints_valid ON endpoints(valid);
 
 	-- IP infos table (IP as PRIMARY KEY)
 	CREATE TABLE IF NOT EXISTS ip_infos (
@@ -208,8 +210,8 @@ func (p *PostgresDB) Migrate() error {
 
 func (p *PostgresDB) UpsertEndpoint(ctx context.Context, endpoint *Endpoint) error {
 	query := `
-        INSERT INTO endpoints (endpoint_type, endpoint, discovered_at, last_checked, status, ip, ipv6, ip_resolved_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO endpoints (endpoint_type, endpoint, discovered_at, last_checked, status, ip, ipv6, ip_resolved_at, valid)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT(endpoint_type, endpoint) DO UPDATE SET
             last_checked = EXCLUDED.last_checked,
             status = EXCLUDED.status,
@@ -225,12 +227,13 @@ func (p *PostgresDB) UpsertEndpoint(ctx context.Context, endpoint *Endpoint) err
                 WHEN (EXCLUDED.ip IS NOT NULL AND EXCLUDED.ip != '') OR (EXCLUDED.ipv6 IS NOT NULL AND EXCLUDED.ipv6 != '') THEN EXCLUDED.ip_resolved_at
                 ELSE endpoints.ip_resolved_at
             END,
+            valid = EXCLUDED.valid,
             updated_at = CURRENT_TIMESTAMP
         RETURNING id
     `
 	err := p.db.QueryRowContext(ctx, query,
 		endpoint.EndpointType, endpoint.Endpoint, endpoint.DiscoveredAt,
-		endpoint.LastChecked, endpoint.Status, endpoint.IP, endpoint.IPv6, endpoint.IPResolvedAt).Scan(&endpoint.ID)
+		endpoint.LastChecked, endpoint.Status, endpoint.IP, endpoint.IPv6, endpoint.IPResolvedAt, endpoint.Valid).Scan(&endpoint.ID)
 	return err
 }
 
@@ -251,7 +254,7 @@ func (p *PostgresDB) GetEndpointIDByEndpoint(ctx context.Context, endpoint strin
 func (p *PostgresDB) GetEndpoint(ctx context.Context, endpoint string, endpointType string) (*Endpoint, error) {
 	query := `
         SELECT id, endpoint_type, endpoint, discovered_at, last_checked, status, 
-               ip, ipv6, ip_resolved_at, updated_at
+               ip, ipv6, ip_resolved_at, valid, updated_at
         FROM endpoints 
         WHERE endpoint = $1 AND endpoint_type = $2
     `
@@ -262,7 +265,7 @@ func (p *PostgresDB) GetEndpoint(ctx context.Context, endpoint string, endpointT
 
 	err := p.db.QueryRowContext(ctx, query, endpoint, endpointType).Scan(
 		&ep.ID, &ep.EndpointType, &ep.Endpoint, &ep.DiscoveredAt, &lastChecked,
-		&ep.Status, &ip, &ipv6, &ipResolvedAt, &ep.UpdatedAt,
+		&ep.Status, &ip, &ipv6, &ipResolvedAt, &ep.Valid, &ep.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -288,7 +291,7 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 	query := `
 	SELECT DISTINCT ON (COALESCE(server_did, id::text))
 		id, endpoint_type, endpoint, server_did, discovered_at, last_checked, status, 
-		ip, ipv6, ip_resolved_at, updated_at
+		ip, ipv6, ip_resolved_at, valid, updated_at
 	FROM endpoints
 	WHERE 1=1
 	`
@@ -300,6 +303,11 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 			query += fmt.Sprintf(" AND endpoint_type = $%d", argIdx)
 			args = append(args, filter.Type)
 			argIdx++
+		}
+
+		// NEW: Filter by valid flag
+		if filter.OnlyValid {
+			query += fmt.Sprintf(" AND valid = true", argIdx)
 		}
 		if filter.Status != "" {
 			statusInt := EndpointStatusUnknown
@@ -566,13 +574,14 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 				last_checked,
 				status,
 				ip,
-				ipv6
+				ipv6,
+				valid
 			FROM endpoints
 			WHERE endpoint_type = 'pds'
 			ORDER BY COALESCE(server_did, id::text), discovered_at ASC
 		)
 		SELECT 
-			e.id, e.endpoint, e.server_did, e.discovered_at, e.last_checked, e.status, e.ip, e.ipv6,
+			e.id, e.endpoint, e.server_did, e.discovered_at, e.last_checked, e.status, e.ip, e.ipv6, e.valid,
 			latest.user_count, latest.response_time, latest.version, latest.scanned_at,
 			i.city, i.country, i.country_code, i.asn, i.asn_org,
 			i.is_datacenter, i.is_vpn, i.is_crawler, i.is_tor, i.is_proxy,
@@ -643,7 +652,7 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 		var scannedAt sql.NullTime
 
 		err := rows.Scan(
-			&item.ID, &item.Endpoint, &serverDID, &item.DiscoveredAt, &item.LastChecked, &item.Status, &ip, &ipv6,
+			&item.ID, &item.Endpoint, &serverDID, &item.DiscoveredAt, &item.LastChecked, &item.Status, &ip, &ipv6, &item.Valid,
 			&userCount, &responseTime, &version, &scannedAt,
 			&city, &country, &countryCode, &asn, &asnOrg,
 			&isDatacenter, &isVPN, &isCrawler, &isTor, &isProxy,
@@ -705,7 +714,7 @@ func (p *PostgresDB) GetPDSList(ctx context.Context, filter *EndpointFilter) ([]
 
 func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDetail, error) {
 	query := `
-		WITH target_endpoint AS MATERIALIZED (  -- MATERIALIZED fence for optimization
+		WITH target_endpoint AS MATERIALIZED (
 			SELECT 
 				e.id, 
 				e.endpoint, 
@@ -714,11 +723,12 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 				e.last_checked, 
 				e.status, 
 				e.ip,
-				e.ipv6
+				e.ipv6,
+				e.valid
 			FROM endpoints e
 			WHERE e.endpoint = $1 
 			AND e.endpoint_type = 'pds'
-			LIMIT 1  -- Early termination since we expect exactly 1 row
+			LIMIT 1
 		)
 		SELECT 
 			te.id, 
@@ -729,6 +739,7 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 			te.status, 
 			te.ip,
 			te.ipv6,
+			te.valid,
 			latest.user_count,
 			latest.response_time,
 			latest.version,
@@ -738,7 +749,6 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 			i.is_datacenter, i.is_vpn, i.is_crawler, i.is_tor, i.is_proxy,
 			i.latitude, i.longitude,
 			i.raw_data,
-			-- Inline aliases aggregation (avoid second CTE)
 			COALESCE(
 				ARRAY(
 					SELECT e2.endpoint 
@@ -751,7 +761,6 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 				), 
 				ARRAY[]::text[]
 			) as aliases,
-			-- Inline first_discovered_at (avoid aggregation)
 			CASE 
 				WHEN te.server_did IS NOT NULL THEN (
 					SELECT MIN(e3.discovered_at)
@@ -792,7 +801,7 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 	var firstDiscoveredAt sql.NullTime
 
 	err := p.db.QueryRowContext(ctx, query, endpoint).Scan(
-		&detail.ID, &detail.Endpoint, &serverDID, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip, &ipv6,
+		&detail.ID, &detail.Endpoint, &serverDID, &detail.DiscoveredAt, &detail.LastChecked, &detail.Status, &ip, &ipv6, &detail.Valid,
 		&userCount, &responseTime, &version, &serverInfoJSON, &scannedAt,
 		&city, &country, &countryCode, &asn, &asnOrg,
 		&isDatacenter, &isVPN, &isCrawler, &isTor, &isProxy,
@@ -819,11 +828,9 @@ func (p *PostgresDB) GetPDSDetail(ctx context.Context, endpoint string) (*PDSDet
 	// Set aliases and is_primary
 	detail.Aliases = aliases
 	if serverDID.Valid && serverDID.String != "" && firstDiscoveredAt.Valid {
-		// Has server_did - check if this is the first discovered
 		detail.IsPrimary = detail.DiscoveredAt.Equal(firstDiscoveredAt.Time) ||
 			detail.DiscoveredAt.Before(firstDiscoveredAt.Time)
 	} else {
-		// No server_did means unique server
 		detail.IsPrimary = true
 	}
 

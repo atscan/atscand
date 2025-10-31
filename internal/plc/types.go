@@ -1,6 +1,9 @@
 package plc
 
 import (
+	"net/url"
+	"strings"
+
 	plclib "tangled.org/atscan.net/plcbundle/plc"
 )
 
@@ -37,4 +40,50 @@ type PLCOpLabel struct {
 	Size       int      `json:"size"`
 	Confidence float64  `json:"confidence"`
 	Detectors  []string `json:"detectors"`
+}
+
+// validateEndpoint checks if endpoint is in correct format: https://<domain>
+func validateEndpoint(endpoint string) bool {
+	// Must not be empty
+	if endpoint == "" {
+		return false
+	}
+
+	// Must not have trailing slash
+	if strings.HasSuffix(endpoint, "/") {
+		return false
+	}
+
+	// Parse URL
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+
+	// Must use https scheme
+	if u.Scheme != "https" {
+		return false
+	}
+
+	// Must have a host
+	if u.Host == "" {
+		return false
+	}
+
+	// Must not have path (except empty)
+	if u.Path != "" && u.Path != "/" {
+		return false
+	}
+
+	// Must not have query parameters
+	if u.RawQuery != "" {
+		return false
+	}
+
+	// Must not have fragment
+	if u.Fragment != "" {
+		return false
+	}
+
+	return true
 }
