@@ -305,10 +305,11 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 			argIdx++
 		}
 
-		// NEW: Filter by valid flag
+		// Filter by valid flag (no placeholder needed - it's a boolean literal)
 		if filter.OnlyValid {
-			query += fmt.Sprintf(" AND valid = true", argIdx)
+			query += " AND valid = true"
 		}
+
 		if filter.Status != "" {
 			statusInt := EndpointStatusUnknown
 			switch filter.Status {
@@ -331,7 +332,7 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 		}
 	}
 
-	// NEW: Choose ordering strategy
+	// Choose ordering strategy
 	if filter != nil && filter.Random {
 		// For random selection, we need to wrap in a subquery
 		query = fmt.Sprintf(`
@@ -353,6 +354,7 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 
 	rows, err := p.db.QueryContext(ctx, query, args...)
 	if err != nil {
+		fmt.Print(err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -365,7 +367,7 @@ func (p *PostgresDB) GetEndpoints(ctx context.Context, filter *EndpointFilter) (
 
 		err := rows.Scan(
 			&ep.ID, &ep.EndpointType, &ep.Endpoint, &serverDID, &ep.DiscoveredAt, &lastChecked,
-			&ep.Status, &ip, &ipv6, &ipResolvedAt, &ep.UpdatedAt,
+			&ep.Status, &ip, &ipv6, &ipResolvedAt, &ep.Valid, &ep.UpdatedAt,
 		)
 		if err != nil {
 			return nil, err

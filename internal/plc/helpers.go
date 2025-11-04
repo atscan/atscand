@@ -14,12 +14,18 @@ var handleRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9
 
 // ExtractHandle safely extracts the handle from a PLC operation
 func ExtractHandle(op *PLCOperation) string {
-	if op == nil || op.Operation == nil {
+	if op == nil {
+		return ""
+	}
+
+	// Parse Operation field on-demand
+	operation, err := op.GetOperationMap()
+	if err != nil || operation == nil {
 		return ""
 	}
 
 	// Get "alsoKnownAs"
-	aka, ok := op.Operation["alsoKnownAs"].([]interface{})
+	aka, ok := operation["alsoKnownAs"].([]interface{})
 	if !ok {
 		return ""
 	}
@@ -57,12 +63,18 @@ func ValidateHandle(handle string) string {
 
 // ExtractPDS safely extracts the PDS endpoint from a PLC operation
 func ExtractPDS(op *PLCOperation) string {
-	if op == nil || op.Operation == nil {
+	if op == nil {
+		return ""
+	}
+
+	// Parse Operation field on-demand
+	operation, err := op.GetOperationMap()
+	if err != nil || operation == nil {
 		return ""
 	}
 
 	// Get "services"
-	services, ok := op.Operation["services"].(map[string]interface{})
+	services, ok := operation["services"].(map[string]interface{})
 	if !ok {
 		return ""
 	}

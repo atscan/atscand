@@ -73,13 +73,13 @@ func (bm *BundleManager) LoadBundle(ctx context.Context, bundleNum int) (*plcbun
 // FetchAndSaveBundle fetches next bundle from PLC and saves
 func (bm *BundleManager) FetchAndSaveBundle(ctx context.Context) (*plcbundle.Bundle, error) {
 	// Fetch from PLC using library
-	bundle, err := bm.libManager.FetchNextBundle(ctx)
+	bundle, err := bm.libManager.FetchNextBundle(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 
 	// Save to disk (library handles this)
-	if err := bm.libManager.SaveBundle(ctx, bundle); err != nil {
+	if err := bm.libManager.SaveBundle(ctx, bundle, false); err != nil {
 		return nil, fmt.Errorf("failed to save bundle to disk: %w", err)
 	}
 

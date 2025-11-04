@@ -152,7 +152,13 @@ func (s *Scanner) processBatch(ctx context.Context, ops []PLCOperation) (map[str
 func (s *Scanner) extractEndpointsFromOperation(op PLCOperation) []EndpointInfo {
 	var endpoints []EndpointInfo
 
-	services, ok := op.Operation["services"].(map[string]interface{})
+	// Parse Operation field on-demand
+	operation, err := op.GetOperationMap()
+	if err != nil || operation == nil {
+		return endpoints
+	}
+
+	services, ok := operation["services"].(map[string]interface{})
 	if !ok {
 		return endpoints
 	}

@@ -1,6 +1,6 @@
 module github.com/atscan/atscand
 
-go 1.23.0
+go 1.25
 
 require (
 	github.com/gorilla/mux v1.8.1
@@ -13,11 +13,13 @@ require github.com/klauspost/compress v1.18.1
 require (
 	github.com/gorilla/handlers v1.5.2
 	github.com/jackc/pgx/v5 v5.7.6
-	tangled.org/atscan.net/plcbundle v0.3.6
+	tangled.org/atscan.net/plcbundle v0.4.12
 )
 
 require (
+	github.com/DataDog/zstd v1.5.7 // indirect
 	github.com/felixge/httpsnoop v1.0.3 // indirect
+	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
